@@ -1,0 +1,28 @@
+# Environment Variables
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Frontend is handled by frontend/.gitignore but just in case
+node_modules/
+.next/
+
+# Agent local state
+.agents/
