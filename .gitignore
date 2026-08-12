@@ -1,6 +1,8 @@
 # Environment Variables
 .env
 .env.*
+!.env.example
+!backend/.env.example
 
 # Python
 __pycache__/
@@ -26,3 +28,8 @@ node_modules/
 
 # Agent local state
 .agents/
+
+# Test workspaces
+backend/tests/.workspaces/
+backend/workspaces/
+backend/primacy.db

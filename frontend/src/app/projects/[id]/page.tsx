@@ -1,492 +1,521 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle, Bot, Database, Loader2, Plus, Send } from "lucide-react";
 import { useParams } from "next/navigation";
-import { FolderGit2, Users, Settings, Database, Play, CheckCircle2, Circle, Loader2, Send, Bot, AlertTriangle, User, AlertCircle } from "lucide-react";
+import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
-import { API_URL } from "@/lib/api";
+import MessageContent from "@/components/MessageContent";
+import AgentStatus from "@/components/AgentStatus";
+import ActivityStepper from "@/components/ActivityStepper";
+import { apiFetch, AgentRun, ChatMessage, followRun, Instance, PendingAction, Project, Step, ToolEvent, visibleContent } from "@/lib/api";
+
+type PendingRecord = { id: string; tool_name: string; preview: Record<string, unknown>; risk_class: string; expires_at: string };
 
 export default function ProjectWorkspace() {
-  const { id } = useParams();
-  const [project, setProject] = useState<any>(null);
-  const [instances, setInstances] = useState<any[]>([]);
-  const [chat, setChat] = useState<any[]>([]);
+  const params = useParams<{ id: string }>();
+  const projectId = Number(params.id);
+  const [project, setProject] = useState<Project | null>(null);
+  const [instances, setInstances] = useState<Instance[]>([]);
+  const [chat, setChat] = useState<ChatMessage[]>([]);
+  const [pending, setPending] = useState<PendingAction | null>(null);
   const [message, setMessage] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [fetchingWorkspace, setFetchingWorkspace] = useState(true);
-  
-  // Connection Form State
-  const [erpType, setErpType] = useState<"odoo" | "pi_erp">("odoo");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
   const [url, setUrl] = useState("");
   const [dbName, setDbName] = useState("");
+  const [detectedDatabases, setDetectedDatabases] = useState<string[]>([]);
+  const [detectingDatabases, setDetectingDatabases] = useState(false);
+  const [discoveryMessage, setDiscoveryMessage] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [connecting, setConnecting] = useState(false);
-  const [connectError, setConnectError] = useState<string | null>(null);
-  const [detectedDbs, setDetectedDbs] = useState<string[]>([]);
-  const [detecting, setDetecting] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [authMethod, setAuthMethod] = useState<"json2" | "xmlrpc">("json2");
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [steps, setSteps] = useState<Step[]>([]);
+  const [usage, setUsage] = useState("");
+  const [tokenInputs, setTokenInputs] = useState(0);
+  const [currentTool, setCurrentTool] = useState<string | null>(null);
+  const [isThinking, setIsThinking] = useState(false);
+  const [deciding, setDeciding] = useState(false);
+  const [isStuck, setIsStuck] = useState(false);
+  const bottom = useRef<HTMLDivElement>(null);
+  const discoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const discoverySequence = useRef(0);
+  const lastEventAt = useRef<number>(0);
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [chat]);
-
-  const fetchWorkspaceData = async () => {
+  const load = useCallback(async () => {
     try {
-      const [projRes, instRes, chatRes] = await Promise.all([
-        fetch(`${API_URL}/projects/${id}`),
-        fetch(`${API_URL}/projects/${id}/instances/`),
-        fetch(`${API_URL}/projects/${id}/chat`)
+      const [projectData, instanceData, chatData, pendingData] = await Promise.all([
+        apiFetch<Project>(`/projects/${projectId}`),
+        apiFetch<Instance[]>(`/projects/${projectId}/instances`),
+        apiFetch<ChatMessage[]>(`/projects/${projectId}/chat`),
+        apiFetch<PendingRecord | null>(`/projects/${projectId}/actions/pending`),
       ]);
-      
-      const projData = await projRes.json();
-      const instData = await instRes.json();
-      const chatData = await chatRes.json();
-      
-      setProject(projData);
-      setInstances(instData);
-      setChat(chatData);
-    } catch (err) {
-      console.error("Failed to load workspace data:", err);
-    } finally {
-      setFetchingWorkspace(false);
-    }
-  };
+      setProject(projectData); setInstances(instanceData); setChat(chatData);
+      setPending(pendingData ? { id: pendingData.id, tool: pendingData.tool_name, preview: pendingData.preview, risk_class: pendingData.risk_class } : null);
+      // Restore step history from the last run
+      const runs = await apiFetch<AgentRun[]>(`/projects/${projectId}/runs`).catch(() => [] as AgentRun[]);
+      if (runs.length > 0) {
+        const events = await apiFetch<ToolEvent[]>(`/runs/${runs[0].id}/events`).catch(() => [] as ToolEvent[]);
+        const rebuilt: Step[] = [];
+        for (const ev of events) {
+          if (ev.event_type === "tool.started") {
+            rebuilt.push({ tool: String(ev.payload.tool), label: String(ev.payload.tool).replace(/_/g, " "), status: "running", startedAt: new Date(ev.created_at).getTime() });
+          } else if (ev.event_type === "tool.completed") {
+            const idx = [...rebuilt].reverse().findIndex(s => s.tool === String(ev.payload.tool) && s.status === "running");
+            if (idx !== -1) {
+              const realIdx = rebuilt.length - 1 - idx;
+              const raw = String(ev.payload.result || "").slice(0, 80).replace(/\n/g, " ");
+              rebuilt[realIdx] = { ...rebuilt[realIdx], status: "done", result: raw, elapsed: (new Date(ev.created_at).getTime() - rebuilt[realIdx].startedAt) / 1000 };
+            }
+          } else if (ev.event_type === "usage") {
+            setUsage(`${ev.payload.input_tokens || 0} input · ${ev.payload.output_tokens || 0} output tokens · $${Number(ev.payload.cost_usd || 0).toFixed(4)}`);
+            setTokenInputs(Number(ev.payload.input_tokens || 0));
+          }
+        }
+        setSteps(rebuilt);
+      }
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not load project"); }
+    finally { setLoading(false); }
+  }, [projectId]);
 
   useEffect(() => {
-    fetchWorkspaceData();
-  }, [id]);
+    // State changes occur after the API promises resolve.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+  }, [load]);
+  useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth" }); }, [chat, pending]);
+  useEffect(() => () => {
+    if (discoveryTimer.current) clearTimeout(discoveryTimer.current);
+    if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+  }, []);
 
-  const handleUrlBlur = async () => {
-    if (!url.trim()) return;
-    setDetecting(true);
+  // 30s heartbeat: detect agent hang
+  useEffect(() => {
+    if (!loading && !deciding) {
+      if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsStuck(false);
+      return;
+    }
+    lastEventAt.current = Date.now();
+    setIsStuck(false);
+    heartbeatRef.current = setInterval(() => {
+      if (Date.now() - lastEventAt.current > 30_000) setIsStuck(true);
+    }, 5_000);
+    return () => { if (heartbeatRef.current) clearInterval(heartbeatRef.current); };
+  }, [loading, deciding]);
+
+  const discoverDatabases = async (candidateUrl: string) => {
+    const normalizedUrl = candidateUrl.trim();
+    if (!normalizedUrl) return;
     try {
-      const res = await fetch(`${API_URL}/instances/detect`, {
+      new URL(normalizedUrl);
+    } catch {
+      return;
+    }
+    const sequence = ++discoverySequence.current;
+    setDetectingDatabases(true); setDiscoveryMessage(""); setDetectedDatabases([]); setDbName("");
+    try {
+      const result = await apiFetch<{ status: string; databases: string[]; suggested_username: string; message?: string }>("/instances/detect", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, erp_type: erpType })
+        body: JSON.stringify({ url: normalizedUrl, erp_type: "odoo" }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.databases && data.databases.length > 0) {
-          setDetectedDbs(data.databases);
-          if (!dbName) setDbName(data.databases[0]);
-        }
-        if (data.suggested_username && !username) {
-          setUsername(data.suggested_username);
-        }
-        if (!password) {
-          setPassword("567e656396a9826770e1f1857f4cf13e892d5042");
-        }
+      if (sequence !== discoverySequence.current) return;
+      const databases = result.databases || [];
+      setDetectedDatabases(databases);
+      if (databases.length === 1) {
+        setDbName(databases[0]);
+        setDiscoveryMessage(`Database “${databases[0]}” selected automatically.`);
+      } else if (databases.length > 1) {
+        setDiscoveryMessage(`${databases.length} databases found. Select one to continue.`);
+      } else {
+        setDiscoveryMessage(result.message || "No database list was exposed by this server. Enter the database name manually.");
       }
-    } catch (err) {
-      console.error("Detect failed:", err);
+      if (!username && result.suggested_username) setUsername(result.suggested_username);
+    } catch (caught) {
+      if (sequence !== discoverySequence.current) return;
+      setDiscoveryMessage(caught instanceof Error ? `${caught.message}. You can enter the database name manually.` : "Database discovery failed. Enter the name manually.");
     } finally {
-      setDetecting(false);
+      if (sequence === discoverySequence.current) setDetectingDatabases(false);
     }
   };
 
-  const handleConnectInstance = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setConnecting(true);
-    setConnectError(null);
+  const changeUrl = (value: string) => {
+    setUrl(value); setDetectedDatabases([]); setDbName(""); setDiscoveryMessage("");
+    if (discoveryTimer.current) clearTimeout(discoveryTimer.current);
+    discoveryTimer.current = setTimeout(() => void discoverDatabases(value), 700);
+  };
 
-    const payload = { erp_type: erpType, url, db_name: dbName, username, password, project_id: Number(id) };
+  const finishUrlEntry = () => {
+    if (discoveryTimer.current) clearTimeout(discoveryTimer.current);
+    void discoverDatabases(url);
+  };
 
+  const connect = async (event: FormEvent) => {
+    event.preventDefault(); setLoading(true); setError("");
     try {
-      const response = await fetch(`${API_URL}/instances/`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      await apiFetch<Instance>("/instances", { method: "POST", body: JSON.stringify({ erp_type: "odoo", url, db_name: dbName, username: authMethod === "xmlrpc" ? username : null, password: authMethod === "xmlrpc" ? password : null, api_key: authMethod === "json2" ? apiKey : null, auth_method: authMethod, project_id: projectId }) });
+      setPassword(""); setApiKey(""); await load();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "Connection failed"); setLoading(false); }
+  };
 
-      if (!response.ok) {
-        throw new Error("Failed to save connection profile");
-      }
-
-      const data = await response.json();
-      
-      // Test connection
-      const testRes = await fetch(`${API_URL}/instances/${data.id}/test-connection`, {
-        method: "POST",
+  // Shared helper — wires SSE events to structured steps, heartbeat, tokens
+  const handleRunEvent = (runEvent: ToolEvent, responseRef: { current: string }, setResponse: (r: string) => void) => {
+    lastEventAt.current = Date.now();
+    setIsStuck(false);
+    setIsThinking(true);
+    if (runEvent.event_type === "message.delta") {
+      responseRef.current += String(runEvent.payload.text || "");
+      setResponse(responseRef.current);
+      setIsThinking(false);
+    }
+    if (runEvent.event_type === "tool.started") {
+      const tool = String(runEvent.payload.tool);
+      setCurrentTool(tool);
+      setIsThinking(false);
+      setSteps(prev => [...prev, { tool, label: tool.replace(/_/g, " "), status: "running", startedAt: Date.now() }]);
+    }
+    if (runEvent.event_type === "tool.completed") {
+      const tool = String(runEvent.payload.tool);
+      const raw = String(runEvent.payload.result || "").slice(0, 80).replace(/\n/g, " ");
+      setCurrentTool(null);
+      setIsThinking(true);
+      setSteps(prev => {
+        const idx = [...prev].reverse().findIndex(s => s.tool === tool && s.status === "running");
+        if (idx === -1) return prev;
+        const realIdx = prev.length - 1 - idx;
+        const next = [...prev];
+        next[realIdx] = { ...next[realIdx], status: "done", result: raw, elapsed: (Date.now() - next[realIdx].startedAt) / 1000 };
+        return next;
       });
-      
-      if (!testRes.ok) {
-        const testData = await testRes.json();
-        throw new Error(testData.detail || "Connection failed to the ERP");
-      }
-      
-      await fetchWorkspaceData();
-    } catch (err: any) {
-      setConnectError(err.message);
-    } finally {
-      setConnecting(false);
+    }
+    if (runEvent.event_type === "usage") {
+      const inp = Number(runEvent.payload.input_tokens || 0);
+      setTokenInputs(inp);
+      setUsage(`${inp} input · ${runEvent.payload.output_tokens || 0} output tokens · $${Number(runEvent.payload.cost_usd || 0).toFixed(4)}`);
+    }
+    if (runEvent.event_type === "approval.required") {
+      setIsThinking(false);
+      setCurrentTool(null);
+      setPending({ id: String(runEvent.payload.action_id), tool: String(runEvent.payload.tool), risk_class: String(runEvent.payload.risk_class), preview: runEvent.payload.preview as Record<string, unknown> });
     }
   };
 
-  const sendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!message.trim()) return;
-
-    const userMsg = message;
-    setMessage("");
-    setChat(prev => [...prev, { role: "user", content: userMsg }]);
-    setLoading(true);
-
+  const send = async (event: FormEvent) => {
+    event.preventDefault();
+    const text = message.trim(); if (!text || pending) return;
+    setMessage(""); setError(""); setLoading(true); setSteps([]); setUsage(""); setTokenInputs(0);
+    setCurrentTool(null); setIsThinking(true);
+    // Don't optimistically add an empty agent bubble — backend now only saves non-empty responses
+    setChat((current) => [...current, { role: "user", content: text }]);
+    const responseRef = { current: "" };
     try {
-      const res = await fetch(`${API_URL}/projects/${id}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userMsg })
+      const run = await apiFetch<AgentRun>(`/projects/${projectId}/runs`, { method: "POST", body: JSON.stringify({ message: text }) });
+      setActiveRunId(run.id);
+      const finished = await followRun(run.id, (runEvent) => {
+        handleRunEvent(runEvent, responseRef, (r) => setChat((cur) => {
+          const last = cur[cur.length - 1];
+          if (last?.role === "agent") return [...cur.slice(0, -1), { role: "agent", content: r }];
+          return [...cur, { role: "agent", content: r }];
+        }));
       });
-      
-      if (!res.ok) {
-        let errData;
-        try {
-          errData = await res.json();
-        } catch {
-          errData = { detail: res.statusText };
+      if (finished.status === "failed") throw new Error(`${finished.error_message || "Agent run failed"} · Support ${finished.support_id}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Agent request failed");
+      setChat((current) => {
+        if (current.length > 0 && current[current.length - 1].role === "agent" && !current[current.length - 1].content) {
+          return current.slice(0, -1);
         }
-        throw new Error(errData.detail || "Server Error");
-      }
-      
-      setLoading(false);
-      setChat(prev => [...prev, { role: "agent", content: "" }]);
-
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      let agentResponse = "";
-
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          agentResponse += chunk;
-          
-          setChat(prev => {
-            const newChat = [...prev];
-            newChat[newChat.length - 1] = { role: "agent", content: agentResponse };
-            return newChat;
-          });
-        }
-      }
-    } catch (err: any) {
-      console.error(err);
-      setLoading(false);
-      setChat(prev => [...prev, { role: "agent", content: `❌ Error: ${err.message}` }]);
+        return current;
+      });
     }
+    finally { setLoading(false); setActiveRunId(null); setIsThinking(false); setCurrentTool(null); }
   };
 
-  const handleResume = async (action: string) => {
-    setLoading(true);
-    
-    // Append a new agent message block for the resumed response
-    setChat(prev => [...prev, { role: "agent", content: "" }]);
-
+  const decide = async (decision: "approve" | "reject") => {
+    if (!pending) return;
+    const action = pending; setPending(null); setDeciding(true); setError("");
+    setChat((current) => [...current, { role: "agent", content: "" }]);
+    setCurrentTool(null); setIsThinking(true); setLoading(true);
+    const responseRef = { current: "" };
     try {
-      const res = await fetch(`${API_URL}/projects/${id}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: "", resume_action: action })
+      const run = await apiFetch<AgentRun>(`/actions/${action.id}/decision`, { method: "POST", body: JSON.stringify({ decision }) });
+      const finished = await followRun(run.id, (runEvent) => {
+        handleRunEvent(runEvent, responseRef, (r) => setChat((cur) => [...cur.slice(0, -1), { role: "agent", content: r }]));
+        setChat((current) => [...current.slice(0, -1), { role: "agent", content: responseRef.current }]);
       });
-      
-      if (!res.ok) {
-        throw new Error("Failed to resume action");
+      if (finished.status === "failed") throw new Error(`${finished.error_message || "Action failed"} · Support ${finished.support_id}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Decision failed");
+      try {
+        const freshPending = await apiFetch<PendingRecord | null>(`/projects/${projectId}/actions/pending`);
+        setPending(freshPending ? { id: freshPending.id, tool: freshPending.tool_name, preview: freshPending.preview, risk_class: freshPending.risk_class } : null);
+      } catch {
+        // ignore
       }
-      
-      setLoading(false);
+    }
+    finally { setDeciding(false); setLoading(false); setIsThinking(false); setCurrentTool(null); }
+  };
 
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      let agentResponse = "";
-
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          agentResponse += chunk;
-          
-          setChat(prev => {
-            const newChat = [...prev];
-            newChat[newChat.length - 1] = { role: "agent", content: agentResponse };
-            return newChat;
-          });
-        }
-      }
-    } catch (err: any) {
-      console.error(err);
-      setLoading(false);
-      setChat(prev => [...prev, { role: "agent", content: `❌ Error: ${err.message}` }]);
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      void send(e as unknown as FormEvent);
     }
   };
 
-  if (fetchingWorkspace) {
-    return (
-      <div className="flex items-center justify-center h-screen w-full">
-        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
-      </div>
-    );
-  }
+  const startNewChat = async () => {
+    if (loading || deciding) return;
+    try {
+      await apiFetch(`/projects/${projectId}/chat`, { method: "DELETE" });
+      setChat([]);
+      setSteps([]);
+      setUsage("");
+      setTokenInputs(0);
+      setPending(null);
+      setError("");
+      setCurrentTool(null);
+      setIsThinking(false);
+      setIsStuck(false);
+      setActiveRunId(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Failed to reset chat");
+    }
+  };
 
-  if (!project) return <div className="p-8">Project not found.</div>;
-
-  const hasInstance = instances.length > 0;
+  if (loading && !project) return <div className="p-8 text-gray-500">Loading…</div>;
+  if (!project) return <div className="p-8 text-red-600">{error || "Project not found"}</div>;
+  if (!instances.length) return (
+    <div className="mx-auto max-w-xl p-8">
+      <h1 className="text-3xl font-bold">{project.name}</h1><p className="mt-2 text-gray-500">Connect an approved Odoo host. Credentials are encrypted and never returned.</p>
+      <form onSubmit={connect} className="mt-8 space-y-4 rounded-2xl border p-6 dark:border-white/10">
+        <label className="block text-sm">Server URL <span className="text-xs text-gray-500">(database discovery runs automatically)</span><div className="relative"><input type="url" required value={url} onChange={(event) => changeUrl(event.target.value)} onBlur={finishUrlEntry} placeholder="https://odoo.internal.example" className="mt-1 w-full rounded-xl border px-4 py-3 pr-10 dark:border-white/10 dark:bg-black" />{detectingDatabases && <Loader2 className="absolute right-3 top-4 h-4 w-4 animate-spin text-blue-600" />}</div></label>
+        <label className="block text-sm">Database
+          {detectedDatabases.length > 1 ? (
+            <select required value={dbName} onChange={(event) => setDbName(event.target.value)} className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black">
+              <option value="">Select a database…</option>
+              {detectedDatabases.map((database) => <option key={database} value={database}>{database}</option>)}
+            </select>
+          ) : (
+            <input required value={dbName} onChange={(event) => setDbName(event.target.value)} readOnly={detectedDatabases.length === 1} placeholder={detectingDatabases ? "Discovering databases…" : "Database name"} className="mt-1 w-full rounded-xl border px-4 py-3 read-only:bg-gray-50 dark:border-white/10 dark:bg-black dark:read-only:bg-white/5" />
+          )}
+          {discoveryMessage && <span className="mt-1 block text-xs text-gray-500">{discoveryMessage}</span>}
+        </label>
+        <label className="block text-sm">Authentication<select value={authMethod} onChange={(event) => setAuthMethod(event.target.value as "json2" | "xmlrpc")} className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black"><option value="json2">Odoo 19 JSON-2 API key (recommended)</option><option value="xmlrpc">XML-RPC username and password</option></select></label>
+        {authMethod === "json2" ? <label className="block text-sm">Scoped API key<input type="password" required value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="off" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black" /></label> : <><label className="block text-sm">Username<input required value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black" /></label><label className="block text-sm">Password<input type="password" required value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black" /></label></>}
+        {error && <p className="text-sm text-red-600">{error}</p>}
+        <button disabled={loading || detectingDatabases} className="w-full rounded-xl bg-blue-600 py-3 font-medium text-white disabled:opacity-50">{loading ? "Verifying…" : detectingDatabases ? "Discovering databases…" : "Verify and connect"}</button>
+      </form>
+    </div>
+  );
 
   return (
-    <div className="flex h-screen overflow-hidden w-full bg-[var(--background)]">
-      {/* Left Panel: Project Overview */}
-      <div className="w-1/3 border-r border-black/5 dark:border-white/10 p-6 flex flex-col glass-panel relative z-10">
-        <h2 className="text-2xl font-bold mb-2 tracking-tight text-black dark:text-white">{project.name}</h2>
-        <p className="text-sm text-gray-500 dark:text-gray-400 mb-8">Implementation Workspace</p>
-
-        <div className="space-y-4 flex-1">
-          <div className="p-4 rounded-2xl border border-black/5 dark:border-white/10 bg-white/80 dark:bg-black/40 shadow-sm">
-            <h3 className="font-semibold mb-3 text-black dark:text-white/90 tracking-tight">Implementation Progress</h3>
-            <ul className="space-y-3 text-sm">
-              <li className="flex justify-between items-center text-gray-700 dark:text-gray-300">
-                <span>Connect ERP Instance</span> 
-                {hasInstance ? <span className="text-green-500 font-bold">✓</span> : <span className="text-blue-500">●</span>}
-              </li>
-              <li className={`flex justify-between items-center ${!hasInstance ? 'text-gray-400 dark:text-gray-500' : 'text-gray-700 dark:text-gray-300'}`}>
-                <span>Discovery Phase</span> 
-                {hasInstance ? <span className="text-blue-500">●</span> : <span>○</span>}
-              </li>
-              <li className="flex justify-between text-gray-400 dark:text-gray-500"><span>Company Setup</span> <span>○</span></li>
-              <li className="flex justify-between text-gray-400 dark:text-gray-500"><span>Sales & Inventory</span> <span>○</span></li>
-            </ul>
+    <div className="flex h-screen">
+      <aside className="w-72 border-r p-6 dark:border-white/10"><h1 className="text-2xl font-bold">{project.name}</h1><div className="mt-6 rounded-xl border p-4 dark:border-white/10"><Database className="mb-2 h-5 w-5 text-blue-600" /><p className="truncate text-sm">{instances[0].url}</p><p className="mt-1 text-xs uppercase text-gray-500">{instances[0].environment} · {instances[0].status}</p></div><Link href={`/projects/${projectId}/workspace`} className="mt-4 block rounded-xl border p-3 text-sm hover:bg-black/5 dark:border-white/10">Workspace & lifecycle</Link><Link href={`/projects/${projectId}/instances`} className="mt-2 block rounded-xl border p-3 text-sm hover:bg-black/5 dark:border-white/10">Odoo connections</Link></aside>
+      <section className="flex min-w-0 flex-1 flex-col">
+        {/* Header */}
+        <header className="flex items-center justify-between border-b border-white/5 bg-zinc-900 px-4 py-3">
+          <div className="flex items-center gap-3">
+            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-600/20">
+              <Bot className="h-4 w-4 text-blue-400" />
+            </div>
+            <span className="text-sm font-semibold text-white">ERP Implementation Agent</span>
+            <button
+              onClick={() => void startNewChat()}
+              disabled={loading || deciding}
+              className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs font-medium text-gray-400 transition hover:bg-white/10 hover:text-white active:scale-95 disabled:opacity-40"
+            >
+              <Plus className="h-3 w-3" />
+              New Chat
+            </button>
           </div>
+          <div className="flex items-center gap-4">
+            {/* Context window bar — always visible after first token usage */}
+            {tokenInputs > 0 && (() => {
+              const pct = Math.min((tokenInputs / 128_000) * 100, 100);
+              const barColor = pct > 90 ? "bg-red-500" : pct > 70 ? "bg-amber-400" : "bg-blue-500";
+              return (
+                <div className="flex items-center gap-2">
+                  <div className="h-1 w-28 overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className={`h-full rounded-full transition-all duration-500 ${barColor}`}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <span className="font-mono text-[10px] text-gray-500">
+                    {(tokenInputs / 1000).toFixed(0)}k
+                    <span className="text-gray-600"> / 128k ctx</span>
+                  </span>
+                </div>
+              );
+            })()}
+            {activeRunId && (
+              <button
+                onClick={() => void apiFetch(`/runs/${activeRunId}/cancel`, { method: "POST" })}
+                className="text-xs text-red-400 hover:text-red-300"
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        </header>
 
-          {hasInstance && (
-            <div className="p-4 rounded-2xl border border-blue-500/20 bg-blue-50 dark:bg-blue-500/10 shadow-sm">
-              <div className="flex items-center space-x-2 text-blue-600 dark:text-blue-400 mb-2">
-                <Database className="w-4 h-4" />
-                <h3 className="font-semibold text-sm">Connected Instance</h3>
-              </div>
-              <p className="text-xs text-gray-600 dark:text-gray-400 truncate">{instances[0].url}</p>
-              <p className="text-xs text-gray-500 dark:text-gray-500 mt-1 uppercase tracking-wider">{instances[0].erp_type}</p>
-            </div>
+        {/* Persistent sticky agent status bar — always visible when agent is working */}
+        <AnimatePresence>
+          {(loading || deciding) && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ duration: 0.18 }}
+              className="border-b border-blue-100 bg-blue-50/80 px-5 py-2 backdrop-blur-sm dark:border-blue-900/30 dark:bg-blue-950/30"
+            >
+              <AgentStatus currentAction={currentTool} isThinking={isThinking} tokenInputs={tokenInputs} isStuck={isStuck} />
+            </motion.div>
           )}
-        </div>
-      </div>
+        </AnimatePresence>
 
-      {/* Right Panel: Agent Chat or Connection Form */}
-      <div className="w-2/3 flex flex-col relative z-0">
-        {!hasInstance ? (
-          <motion.div 
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ type: "spring", bounce: 0, duration: 0.5 }}
-            className="flex-1 overflow-y-auto p-8 flex flex-col items-center justify-center"
-          >
-            <div className="w-full max-w-md p-8 rounded-2xl border border-black/5 dark:border-white/10 bg-white/80 dark:bg-white/5 backdrop-blur-xl shadow-lg">
-              <div className="mb-6 text-center">
-                <div className="w-12 h-12 bg-blue-100 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400 rounded-full flex items-center justify-center mx-auto mb-4">
-                  <Database className="w-6 h-6" />
-                </div>
-                <h2 className="text-2xl font-bold mb-2 tracking-tight text-black dark:text-white">Connect ERP Instance</h2>
-                <p className="text-sm text-gray-500 dark:text-gray-400">Provide the credentials for the target ERP instance to allow the agent to inspect and configure it.</p>
-              </div>
-
-              <form onSubmit={handleConnectInstance} className="space-y-4">
-                <div className="grid grid-cols-2 gap-3">
-                  <button type="button" onClick={() => setErpType("odoo")} className={`p-2.5 rounded-xl border text-sm font-medium transition-colors ${erpType === "odoo" ? "border-blue-500 bg-blue-50 text-blue-700 dark:bg-blue-500/20 dark:text-blue-400" : "border-black/10 dark:border-white/10 bg-gray-50 dark:bg-white/5 text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-white/10"}`}>
-                    Odoo
-                  </button>
-                  <button type="button" onClick={() => setErpType("pi_erp")} className={`p-2.5 rounded-xl border text-sm font-medium transition-colors ${erpType === "pi_erp" ? "border-purple-500 bg-purple-50 text-purple-700 dark:bg-purple-500/20 dark:text-purple-400" : "border-black/10 dark:border-white/10 bg-gray-50 dark:bg-white/5 text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-white/10"}`}>
-                    Pi ERP
-                  </button>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
-                    Server URL {detecting && <Loader2 className="inline w-3 h-3 animate-spin ml-2 text-blue-500" />}
-                  </label>
-                  <input type="url" required value={url} onChange={(e) => setUrl(e.target.value)} onBlur={handleUrlBlur} placeholder="https://your-erp.com" className="w-full px-4 py-2.5 text-sm bg-gray-50 dark:bg-black/40 border border-black/10 dark:border-white/10 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-black dark:text-white transition-all shadow-inner" />
-                </div>
-                
-                {erpType === "odoo" && (
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Database Name</label>
-                    {detectedDbs.length > 0 ? (
-                      <select required value={dbName} onChange={(e) => setDbName(e.target.value)} className="w-full px-4 py-2.5 text-sm bg-gray-50 dark:bg-black/40 border border-black/10 dark:border-white/10 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-black dark:text-white transition-all shadow-inner">
-                        {detectedDbs.map(db => <option key={db} value={db}>{db}</option>)}
-                      </select>
-                    ) : (
-                      <input type="text" required value={dbName} onChange={(e) => setDbName(e.target.value)} placeholder="odoo_db" className="w-full px-4 py-2.5 text-sm bg-gray-50 dark:bg-black/40 border border-black/10 dark:border-white/10 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-black dark:text-white transition-all shadow-inner" />
-                    )}
-                  </div>
-                )}
-
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Username</label>
-                  <input type="text" required value={username} onChange={(e) => setUsername(e.target.value)} placeholder="admin" className="w-full px-4 py-2.5 text-sm bg-gray-50 dark:bg-black/40 border border-black/10 dark:border-white/10 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-black dark:text-white transition-all shadow-inner" />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Password</label>
-                  <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" className="w-full px-4 py-2.5 text-sm bg-gray-50 dark:bg-black/40 border border-black/10 dark:border-white/10 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-black dark:text-white transition-all shadow-inner" />
-                </div>
-
-                {connectError && (
-                  <div className="p-3 rounded-xl bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 text-red-600 dark:text-red-400 text-sm flex items-start space-x-2">
-                    <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
-                    <span>{connectError}</span>
-                  </div>
-                )}
-
-                <button type="submit" disabled={connecting} className="w-full py-3 bg-blue-500 hover:bg-blue-600 text-white text-sm font-semibold rounded-xl transition-colors flex justify-center items-center mt-4 disabled:opacity-50 shadow-sm">
-                  {connecting ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
-                  {connecting ? "Testing Connection..." : "Connect Instance"}
-                </button>
-              </form>
-            </div>
-          </motion.div>
-        ) : (
-          <>
-            <div className="p-4 border-b border-black/5 dark:border-white/10 glass-panel sticky top-0 z-20 flex items-center justify-between">
-              <div className="flex items-center space-x-3">
-                <div className="w-10 h-10 rounded-full bg-blue-500 flex items-center justify-center shadow-sm">
-                  <Bot className="w-5 h-5 text-white" />
-                </div>
-                <div>
-                  <h3 className="font-semibold text-black dark:text-white tracking-tight">ERP Implementation Agent</h3>
-                  <p className="text-xs text-gray-500 dark:text-gray-400">Online • {instances[0].erp_type.toUpperCase()} Connected</p>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-6 space-y-6">
-              {chat.length === 0 && (
-                <div className="text-center text-gray-400 dark:text-gray-500 mt-20">
-                  <Bot className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                  <p>No messages yet. Try asking: "What modules are installed?"</p>
-                </div>
-              )}
-              <AnimatePresence initial={false}>
-              {chat.map((msg, i) => {
-                const parts = msg.content.split("_ACTION_PENDING_||");
-                const actualContent = parts[0];
-                let pendingAction = null;
-                if (parts.length > 1) {
-                  try {
-                    pendingAction = JSON.parse(parts[1].trim());
-                  } catch (e) {}
-                }
-
-                // If this is not the last message, and it had a pending action, hide the buttons (it was already resolved)
-                const isResolved = i !== chat.length - 1 && pendingAction !== null;
-
-                return (
-                  <motion.div 
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ type: "spring", bounce: 0, duration: 0.4 }}
-                    key={i} 
-                    className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                  >
-                    <div className={`flex items-end max-w-[75%] space-x-2 ${msg.role === 'user' ? 'flex-row-reverse space-x-reverse' : ''}`}>
-                      {msg.role !== 'user' && (
-                        <div className="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 bg-blue-500 shadow-sm mb-1">
-                          <Bot className="w-4 h-4 text-white" />
-                        </div>
-                      )}
-                      <div className={`p-4 text-[15px] leading-relaxed whitespace-pre-wrap shadow-sm ${
-                        msg.role === 'user' 
-                          ? 'bg-blue-500 text-white rounded-2xl rounded-tr-sm' 
-                          : 'bg-white dark:bg-[#2c2c2e] text-black dark:text-white rounded-2xl rounded-tl-sm border border-black/5 dark:border-white/5'
-                      }`}>
-                        {actualContent}
-                        
-                        {pendingAction && (
-                          <div className={`mt-3 p-4 rounded-xl border ${isResolved ? 'border-gray-500/30 bg-gray-500/10' : 'border-yellow-500/30 bg-yellow-500/10'} shadow-sm`}>
-                            <div className={`flex items-center gap-2 mb-2 ${isResolved ? 'text-gray-500' : 'text-yellow-600 dark:text-yellow-500'}`}>
-                              <AlertTriangle className="w-5 h-5" />
-                              <span className="font-semibold text-sm">
-                                {isResolved ? "Action Resolved" : "Action Pending Approval"}
-                              </span>
-                            </div>
-                            <div className="text-sm font-medium mb-1">{pendingAction.tool}</div>
-                            <pre className="text-xs text-gray-600 dark:text-gray-400 mb-4 overflow-x-auto p-2 bg-black/5 dark:bg-black/20 rounded">
-                              {JSON.stringify(pendingAction.args, null, 2)}
-                            </pre>
-                            
-                            {!isResolved && (
-                              <div className="flex gap-2">
-                                <button 
-                                  onClick={() => handleResume("approve")}
-                                  disabled={loading}
-                                  className="flex-1 bg-green-500 hover:bg-green-600 text-white py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                                >
-                                  Approve
-                                </button>
-                                <button 
-                                  onClick={() => handleResume("reject")}
-                                  disabled={loading}
-                                  className="flex-1 bg-gray-200 hover:bg-gray-300 dark:bg-white/10 dark:hover:bg-white/20 text-black dark:text-white py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                                >
-                                  Reject
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </motion.div>
-                );
-              })}
-              {loading && (
-                <motion.div 
-                  initial={{ opacity: 0, y: 10 }}
+        <div className="flex-1 space-y-4 overflow-y-auto p-6">
+          <AnimatePresence initial={false}>
+            {chat
+              .filter((m) => m.role !== "agent" || visibleContent(m.content).trim())
+              .map((item, index, arr) => {
+              const isCurrentStreaming = loading && index === arr.length - 1 && item.role === "agent";
+              const prevRole = index > 0 ? arr[index - 1].role : null;
+              const isFirstInGroup = item.role !== prevRole;
+              return (
+                <motion.div
+                  key={`${item.id || "new"}-${index}`}
+                  initial={{ opacity: 0, y: 6 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className="flex justify-start"
+                  transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+                  className={`flex ${item.role === "user" ? "justify-end" : "justify-start"}`}
                 >
-                  <div className="flex items-end space-x-2 max-w-[75%]">
-                    <div className="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 bg-blue-500 shadow-sm mb-1">
-                      <Loader2 className="w-4 h-4 text-white animate-spin" />
-                    </div>
-                    <div className="p-4 rounded-2xl rounded-tl-sm bg-white dark:bg-[#2c2c2e] border border-black/5 dark:border-white/5 shadow-sm">
-                      <div className="flex space-x-1.5">
-                        <div className="w-2 h-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-bounce" />
-                        <div className="w-2 h-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "0.15s" }} />
-                        <div className="w-2 h-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: "0.3s" }} />
+                  {item.role === "agent" ? (
+                    <div className="flex min-w-0 max-w-[82%] items-start gap-3">
+                      {/* Bot avatar — only on first message in a sequence */}
+                      <div className={`mt-0.5 shrink-0 transition-opacity ${isFirstInGroup ? "opacity-100" : "opacity-0"}`}>
+                        <div className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-600/15">
+                          <Bot className="h-3.5 w-3.5 text-blue-400" />
+                        </div>
+                      </div>
+                      {/* Message content — flat, no bubble */}
+                      <div className="min-w-0 flex-1 pb-1">
+                        <MessageContent
+                          content={visibleContent(item.content)}
+                          projectId={projectId}
+                          isStreaming={isCurrentStreaming}
+                        />
                       </div>
                     </div>
-                  </div>
+                  ) : (
+                    <div className="max-w-[75%] rounded-2xl bg-blue-600 px-4 py-3 text-sm text-white shadow-xs">
+                      <MessageContent
+                        content={visibleContent(item.content)}
+                        projectId={projectId}
+                        isStreaming={false}
+                      />
+                    </div>
+                  )}
                 </motion.div>
-              )}
-              </AnimatePresence>
-              <div ref={messagesEndRef} />
-            </div>
+              );
+            })}
+          </AnimatePresence>
 
-            <div className="p-4 border-t border-black/5 dark:border-white/10 glass-panel z-20 sticky bottom-0">
-              <form onSubmit={sendMessage} className="relative max-w-4xl mx-auto">
-                <input
-                  type="text"
-                  value={message}
-                  onChange={(e) => setMessage(e.target.value)}
-                  placeholder="Ask the agent to inspect or configure..."
-                  className="w-full bg-white dark:bg-[#1c1c1e] border border-black/10 dark:border-white/10 rounded-full py-3.5 pl-6 pr-14 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-black dark:text-white shadow-sm transition-all"
-                />
-                <button
-                  type="submit"
-                  disabled={loading || !message.trim()}
-                  className="absolute right-1.5 top-1.5 bottom-1.5 aspect-square flex items-center justify-center rounded-full bg-blue-500 hover:bg-blue-600 disabled:opacity-50 disabled:hover:bg-blue-500 transition-colors shadow-sm"
-                >
-                  <Send className="w-4 h-4 text-white ml-0.5" />
-                </button>
-              </form>
-            </div>
-          </>
-        )}
-      </div>
+          {/* Pending Approval Card */}
+          <AnimatePresence>
+            {pending && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.96, y: 8 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.96, y: 4 }}
+                transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+                className="max-w-2xl rounded-2xl border border-amber-400/80 bg-amber-50/90 p-5 text-sm shadow-sm backdrop-blur-md dark:border-amber-500/30 dark:bg-amber-950/30"
+              >
+                <div className="flex items-center gap-2 font-semibold text-amber-800 dark:text-amber-300">
+                  <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+                  <span>Class {pending.risk_class} action awaiting approval</span>
+                </div>
+                <p className="mt-2 font-mono text-xs text-amber-900/80 dark:text-amber-200/80">
+                  {pending.tool}
+                </p>
+                <pre className="mt-3 max-h-72 overflow-auto rounded-xl bg-black/5 p-3 font-mono text-xs text-gray-800 dark:bg-black/40 dark:text-gray-200">
+                  {JSON.stringify(pending.preview, null, 2)}
+                </pre>
+                <div className="mt-4 flex gap-2.5">
+                  <button
+                    disabled={deciding}
+                    onClick={() => void decide("approve")}
+                    className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-xs transition-transform active:scale-95 disabled:opacity-50"
+                  >
+                    {deciding ? "Approving…" : "Approve"}
+                  </button>
+                  <button
+                    disabled={deciding}
+                    onClick={() => void decide("reject")}
+                    className="rounded-xl bg-gray-200 px-4 py-2 text-xs font-semibold text-gray-800 transition-transform hover:bg-gray-300 active:scale-95 disabled:opacity-50 dark:bg-white/10 dark:text-gray-200 dark:hover:bg-white/20"
+                  >
+                    Reject
+                  </button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Activity Stepper */}
+          <ActivityStepper
+            steps={steps}
+            usage={usage}
+            isStuck={isStuck}
+          />
+
+          {/* Error Banner */}
+          <AnimatePresence>
+            {error && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.98, y: 4 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.98, y: -4 }}
+                transition={{ duration: 0.18 }}
+                className="max-w-2xl rounded-2xl border border-red-200 bg-red-50/90 p-4 text-sm shadow-sm dark:border-red-900/50 dark:bg-red-950/30"
+              >
+                <div className="flex items-center gap-2 font-semibold text-red-700 dark:text-red-400">
+                  <AlertTriangle className="h-4 w-4" />
+                  <span>Agent Error</span>
+                </div>
+                <p className="mt-1.5 font-medium text-red-600 dark:text-red-300">{error}</p>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <div ref={bottom} />
+        </div>
+        <form onSubmit={send} className="border-t border-white/5 bg-zinc-900 p-3">
+          <div className="relative mx-auto max-w-4xl">
+            <textarea
+              rows={1}
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              onKeyDown={handleKeyDown}
+              disabled={loading || Boolean(pending)}
+              placeholder={pending ? "Resolve the pending action first" : "Ask the agent… (⌘↵ to send)"}
+              className="w-full resize-none overflow-hidden rounded-2xl border border-white/10 bg-zinc-800 px-5 py-3 pr-12 text-sm text-white placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500/60"
+              style={{ fieldSizing: "content", maxHeight: "9rem" } as React.CSSProperties}
+            />
+            <button
+              type="submit"
+              disabled={loading || !message.trim() || Boolean(pending)}
+              className="absolute bottom-2 right-2 rounded-xl bg-blue-600 p-2 text-white transition-transform hover:bg-blue-500 active:scale-95 disabled:opacity-30"
+            >
+              <Send className="h-4 w-4" />
+            </button>
+          </div>
+          {usage && <p className="mt-1.5 text-center font-mono text-[10px] text-gray-600">{usage}</p>}
+        </form>
+      </section>
     </div>
   );
 }

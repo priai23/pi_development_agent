@@ -1,0 +1,12 @@
+{
+    "bridge_url": "https://odoo.local",
+    "public_key_base64": "YOUR_BASE64_ENCODED_PUBLIC_KEY",
+    "allowed_artifact_hosts": [
+        "storage.googleapis.com",
+        "s3.amazonaws.com"
+    ],
+    "odoo_path": "/opt/odoo/odoo-server",
+    "custom_addons_path": "/opt/odoo/custom_addons",
+    "odoo_user": "odoo",
+    "restart_command": ["sudo", "systemctl", "restart", "odoo"]
+}

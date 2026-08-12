@@ -1,87 +1,372 @@
-from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional, List
+from typing import Literal
 
-# Interaction Schemas
-class InteractionBase(BaseModel):
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, EmailStr, Field
+
+
+class ORMModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserOut(ORMModel):
+    id: int
+    email: str
     role: str
-    content: str
+    is_active: bool
+    must_change_password: bool
 
-class InteractionCreate(InteractionBase):
-    project_id: int
 
-class Interaction(InteractionBase):
+class AuthState(BaseModel):
+    user: UserOut
+    csrf_token: str
+
+
+class AdminUserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=12)
+    role: Literal["admin", "member"] = "member"
+    organization_ids: list[int] = []
+    approver_organization_ids: list[int] = []
+
+
+class AdminUserUpdate(BaseModel):
+    role: Literal["admin", "member"] | None = None
+    is_active: bool | None = None
+    organization_ids: list[int] | None = None
+    approver_organization_ids: list[int] | None = None
+
+
+class OrganizationCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+class BudgetUpdate(BaseModel):
+    monthly_budget_usd: float = Field(gt=0, le=1_000_000)
+    budget_warning_percent: int = Field(default=80, ge=1, le=100)
+
+
+class OrganizationOut(ORMModel):
+    id: int
+    name: str
+    created_at: datetime
+    monthly_budget_usd: float | None
+    budget_warning_percent: int
+
+
+class InstanceOut(ORMModel):
     id: int
     project_id: int
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-# Instance Schemas (formerly ERPProfile)
-class InstanceBase(BaseModel):
     erp_type: str
     url: str
-    db_name: Optional[str] = None
-    username: str
-
-class InstanceCreate(InstanceBase):
-    password: str
-    project_id: int
-
-class Instance(InstanceBase):
-    id: int
-    project_id: int
+    db_name: str | None
+    username: str | None
+    environment: str
+    hosting_type: str
+    auth_method: str
+    status: str
+    is_active: bool
+    version_info: dict
+    capabilities: dict
+    bridge_status: str
+    last_tested_at: datetime | None
+    last_error: str | None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
 
-# Project Schemas
-class ProjectBase(BaseModel):
-    name: str
-    workspace_path: Optional[str] = None
-
-class ProjectCreate(ProjectBase):
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
     organization_id: int
 
-class Project(ProjectBase):
+
+class ProjectOut(ORMModel):
     id: int
-    organization_id: int
-    created_at: datetime
-    instances: List[Instance] = []
-
-    class Config:
-        from_attributes = True
-
-# Organization Schemas
-class OrganizationBase(BaseModel):
     name: str
-
-class OrganizationCreate(OrganizationBase):
-    pass
-
-class Organization(OrganizationBase):
-    id: int
+    organization_id: int
+    created_by_id: int
+    workspace_slug: str
+    phase: str
     created_at: datetime
-    projects: List[Project] = []
+    instances: list[InstanceOut] = []
 
-    class Config:
-        from_attributes = True
 
 class DetectRequest(BaseModel):
-    url: str
-    erp_type: str
+    url: AnyHttpUrl
+    erp_type: Literal["odoo", "pi_erp"]
 
-class SettingBase(BaseModel):
-    key: str
-    value: str
 
-class SettingCreate(SettingBase):
-    pass
+class InstanceCreate(BaseModel):
+    erp_type: Literal["odoo", "pi_erp"]
+    url: AnyHttpUrl
+    db_name: str | None = None
+    username: str | None = None
+    password: str | None = None
+    api_key: str | None = None
+    environment: Literal["staging", "production"] = "staging"
+    hosting_type: Literal["on_premise", "odoo_sh"] = "on_premise"
+    auth_method: Literal["json2", "xmlrpc"] = "json2"
+    project_id: int
 
-class Setting(SettingBase):
-    updated_at: datetime
 
-    class Config:
-        from_attributes = True
+class InstanceUpdate(BaseModel):
+    url: AnyHttpUrl | None = None
+    db_name: str | None = None
+    username: str | None = None
+    password: str | None = None
+    api_key: str | None = None
+    environment: Literal["staging", "production"] | None = None
+    hosting_type: Literal["on_premise", "odoo_sh"] | None = None
+    auth_method: Literal["json2", "xmlrpc"] | None = None
+    is_active: bool | None = None
+
+
+class InteractionOut(ORMModel):
+    id: int
+    project_id: int
+    role: str
+    content: str
+    created_at: datetime
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=20_000)
+
+
+class ActionDecision(BaseModel):
+    decision: Literal["approve", "reject"]
+
+
+class PendingActionOut(ORMModel):
+    id: str
+    tool_name: str
+    preview: dict
+    risk_class: str
+    expires_at: datetime
+
+
+class LLMSettingsOut(BaseModel):
+    model_name: str
+    api_key_configured: bool
+    fallback_model_name: str | None = None
+    timeout_seconds: int = 120
+    max_output_tokens: int = 8000
+
+
+class LLMSettingsUpdate(BaseModel):
+    model_name: str = Field(min_length=1, max_length=200)
+    openrouter_api_key: str | None = Field(default=None, min_length=10)
+    fallback_model_name: str | None = None
+    timeout_seconds: int = Field(default=120, ge=10, le=600)
+    max_output_tokens: int = Field(default=8000, ge=256, le=100_000)
+
+
+class RunCreate(BaseModel):
+    message: str = Field(min_length=1, max_length=20_000)
+    queue_if_busy: bool = False
+
+
+class RunOut(ORMModel):
+    id: str
+    project_id: int
+    requested_by_id: int
+    status: str
+    prompt: str
+    support_id: str
+    error_category: str | None
+    error_message: str | None
+    retryable: bool
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class ToolEventOut(ORMModel):
+    id: int
+    run_id: str
+    sequence: int
+    event_type: str
+    payload: dict
+    created_at: datetime
+
+
+class HostPolicyCreate(BaseModel):
+    hostname_pattern: str = Field(min_length=1, max_length=255)
+    allow_private_network: bool = False
+    require_https: bool = True
+
+
+class HostPolicyOut(ORMModel):
+    id: int
+    hostname_pattern: str
+    allow_private_network: bool
+    require_https: bool
+    is_active: bool
+    created_by_id: int
+    created_at: datetime
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=12)
+
+
+class PasswordResetComplete(BaseModel):
+    token: str
+    new_password: str = Field(min_length=12)
+
+
+class SessionOut(ORMModel):
+    id: str
+    expires_at: datetime
+    created_at: datetime
+    last_seen_at: datetime
+
+
+class RequirementCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    description: str = ""
+    acceptance_criteria: str = ""
+    owner_id: int | None = None
+
+
+class RequirementOut(ORMModel):
+    id: int
+    project_id: int
+    title: str
+    description: str
+    acceptance_criteria: str
+    status: str
+    owner_id: int | None
+    approved_by_id: int | None
+    created_at: datetime
+
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    requirement_id: int | None = None
+    owner_id: int | None = None
+
+
+class TaskOut(ORMModel):
+    id: int
+    project_id: int
+    requirement_id: int | None
+    title: str
+    status: str
+    owner_id: int | None
+    created_at: datetime
+
+
+class DiscoveryCreate(BaseModel):
+    category: Literal["instance", "version", "modules", "configuration", "security", "data"]
+    title: str = Field(min_length=1, max_length=300)
+    evidence: dict = {}
+    verified: bool = False
+
+
+class SpecificationCreate(BaseModel):
+    requirement_id: int
+    content: str = Field(min_length=20)
+    risk_assessment: str = Field(min_length=10)
+
+
+class UATEvidenceCreate(BaseModel):
+    artifact_id: str
+    notes: str = Field(min_length=10)
+
+
+class PhaseUpdate(BaseModel):
+    phase: Literal["discovery", "requirements", "design", "build", "validate", "uat", "ready_for_production"]
+
+
+class AuditOut(ORMModel):
+    id: int
+    project_id: int | None
+    user_id: int | None
+    organization_id: int | None
+    event_type: str
+    risk_class: str | None
+    result: str | None
+    support_id: str | None
+    details: dict
+    created_at: datetime
+
+
+class ArtifactCreate(BaseModel):
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]*$", max_length=100)
+    version: str = Field(pattern=r"^19\.0\.\d+\.\d+\.\d+$")
+    path: str
+    requirement_id: int | None = None
+
+
+class ArtifactOut(ORMModel):
+    id: str
+    project_id: int
+    requirement_id: int | None
+    artifact_type: str
+    name: str
+    version: str
+    commit_hash: str
+    digest: str
+    path: str
+    status: str
+    created_by_id: int
+    created_at: datetime
+
+
+class ValidationOut(ORMModel):
+    id: str
+    project_id: int
+    artifact_id: str
+    status: str
+    report: dict
+    logs: str
+    created_at: datetime
+    finished_at: datetime | None
+
+
+class DeploymentConfigUpdate(BaseModel):
+    bridge_url: AnyHttpUrl | None = None
+    bridge_token: str | None = None
+    repository_url: str | None = None
+    staging_branch: str | None = None
+    production_branch: str | None = None
+    module_directory: str | None = None
+    git_deploy_key: str | None = None
+
+
+class DeploymentConfigOut(BaseModel):
+    configured: bool
+    public_key_base64: str | None = None
+    bridge_url: str | None = None
+    repository_configured: bool = False
+
+
+class DeploymentCreate(BaseModel):
+    instance_id: int
+    artifact_id: str
+    rollback_plan: str = Field(min_length=10, max_length=10_000)
+
+
+class DeploymentOut(ORMModel):
+    id: str
+    project_id: int
+    instance_id: int
+    artifact_id: str
+    validation_id: str
+    environment: str
+    status: str
+    requested_by_id: int
+    approved_by_id: int | None
+    rollback_plan: str
+    logs: str
+    external_job_id: str | None
+    created_at: datetime
+    finished_at: datetime | None

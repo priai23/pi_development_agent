@@ -1,107 +1,97 @@
-# PI ERP Implementation Agent
+# Odoo ERP Implementation Agent
 
-An advanced, agentic AI assistant designed explicitly for **Odoo 19 Custom Module Development**, built by Primacy Infotech. 
+An internal, human-approved Odoo 19 implementation agent. The application combines a FastAPI API, PostgreSQL persistence, a LangGraph agent, and a Next.js 16 frontend.
 
-The application uses a **LangGraph-powered** reactive agent capable of reasoning, planning, and securely writing Python and XML directly to your local file system to build Odoo modules from scratch. The agent operates with a **Human-in-the-loop (HITL)** architecture, ensuring that all potentially unsafe filesystem operations are presented for your explicit approval before execution.
+## Security model
 
----
+- Local Argon2-backed accounts with administrator and member roles
+- Organization-scoped projects and ERP connections
+- HttpOnly session cookies, CSRF protection, explicit CORS/trusted-host configuration
+- Fernet-encrypted ERP and OpenRouter credentials that are never returned by the API
+- PostgreSQL-backed agent checkpoints and durable, user-bound action approvals
+- Read-only tools run directly; every filesystem or supported ERP write requires explicit approval
+- Server-owned workspace paths with traversal, prefix-collision, symlink, and size checks
+- Audited requests, decisions, and execution results
 
-## 🌟 Features
+The model never receives raw ORM methods, domains, SQL, shell commands, filesystem paths, or Git commands. It can inspect allowlisted metadata, create approved master data and draft transactions, and prepare module source. Installation and upgrades occur only through validated artifacts and the separate deployment runner.
 
-- **Agentic Odoo 19 Developer:** Integrated with an extensive Knowledge Base (`skills/Odoo19_Dev_Customization_KB.md`) tailored to the latest Odoo 19 ORM, View, and Security paradigms.
-- **Human-in-the-loop (HITL):** Safe and transparent execution. When the agent wants to write or modify a file, you get an actionable "Action Pending" card in the UI to approve or reject the change.
-- **Dynamic Model Selection:** Configurable OpenRouter integration. Fetch, search, and switch between 400+ LLMs directly from the polished Settings UI.
-- **Apple-Style Aesthetics:** A buttery smooth, premium interface built with Next.js, Tailwind CSS, and Framer Motion. 
-- **Local Postgres Database:** Securely stores your OpenRouter API keys, model preferences, and workspaces.
+## Prerequisites
 
----
+- Python 3.11+
+- Node.js 20+
+- PostgreSQL
+- An Odoo 19 instance whose hostname is explicitly allowed
 
-## 🏗️ Architecture
+## Backend setup
 
-The project is structured as a full-stack application:
+```bash
+cd backend
+python3 -m venv venv
+source venv/bin/activate
+pip install -e '.[test]'
+cp .env.example .env
+```
 
-- **`/backend`**: 
-  - **FastAPI** powering the REST endpoints.
-  - **LangGraph** defining the stateful reactive agent (`agent.py`).
-  - **SQLAlchemy** + **PostgreSQL** for data persistence.
-  
-- **`/frontend`**:
-  - **Next.js 15** (App Router) with React Server Components.
-  - **Tailwind CSS** + **Framer Motion** for a premium, micro-animation-heavy UI.
-  - Dynamic OpenRouter configuration and real-time Server-Sent Events (SSE) chat streaming.
+Generate `ENCRYPTION_KEY` once with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Keep it outside source control; losing or changing it makes stored credentials unreadable.
 
-- **`/skills`**:
-  - Custom markdown-based instructions and knowledge bases injected directly into the agent's context.
+Set `ERP_ALLOWED_HOSTS` to exact approved hostnames or explicit suffixes such as `.internal.example`. Production deployments must use HTTPS, set `SECURE_COOKIES=true`, and set exact frontend and trusted-host values.
 
----
+Migrations after the hardened baseline are incremental and preserve application data:
 
-## 🚀 Getting Started
+```bash
+alembic upgrade head
+python manage.py create-admin admin@example.com
+uvicorn main:app --reload --port 8001
+```
 
-### Prerequisites
-- Python 3.10+
-- Node.js 18+
-- PostgreSQL (running and accessible)
-- OpenRouter API Key
+Run the durable tool/deployment worker in a second process:
 
-### 1. Setup Backend
+```bash
+cd backend
+venv/bin/python worker.py
+```
 
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
-2. Create and activate a virtual environment:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Configure your environment variables:
-   - Ensure you have a `.env` file or export your `DATABASE_URL` (e.g., `postgresql://postgres:postgres@localhost:5432/erp_agent`).
-5. Start the FastAPI server:
-   ```bash
-   uvicorn main:app --reload --port 8001
-   ```
+Agent use is disabled until an administrator configures an OpenRouter key, selects a catalogue-validated model, and sets an organization monthly budget.
 
-### 2. Setup Frontend
+## Frontend setup
 
-1. Navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Start the Next.js development server:
-   ```bash
-   npm run dev
-   ```
-4. Open [http://localhost:3000](http://localhost:3000) in your browser.
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
----
+Set `NEXT_PUBLIC_API_URL` when the API is not at `http://localhost:8001`.
 
-## ⚙️ Configuration
+## Quality gates
 
-Before chatting with the agent, you must configure your OpenRouter API key:
+```bash
+cd backend && pytest && python -m compileall -q .
+cd frontend && npm run lint && npm test && npx tsc --noEmit && npm run build
+```
 
-1. Open the application at [http://localhost:3000](http://localhost:3000).
-2. Navigate to **Settings** in the sidebar.
-3. Paste your **OpenRouter API Key**.
-4. Use the searchable combobox to select your preferred **LLM Model** (e.g., `openai/gpt-4o`, `anthropic/claude-3.5-sonnet`).
-5. Click **Save Settings**.
+After the first administrator signs in, create an organization, add projects, configure the OpenRouter model/key under Settings, and connect approved Odoo instances. Existing prototype credentials must be re-entered.
 
----
+## Deployment targets
 
-## 🛠️ Usage
+### On-premise Odoo 19
 
-1. **Create a Workspace**: Navigate to the home page or projects page to create a new module building workspace.
-2. **Chat with the Agent**: Prompt the agent to build an Odoo 19 module (e.g., *"Create a Real Estate Property Management module"*).
-3. **Approve Actions**: The agent will plan the module architecture. When it attempts to scaffold directories or write `__manifest__.py`, an "Action Pending" card will appear. Review the code and click **Approve** to execute the filesystem write.
+1. Install `odoo_addons/primacy_deployment_bridge` manually and generate a strong bridge token in Odoo system parameter `primacy_bridge.api_token`.
+2. Create a least-privileged operating-system account that can write only the custom-addons and runner backup directories and can invoke only the configured Odoo command/service policy.
+3. In the connection screen, configure the bridge URL/token. Copy the returned Ed25519 public key into a runner configuration based on `bridge_runner/config.example.json`.
+4. Store `PRIMACY_BRIDGE_TOKEN` in the runner service secret store, not in its JSON file, and start `python -m bridge_runner.runner --config /etc/primacy-runner.json`.
+5. Configure `PUBLIC_BASE_URL` as an HTTPS URL reachable by the runner. Allow that hostname in the runner's `allowed_artifact_hosts`.
 
----
+The Odoo web process only stores and reports jobs. The runner independently verifies signature, nonce, expiry, digest, archive contents, module name, and fixed command arguments. Failed upgrades restore the retained prior artifact.
 
-## 📄 License
-Internal use only - Primacy Infotech.
+### Odoo.sh
+
+Configure an administrator-approved `ssh://` or HTTPS repository URL, staging branch template, and encrypted deploy key on the instance. Deployments push the exact validated workspace commit to a `primacy/<project>/<release>`-style branch. Promotion remains gated on the same digest, successful staging, UAT evidence, rollback plan, and a different Class E approver.
+
+Odoo Online custom Python deployment is intentionally unsupported.
+
+## Recovery and operations
+
+- The worker runs a recovery sweep on startup. Expired approvals are rejected into their waiting checkpoint; stale runs become retryable interruptions; unclaimed outbox work is returned to the queue.
+- Run history includes typed tool/message/approval/usage events and support IDs. Administrators can search audit events, export safe CSV, inspect queue health, and revoke sessions.
+- Back up PostgreSQL, the project workspace root, deployment-runner backups, bridge tokens, signing keys, and Odoo databases before production promotion. Rotate a bridge token or signing key by updating the application target and runner together.
