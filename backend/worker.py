@@ -117,7 +117,7 @@ async def build_agent(db, run: models.AgentRun, checkpointer):
         decrypt_secret(key.value) if key else None,
         "https://openrouter.ai/api/v1" if key else None,
         int(timeout.value) if timeout else 120,
-        int(max_tokens.value) if max_tokens else 8000,
+        int(max_tokens.value) if max_tokens else 16000,
         project.id,
         run.requested_by_id,
         instance.id,

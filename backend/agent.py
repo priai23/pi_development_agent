@@ -149,6 +149,7 @@ class ERPImplementationAgent:
         # Workspace file writes are git-backed and fully reversible — auto-approve
         "create_directory",
         "write_file",
+        "patch_file",
     }
     RISK_CLASSES = {
         "create_directory": "C",
@@ -177,7 +178,7 @@ class ERPImplementationAgent:
         api_key: str | None = None,
         base_url: str | None = None,
         request_timeout: int = 120,
-        max_output_tokens: int = 8000,
+        max_output_tokens: int = 16000,
         project_id: int | None = None,
         requested_by_id: int | None = None,
         instance_id: int | None = None,
@@ -314,8 +315,31 @@ class ERPImplementationAgent:
 
         @tool
         def write_file(path: str, content: str) -> str:
-            """Atomically write a UTF-8 file inside this project's workspace after approval."""
+            """Atomically write a UTF-8 file inside this project's workspace. Validates Python and XML syntax before writing — returns an error string (not an exception) if validation fails so you can fix and retry."""
+            import ast as _ast
+            import xml.etree.ElementTree as _ET
+            if path.endswith(".py"):
+                try:
+                    _ast.parse(content, filename=path)
+                except SyntaxError as exc:
+                    return f"SYNTAX_ERROR in {path}: {exc}. Fix the code and call write_file again."
+            elif path.endswith(".xml"):
+                try:
+                    _ET.fromstring(content) if not content.strip().startswith("<?xml") else _ET.fromstring(content.split("\n", 1)[-1])
+                except _ET.ParseError as exc:
+                    return f"XML_ERROR in {path}: {exc}. Fix the XML and call write_file again."
             return self.workspace.write_file(path, content)
+
+        @tool
+        def patch_file(path: str, old_str: str, new_str: str) -> str:
+            """Replace old_str with new_str in an existing workspace file. Use for small targeted edits instead of rewriting the whole file. Returns an error if old_str is not found or appears more than once."""
+            current = self.workspace.read_file(path)
+            count = current.count(old_str)
+            if count == 0:
+                return f"PATCH_ERROR: old_str not found in {path}. Use read_file to check the current content."
+            if count > 1:
+                return f"PATCH_ERROR: old_str appears {count} times in {path}. Make old_str more specific."
+            return self.workspace.write_file(path, current.replace(old_str, new_str, 1))
 
         @tool
         def update_company_contact(company_id: int, email: str, phone: str | None = None) -> str:
@@ -528,6 +552,7 @@ class ERPImplementationAgent:
             read_file,
             create_directory,
             write_file,
+            patch_file,
             update_company_contact,
             configure_sales,
             configure_purchase,
@@ -543,20 +568,30 @@ class ERPImplementationAgent:
             check_deployment_status,
         ]
         kb_path = Path(__file__).parent.parent / "skills" / "odoo19-dev" / "Odoo19_Dev_Customization_KB.md"
-        knowledge = kb_path.read_text(encoding="utf-8") if kb_path.exists() else ""
+        self._kb_path = kb_path  # stored for the read_knowledge_base tool below
+
+        @tool
+        def read_knowledge_base() -> str:
+            """Read the Odoo 19 technical reference (ORM patterns, view syntax, manifest format, security CSV). Call this ONCE before writing any module code if you are uncertain about Odoo 19 conventions."""
+            return kb_path.read_text(encoding="utf-8") if kb_path.exists() else "Knowledge base not found."
+
+        self.tools.append(read_knowledge_base)
+        # Add to SAFE_TOOLS so it doesn't require approval
+        ERPImplementationAgent.SAFE_TOOLS.add("read_knowledge_base")
+
         prompt = SystemMessage(
             content=(
                 "You are an expert autonomous Odoo 19 ERP implementation agent. "
                 "Every ERP schema fact must come from a tool result. "
-                "Use only the registered typed tools. File and ERP writes require human approval.\n\n"
+                "Use only the registered typed tools.\n\n"
                 "When requested to build, customize, or scaffold a module:\n"
-                "1. Inspect the live database schema (via inspect_odoo_schema or inspect_views) to verify model names and fields. Do this ONCE — do not repeat if you have already done it in this session.\n"
-                "2. Create the required directory structure using create_directory.\n"
-                "3. Write all required module files (__manifest__.py, __init__.py, models, views, security/ir.model.access.csv) using write_file.\n"
-                "4. Always write clean, complete Odoo 19 compliant Python and XML code without placeholders.\n"
-                "5. After all files are written, call package_module to validate and package the module, then provide a friendly summary of what you created.\n"
-                "6. Always call one tool at a time.\n\n"
-                f"Odoo 19 Technical Reference:\n{knowledge}"
+                "1. Inspect the live database schema (inspect_odoo_schema / inspect_views) ONCE to verify model names and fields. Do NOT repeat if you already have results in this session.\n"
+                "2. If uncertain about Odoo 19 syntax (ORM fields, view arch, manifest format), call read_knowledge_base ONCE.\n"
+                "3. Create directories with create_directory, then write files with write_file.\n"
+                "4. If write_file returns SYNTAX_ERROR or XML_ERROR, fix the content and call write_file again immediately.\n"
+                "5. After each write_file call, call read_file on the same path to verify the file was written correctly.\n"
+                "6. After all files are written, call package_module to validate, then summarise what was built.\n"
+                "7. Always call exactly one tool at a time. Never use placeholders in generated code."
             )
         )
         self.executor = create_react_agent(
