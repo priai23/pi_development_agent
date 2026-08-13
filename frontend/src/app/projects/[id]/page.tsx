@@ -568,6 +568,15 @@ export default function ProjectWorkspace() {
             steps={steps}
             usage={usage}
             isStuck={isStuck}
+            onOpenDiff={() => {
+              setShowRightPanel(true);
+              setRightPanelTab("diff");
+            }}
+            onOpenFile={(filepath) => {
+              setShowRightPanel(true);
+              setRightPanelTab("code");
+              void openFile(filepath);
+            }}
           />
 
           {/* Error Banner */}
