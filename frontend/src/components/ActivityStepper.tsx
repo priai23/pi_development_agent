@@ -11,7 +11,9 @@ import {
   XCircle,
   Loader2,
   FileSearch,
-  ExternalLink
+  ExternalLink,
+  ListTodo,
+  Circle
 } from "lucide-react";
 import { Step } from "@/lib/api";
 
@@ -45,6 +47,19 @@ export default function ActivityStepper({
   const editSteps = steps.filter((s) => s.tool.includes("write") || s.tool.includes("patch") || s.tool.includes("replace"));
   const runSteps = steps.filter((s) => !viewSteps.includes(s) && !editSteps.includes(s));
 
+  // Extract live task plan checklist if available
+  const planStep = steps.find((s) => s.tool === "update_task_plan" || s.tool === "plan.updated");
+  let planItems: Array<{ title: string; status: string }> = [];
+  if (planStep?.result) {
+    try {
+      const parsed = JSON.parse(planStep.result);
+      if (Array.isArray(parsed.items)) planItems = parsed.items;
+      else if (Array.isArray(parsed)) planItems = parsed;
+    } catch {
+      // ignore
+    }
+  }
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 8, scale: 0.98 }}
@@ -57,6 +72,41 @@ export default function ActivityStepper({
         <div className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-800 dark:border-amber-700/40 dark:bg-amber-950/40 dark:text-amber-300">
           <span className="inline-block h-2 w-2 rounded-full bg-amber-500 animate-ping" />
           No activity for 60s — the agent may be processing a long tool task.
+        </div>
+      )}
+
+      {/* Live Plan Checklist Card */}
+      {planItems.length > 0 && (
+        <div className="rounded-xl border border-purple-500/30 bg-purple-950/20 p-3 text-xs space-y-2 backdrop-blur-md">
+          <div className="flex items-center justify-between font-semibold text-purple-300">
+            <div className="flex items-center gap-2">
+              <ListTodo className="h-4 w-4 text-purple-400" />
+              <span>Agent Execution Plan</span>
+            </div>
+            <span className="font-mono text-[10px] text-purple-400">
+              {planItems.filter((i) => i.status === "completed").length}/{planItems.length} completed
+            </span>
+          </div>
+          <ul className="space-y-1.5 pl-1">
+            {planItems.map((item, i) => {
+              const isDone = item.status === "completed";
+              const isRunning = item.status === "in_progress";
+              return (
+                <li key={i} className="flex items-center gap-2 text-gray-300">
+                  {isDone ? (
+                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                  ) : isRunning ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-purple-400 shrink-0" />
+                  ) : (
+                    <Circle className="h-3.5 w-3.5 text-gray-600 shrink-0" />
+                  )}
+                  <span className={`text-xs ${isDone ? "line-through text-gray-500" : isRunning ? "font-semibold text-purple-200" : "text-gray-400"}`}>
+                    {item.title}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
         </div>
       )}
 

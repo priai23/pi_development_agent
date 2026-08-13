@@ -618,6 +618,43 @@ class ERPImplementationAgent:
             save_memory,
             search_memory,
         ]
+        @tool
+        def update_task_plan(plan_items: list[dict]) -> str:
+          """Update the live execution plan checklist for the user. Each item must have 'title' (string) and 'status' ('pending' | 'in_progress' | 'completed'). Call this at the start of a task and whenever progress advances."""
+          self.activity_events.append(("plan.updated", {"items": plan_items}))
+          return json.dumps({"status": "plan_updated", "count": len(plan_items)})
+
+        @tool
+        def verify_module_installation(module_name: str, expected_models: list[str] | None = None, expected_fields: list[str] | None = None) -> str:
+          """Perform explicit post-build XML-RPC verification on Odoo 19 database. Verifies module state == 'installed', and checks ir.model and ir.model.fields. Call this before returning final completion."""
+          expected_models = expected_models or []
+          expected_fields = expected_fields or []
+          checks = []
+          try:
+            mods = self._search_read("ir.module.module", [("name", "=", module_name)], ["id", "name", "state"])
+            mod_installed = bool(mods) and mods[0]["state"] == "installed"
+            checks.append({"check": "module_installed", "passed": mod_installed, "details": f"Module {module_name} state: {mods[0]['state'] if mods else 'not found'}"})
+
+            for model_name in expected_models:
+              models_found = self._search_read("ir.model", [("model", "=", model_name)], ["id", "model", "name"])
+              model_ok = bool(models_found)
+              checks.append({"check": f"model_exists:{model_name}", "passed": model_ok, "details": f"Model {model_name} found: {model_ok}"})
+
+            for field_name in expected_fields:
+              fields_found = self._search_read("ir.model.fields", [("name", "=", field_name)], ["id", "model", "name"])
+              field_ok = bool(fields_found)
+              checks.append({"check": f"field_exists:{field_name}", "passed": field_ok, "details": f"Field {field_name} found: {field_ok}"})
+
+            passed = all(c["passed"] for c in checks)
+            return json.dumps({"passed": passed, "checks": checks})
+          except Exception as exc:
+            return json.dumps({"passed": False, "error": str(exc)})
+
+        self.tools.append(update_task_plan)
+        self.tools.append(verify_module_installation)
+        ERPImplementationAgent.SAFE_TOOLS.add("update_task_plan")
+        ERPImplementationAgent.SAFE_TOOLS.add("verify_module_installation")
+
         kb_path = Path(__file__).parent.parent / "skills" / "odoo19-dev" / "Odoo19_Dev_Customization_KB.md"
         self._kb_path = kb_path  # stored for the read_knowledge_base tool below
 
@@ -646,14 +683,16 @@ class ERPImplementationAgent:
                 "Every ERP schema fact must come from a tool result. "
                 "Use only the registered typed tools.\n\n"
                 "When requested to build, customize, or scaffold a module:\n"
-                "1. Inspect the live database schema (inspect_odoo_schema / inspect_views) ONCE to verify model names and fields. Do NOT repeat if you already have results in this session.\n"
-                "2. If uncertain about Odoo 19 syntax (ORM fields, view arch, manifest format), call read_knowledge_base ONCE.\n"
-                "3. Create directories with create_directory, then write files with write_file.\n"
-                "4. If write_file returns SYNTAX_ERROR or XML_ERROR, fix the content and call write_file again immediately.\n"
-                "5. After each write_file call, call read_file on the same path to verify the file was written correctly.\n"
-                "6. After all files are written, call package_module to validate, then summarise what was built.\n"
-                "7. Always call exactly one tool at a time. Never use placeholders in generated code.\n"
-                "8. Use save_memory whenever you discover a critical schema detail, fix a bug, or receive a key preference from the user so you remember it in future runs."
+                "1. Emit a live task checklist at the start of work using update_task_plan (e.g. ['Inspect schema', 'Write module models & views', 'Package module', 'Verify installation'])\n"
+                "2. Inspect the live database schema (inspect_odoo_schema / inspect_views) ONCE to verify model names and fields. Do NOT repeat if you already have results in this session.\n"
+                "3. If uncertain about Odoo 19 syntax (ORM fields, view arch, manifest format), call read_knowledge_base ONCE.\n"
+                "4. Create directories with create_directory, then write files with write_file.\n"
+                "5. If write_file returns SYNTAX_ERROR or XML_ERROR, fix the content and call write_file again immediately with exact traceback feedback.\n"
+                "6. After files are written, call package_module to validate.\n"
+                "7. Call verify_module_installation to execute explicit XML-RPC checks confirming module state == 'installed' and ORM models exist in database.\n"
+                "8. ALWAYS include a dedicated section titled 'Where to find it inside Odoo 19:' at the end of your final response after building or customizing a module. Specify the exact Apps search name, Odoo top menu path (e.g. Inventory / Operations / Reorder Alerts), and form view smart buttons or field locations.\n"
+                "9. Always call exactly one tool at a time. Never use placeholders in generated code.\n"
+                "10. Use save_memory whenever you discover a critical schema detail, fix a bug, or receive a key preference from the user so you remember it in future runs."
                 f"{memories_text}"
             )
         )
