@@ -1,14 +1,16 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Bot, Database, Loader2, Plus, Send } from "lucide-react";
+import { AlertTriangle, Bot, Brain, Code2, Database, FileText, Folder, GitBranch, Layers, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, Send } from "lucide-react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
 import MessageContent from "@/components/MessageContent";
 import AgentStatus from "@/components/AgentStatus";
 import ActivityStepper from "@/components/ActivityStepper";
-import { apiFetch, AgentRun, ChatMessage, followRun, Instance, PendingAction, Project, Step, ToolEvent, visibleContent } from "@/lib/api";
+import LearnedMemories from "@/components/LearnedMemories";
+import CodeDiffViewer from "@/components/CodeDiffViewer";
+import { apiFetch, AgentRun, Artifact, ChatMessage, Deployment, followRun, Instance, PendingAction, Project, Step, ToolEvent, WorkspaceEntry, visibleContent } from "@/lib/api";
 
 type PendingRecord = { id: string; tool_name: string; preview: Record<string, unknown>; risk_class: string; expires_at: string };
 
@@ -38,12 +40,69 @@ export default function ProjectWorkspace() {
   const [currentTool, setCurrentTool] = useState<string | null>(null);
   const [isThinking, setIsThinking] = useState(false);
   const [deciding, setDeciding] = useState(false);
-  const [isStuck, setIsStuck] = useState(false);
+  const [showLeftSidebar, setShowLeftSidebar] = useState(true);
+  const [showRightPanel, setShowRightPanel] = useState(true);
+  const [rightPanelWidth, setRightPanelWidth] = useState(520);
+  const [isResizingRight, setIsResizingRight] = useState(false);
+  const [rightPanelTab, setRightPanelTab] = useState<"code" | "diff" | "memory" | "evidence">("code");
+  const [entries, setEntries] = useState<WorkspaceEntry[]>([]);
+  const [selectedFile, setSelectedFile] = useState("");
+  const [fileContent, setFileContent] = useState("");
+  const [diffContent, setDiffContent] = useState("");
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [deployments, setDeployments] = useState<Deployment[]>([]);
   const bottom = useRef<HTMLDivElement>(null);
   const discoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const discoverySequence = useRef(0);
   const lastEventAt = useRef<number>(0);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Mouse drag handler for dynamic right panel width resizing
+  useEffect(() => {
+    if (!isResizingRight) return;
+    const handleMouseMove = (e: MouseEvent) => {
+      const newWidth = window.innerWidth - e.clientX;
+      if (newWidth >= 320 && newWidth <= window.innerWidth * 0.75) {
+        setRightPanelWidth(newWidth);
+      }
+    };
+    const handleMouseUp = () => {
+      setIsResizingRight(false);
+    };
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isResizingRight]);
+
+  const loadWorkspaceDetails = useCallback(async () => {
+    try {
+      const [treeData, diffData, artifactData, deploymentData] = await Promise.all([
+        apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree`).catch(() => []),
+        apiFetch<{ diff: string }>(`/projects/${projectId}/workspace/diff`).catch(() => ({ diff: "" })),
+        apiFetch<Artifact[]>(`/projects/${projectId}/artifacts`).catch(() => []),
+        apiFetch<Deployment[]>(`/projects/${projectId}/deployments`).catch(() => []),
+      ]);
+      setEntries(treeData);
+      setDiffContent(diffData.diff);
+      setArtifacts(artifactData);
+      setDeployments(deploymentData);
+    } catch {
+      // ignore
+    }
+  }, [projectId]);
+
+  const openFile = async (path: string) => {
+    try {
+      const file = await apiFetch<{ content: string }>(`/projects/${projectId}/workspace/files?path=${encodeURIComponent(path)}`);
+      setSelectedFile(path);
+      setFileContent(file.content);
+    } catch {
+      // ignore
+    }
+  };
 
   const load = useCallback(async () => {
     try {
@@ -77,9 +136,10 @@ export default function ProjectWorkspace() {
         }
         setSteps(rebuilt);
       }
+      void loadWorkspaceDetails();
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not load project"); }
     finally { setLoading(false); }
-  }, [projectId]);
+  }, [projectId, loadWorkspaceDetails]);
 
   useEffect(() => {
     // State changes occur after the API promises resolve.
@@ -96,7 +156,6 @@ export default function ProjectWorkspace() {
   useEffect(() => {
     if (!loading && !deciding) {
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsStuck(false);
       return;
     }
@@ -313,20 +372,45 @@ export default function ProjectWorkspace() {
   );
 
   return (
-    <div className="flex h-screen">
-      <aside className="w-72 border-r p-6 dark:border-white/10"><h1 className="text-2xl font-bold">{project.name}</h1><div className="mt-6 rounded-xl border p-4 dark:border-white/10"><Database className="mb-2 h-5 w-5 text-blue-600" /><p className="truncate text-sm">{instances[0].url}</p><p className="mt-1 text-xs uppercase text-gray-500">{instances[0].environment} · {instances[0].status}</p></div><Link href={`/projects/${projectId}/workspace`} className="mt-4 block rounded-xl border p-3 text-sm hover:bg-black/5 dark:border-white/10">Workspace & lifecycle</Link><Link href={`/projects/${projectId}/instances`} className="mt-2 block rounded-xl border p-3 text-sm hover:bg-black/5 dark:border-white/10">Odoo connections</Link></aside>
+    <div className={`flex h-screen overflow-hidden ${isResizingRight ? "select-none" : ""}`}>
+      {/* Collapsible Left Sub-Sidebar */}
+      {showLeftSidebar && (
+        <aside className="w-64 shrink-0 border-r p-5 dark:border-white/10">
+          <h1 className="text-xl font-bold truncate">{project.name}</h1>
+          <div className="mt-4 rounded-xl border p-3.5 dark:border-white/10">
+            <Database className="mb-1.5 h-4 w-4 text-blue-600" />
+            <p className="truncate text-xs font-mono">{instances[0].url}</p>
+            <p className="mt-1 text-[10px] uppercase font-semibold text-gray-500">{instances[0].environment} · {instances[0].status}</p>
+          </div>
+          <Link href={`/projects/${projectId}/workspace`} className="mt-4 block rounded-xl border p-2.5 text-xs hover:bg-black/5 dark:border-white/10">
+            Workspace & lifecycle
+          </Link>
+          <Link href={`/projects/${projectId}/instances`} className="mt-2 block rounded-xl border p-2.5 text-xs hover:bg-black/5 dark:border-white/10">
+            Odoo connections
+          </Link>
+        </aside>
+      )}
+
+      {/* Center Fluid Chat Pane */}
       <section className="flex min-w-0 flex-1 flex-col">
         {/* Header */}
-        <header className="flex items-center justify-between border-b border-white/5 bg-zinc-900 px-4 py-3">
-          <div className="flex items-center gap-3">
-            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-600/20">
-              <Bot className="h-4 w-4 text-blue-400" />
+        <header className="flex items-center justify-between border-b border-white/5 bg-zinc-900 px-4 py-2.5">
+          <div className="flex items-center gap-2.5">
+            <button
+              onClick={() => setShowLeftSidebar(!showLeftSidebar)}
+              className="rounded-md border border-white/10 bg-white/5 p-1.5 text-gray-400 hover:bg-white/10 hover:text-white"
+              title="Toggle Project Sub-Sidebar"
+            >
+              {showLeftSidebar ? <PanelLeftClose className="h-3.5 w-3.5" /> : <PanelLeftOpen className="h-3.5 w-3.5" />}
+            </button>
+            <div className="flex h-6 w-6 items-center justify-center rounded-lg bg-blue-600/20">
+              <Bot className="h-3.5 w-3.5 text-blue-400" />
             </div>
-            <span className="text-sm font-semibold text-white">ERP Implementation Agent</span>
+            <span className="text-xs font-semibold text-white">ERP Implementation Agent</span>
             <button
               onClick={() => void startNewChat()}
               disabled={loading || deciding}
-              className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs font-medium text-gray-400 transition hover:bg-white/10 hover:text-white active:scale-95 disabled:opacity-40"
+              className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] font-medium text-gray-400 transition hover:bg-white/10 hover:text-white active:scale-95 disabled:opacity-40"
             >
               <Plus className="h-3 w-3" />
               New Chat
@@ -360,6 +444,18 @@ export default function ProjectWorkspace() {
                 Cancel
               </button>
             )}
+            <button
+              onClick={() => setShowRightPanel(!showRightPanel)}
+              className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                showRightPanel
+                  ? "border-blue-500/30 bg-blue-600/20 text-blue-300"
+                  : "border-white/10 bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white"
+              }`}
+              title="Toggle Right Workspace Panel"
+            >
+              {showRightPanel ? <PanelRightClose className="h-3.5 w-3.5" /> : <PanelRightOpen className="h-3.5 w-3.5" />}
+              <span>IDE Panel</span>
+            </button>
           </div>
         </header>
 
@@ -516,6 +612,161 @@ export default function ProjectWorkspace() {
           {usage && <p className="mt-1.5 text-center font-mono text-[10px] text-gray-600">{usage}</p>}
         </form>
       </section>
+
+      {/* Resizable & Adaptive Right IDE Split-Pane Panel */}
+      {showRightPanel && (
+        <>
+          {/* Draggable Resizer Handle Bar */}
+          <div
+            onMouseDown={() => setIsResizingRight(true)}
+            className={`group relative z-20 w-1.5 cursor-col-resize hover:bg-blue-500/60 active:bg-blue-600 transition-colors ${
+              isResizingRight ? "bg-blue-600" : "bg-white/5"
+            }`}
+            title="Drag to resize IDE panel width"
+          >
+            <div className="absolute inset-y-0 -left-1 -right-1" />
+          </div>
+
+          <aside
+            style={{ width: `${rightPanelWidth}px` }}
+            className="flex shrink-0 flex-col border-l border-white/10 bg-zinc-900 transition-none"
+          >
+          {/* Tabs Navigation Header */}
+          <div className="flex items-center justify-between border-b border-white/10 bg-zinc-950 px-2 py-1.5">
+            <div className="flex items-center gap-1 text-xs">
+              <button
+                onClick={() => setRightPanelTab("code")}
+                className={`flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition ${
+                  rightPanelTab === "code" ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"
+                }`}
+              >
+                <Code2 className="h-3.5 w-3.5 text-purple-400" />
+                Code & Files
+              </button>
+              <button
+                onClick={() => setRightPanelTab("diff")}
+                className={`flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition ${
+                  rightPanelTab === "diff" ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"
+                }`}
+              >
+                <GitBranch className="h-3.5 w-3.5 text-blue-400" />
+                Git Diff
+              </button>
+              <button
+                onClick={() => setRightPanelTab("memory")}
+                className={`flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition ${
+                  rightPanelTab === "memory" ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"
+                }`}
+              >
+                <Brain className="h-3.5 w-3.5 text-amber-400" />
+                Memories
+              </button>
+              <button
+                onClick={() => setRightPanelTab("evidence")}
+                className={`flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition ${
+                  rightPanelTab === "evidence" ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"
+                }`}
+              >
+                <Layers className="h-3.5 w-3.5 text-emerald-400" />
+                Artifacts
+              </button>
+            </div>
+          </div>
+
+          {/* Tab Contents */}
+          <div className="flex-1 overflow-hidden">
+            {rightPanelTab === "code" && (
+              <div className="grid h-full grid-cols-[180px_1fr]">
+                {/* File Tree */}
+                <div className="border-r border-white/10 bg-zinc-950 p-2 overflow-y-auto">
+                  <div className="mb-2 text-[10px] font-semibold uppercase text-gray-500">Workspace Files</div>
+                  <ul className="space-y-0.5 text-xs font-mono">
+                    {entries.map((entry) => (
+                      <li key={entry.path}>
+                        <button
+                          disabled={entry.type !== "file"}
+                          onClick={() => void openFile(entry.path)}
+                          className={`flex w-full items-center gap-1.5 truncate rounded px-2 py-1 text-left transition ${
+                            selectedFile === entry.path
+                              ? "bg-purple-600/30 text-purple-300 font-semibold"
+                              : "text-gray-400 hover:bg-white/5 hover:text-gray-200"
+                          } disabled:text-gray-600`}
+                        >
+                          {entry.type === "directory" ? (
+                            <Folder className="h-3 w-3 shrink-0 text-amber-500/80" />
+                          ) : (
+                            <FileText className="h-3 w-3 shrink-0 text-blue-400/80" />
+                          )}
+                          <span className="truncate">{entry.path}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                {/* Code Viewer */}
+                <div className="flex-1 overflow-hidden">
+                  <CodeDiffViewer path={selectedFile} content={fileContent} />
+                </div>
+              </div>
+            )}
+
+            {rightPanelTab === "diff" && (
+              <div className="h-full">
+                <CodeDiffViewer path="Workspace Uncommitted / Commit Diff" content={diffContent || "No active diff changes in workspace."} isDiff={true} />
+              </div>
+            )}
+
+            {rightPanelTab === "memory" && (
+              <div className="h-full">
+                <LearnedMemories projectId={projectId} />
+              </div>
+            )}
+
+            {rightPanelTab === "evidence" && (
+              <div className="h-full overflow-y-auto p-4 space-y-4 text-xs">
+                <div>
+                  <h3 className="font-semibold text-white mb-2">Build Artifacts ({artifacts.length})</h3>
+                  {artifacts.length === 0 ? (
+                    <p className="text-gray-500">No packaged artifacts yet.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {artifacts.map((a) => (
+                        <li key={a.id} className="rounded-lg border border-white/10 bg-zinc-800/60 p-2.5">
+                          <div className="flex justify-between font-semibold text-purple-300">
+                            <span>{a.name} v{a.version}</span>
+                            <span className="text-[10px] uppercase text-emerald-400">{a.status}</span>
+                          </div>
+                          <p className="mt-1 font-mono text-[10px] text-gray-500 truncate">SHA256: {a.digest}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                <div>
+                  <h3 className="font-semibold text-white mb-2">Deployments ({deployments.length})</h3>
+                  {deployments.length === 0 ? (
+                    <p className="text-gray-500">No deployment jobs requested yet.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {deployments.map((d) => (
+                        <li key={d.id} className="rounded-lg border border-white/10 bg-zinc-800/60 p-2.5">
+                          <div className="flex justify-between font-semibold text-blue-300">
+                            <span>Env: {d.environment}</span>
+                            <span className="text-[10px] uppercase text-amber-400">{d.status}</span>
+                          </div>
+                          {d.logs && <pre className="mt-1.5 max-h-24 overflow-auto rounded bg-zinc-950 p-2 text-[10px] text-gray-400">{d.logs}</pre>}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </aside>
+        </>
+      )}
     </div>
   );
 }
