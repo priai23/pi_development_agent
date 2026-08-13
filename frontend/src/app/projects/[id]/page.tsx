@@ -40,6 +40,7 @@ export default function ProjectWorkspace() {
   const [currentTool, setCurrentTool] = useState<string | null>(null);
   const [isThinking, setIsThinking] = useState(false);
   const [deciding, setDeciding] = useState(false);
+  const [isStuck, setIsStuck] = useState(false);
   const [showLeftSidebar, setShowLeftSidebar] = useState(true);
   const [showRightPanel, setShowRightPanel] = useState(true);
   const [rightPanelWidth, setRightPanelWidth] = useState(520);
@@ -156,6 +157,7 @@ export default function ProjectWorkspace() {
   useEffect(() => {
     if (!loading && !deciding) {
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsStuck(false);
       return;
     }
