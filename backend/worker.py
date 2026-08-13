@@ -56,9 +56,10 @@ def recover_stale_work() -> None:
             action.claimed_at = None
             if action.run_id:
                 enqueue(db, "action.resume", action.run_id, {"action_id": action.id, "decision": "approve"})
+        stale_run_cutoff = now - timedelta(seconds=60)
         stale_runs = db.query(models.AgentRun).filter(
             models.AgentRun.status.in_(["running", "cancelling"]),
-            models.AgentRun.heartbeat_at < stale,
+            (models.AgentRun.heartbeat_at < stale_run_cutoff) | (models.AgentRun.heartbeat_at.is_(None)),
         ).all()
         for run in stale_runs:
             run.status = "queued"

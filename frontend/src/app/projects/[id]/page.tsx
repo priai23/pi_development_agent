@@ -58,6 +58,26 @@ export default function ProjectWorkspace() {
   const lastEventAt = useRef<number>(0);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Restore & save panel layout preferences in localStorage
+  useEffect(() => {
+    const savedSidebar = localStorage.getItem("workspace:showLeftSidebar");
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (savedSidebar !== null) setShowLeftSidebar(savedSidebar === "true");
+    const savedWidth = localStorage.getItem("workspace:rightPanelWidth");
+    if (savedWidth !== null) {
+      const parsed = Number(savedWidth);
+      if (parsed >= 320 && parsed <= window.innerWidth * 0.75) setRightPanelWidth(parsed);
+    }
+  }, []);
+
+  const toggleLeftSidebar = () => {
+    setShowLeftSidebar((prev) => {
+      const next = !prev;
+      localStorage.setItem("workspace:showLeftSidebar", String(next));
+      return next;
+    });
+  };
+
   // Mouse drag handler for dynamic right panel width resizing
   useEffect(() => {
     if (!isResizingRight) return;
@@ -65,6 +85,7 @@ export default function ProjectWorkspace() {
       const newWidth = window.innerWidth - e.clientX;
       if (newWidth >= 320 && newWidth <= window.innerWidth * 0.75) {
         setRightPanelWidth(newWidth);
+        localStorage.setItem("workspace:rightPanelWidth", String(newWidth));
       }
     };
     const handleMouseUp = () => {
@@ -399,7 +420,7 @@ export default function ProjectWorkspace() {
         <header className="flex items-center justify-between border-b border-white/5 bg-zinc-900 px-4 py-2.5">
           <div className="flex items-center gap-2.5">
             <button
-              onClick={() => setShowLeftSidebar(!showLeftSidebar)}
+              onClick={toggleLeftSidebar}
               className="rounded-md border border-white/10 bg-white/5 p-1.5 text-gray-400 hover:bg-white/10 hover:text-white"
               title="Toggle Project Sub-Sidebar"
             >

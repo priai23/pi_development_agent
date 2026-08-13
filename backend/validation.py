@@ -49,8 +49,20 @@ def validate_module(module_root: Path) -> dict:
                 checks.append({"name": f"python:{path.name}", "passed": False, "message": str(exc)})
         if path.suffix == ".xml":
             try:
-                ET.parse(path)
+                tree = ET.parse(path)
                 checks.append({"name": f"xml:{path.name}", "passed": True, "message": "Parsed"})
+                # Odoo 19 search view group filter check: filters with group_by in context must specify domain
+                text = path.read_text(encoding="utf-8")
+                if "<group" in text and "group_by" in text:
+                    for elem in tree.iter("filter"):
+                        ctx = elem.get("context", "")
+                        domain = elem.get("domain")
+                        if "group_by" in ctx and domain is None:
+                            checks.append({
+                                "name": f"xml_group_filter_domain:{path.name}",
+                                "passed": False,
+                                "message": f"Filter '{elem.get('name', 'unknown')}' inside group passing group_by context MUST explicitly specify domain='[]'"
+                            })
             except ET.ParseError as exc:
                 checks.append({"name": f"xml:{path.name}", "passed": False, "message": str(exc)})
         if path.suffix in {".py", ".xml", ".js", ".csv"}:
