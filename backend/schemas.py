@@ -370,3 +370,23 @@ class DeploymentOut(ORMModel):
     external_job_id: str | None
     created_at: datetime
     finished_at: datetime | None
+
+
+class MemoryCreate(BaseModel):
+    category: str = Field(min_length=2, max_length=32)
+    key: str = Field(min_length=2, max_length=128)
+    content: str = Field(min_length=1, max_length=10_000)
+    confidence: float = 1.0
+
+
+class MemoryOut(ORMModel):
+    id: int
+    project_id: int | None
+    category: str
+    key: str
+    content: str
+    confidence: float
+    usage_count: int
+    created_at: datetime
+    updated_at: datetime
+

@@ -150,6 +150,8 @@ class ERPImplementationAgent:
         "create_directory",
         "write_file",
         "patch_file",
+        "save_memory",
+        "search_memory",
     }
     RISK_CLASSES = {
         "create_directory": "C",
@@ -340,6 +342,53 @@ class ERPImplementationAgent:
             if count > 1:
                 return f"PATCH_ERROR: old_str appears {count} times in {path}. Make old_str more specific."
             return self.workspace.write_file(path, current.replace(old_str, new_str, 1))
+
+        @tool
+        def save_memory(category: str, key: str, content: str) -> str:
+            """Save a learned insight, schema gotcha, user coding preference, or module pattern into long-term memory for future runs."""
+            with SessionLocal() as db:
+                existing = db.query(models.AgentMemory).filter(
+                    models.AgentMemory.project_id == self.project_id,
+                    models.AgentMemory.key == key,
+                ).first()
+                if existing:
+                    existing.content = content
+                    existing.category = category
+                    existing.updated_at = datetime.now(timezone.utc)
+                    db.commit()
+                    return f"Updated existing memory '{key}'"
+                mem = models.AgentMemory(
+                    project_id=self.project_id,
+                    category=category,
+                    key=key,
+                    content=content,
+                    confidence=1.0,
+                )
+                db.add(mem)
+                db.commit()
+                return f"Saved new memory '{key}' under category '{category}'"
+
+        @tool
+        def search_memory(query: str, category: str | None = None) -> str:
+            """Search persistent long-term memory for past learnings, user preferences, schema gotchas, or project rules."""
+            with SessionLocal() as db:
+                q = db.query(models.AgentMemory).filter(
+                    (models.AgentMemory.project_id == self.project_id) | (models.AgentMemory.project_id.is_(None))
+                )
+                if category:
+                    q = q.filter(models.AgentMemory.category == category)
+                if query:
+                    q = q.filter(models.AgentMemory.content.ilike(f"%{query}%") | models.AgentMemory.key.ilike(f"%{query}%"))
+                results = q.order_by(models.AgentMemory.updated_at.desc()).limit(10).all()
+                if not results:
+                    return "No matching memories found."
+                for r in results:
+                    r.usage_count += 1
+                db.commit()
+                return json.dumps([
+                    {"category": r.category, "key": r.key, "content": r.content, "updated_at": r.updated_at.isoformat()}
+                    for r in results
+                ])
 
         @tool
         def update_company_contact(company_id: int, email: str, phone: str | None = None) -> str:
@@ -566,6 +615,8 @@ class ERPImplementationAgent:
             package_module,
             execute_deployment,
             check_deployment_status,
+            save_memory,
+            search_memory,
         ]
         kb_path = Path(__file__).parent.parent / "skills" / "odoo19-dev" / "Odoo19_Dev_Customization_KB.md"
         self._kb_path = kb_path  # stored for the read_knowledge_base tool below
@@ -579,6 +630,16 @@ class ERPImplementationAgent:
         # Add to SAFE_TOOLS so it doesn't require approval
         ERPImplementationAgent.SAFE_TOOLS.add("read_knowledge_base")
 
+        memories_text = ""
+        if self.project_id:
+            with SessionLocal() as db:
+                mems = db.query(models.AgentMemory).filter(
+                    (models.AgentMemory.project_id == self.project_id) | (models.AgentMemory.project_id.is_(None))
+                ).order_by(models.AgentMemory.updated_at.desc()).limit(10).all()
+                if mems:
+                    items = "\n".join([f"- [{m.category}] {m.key}: {m.content}" for m in mems])
+                    memories_text = f"\n\n[PERSISTENT AGENT MEMORY & PAST LEARNINGS]\n{items}"
+
         prompt = SystemMessage(
             content=(
                 "You are an expert autonomous Odoo 19 ERP implementation agent. "
@@ -591,7 +652,9 @@ class ERPImplementationAgent:
                 "4. If write_file returns SYNTAX_ERROR or XML_ERROR, fix the content and call write_file again immediately.\n"
                 "5. After each write_file call, call read_file on the same path to verify the file was written correctly.\n"
                 "6. After all files are written, call package_module to validate, then summarise what was built.\n"
-                "7. Always call exactly one tool at a time. Never use placeholders in generated code."
+                "7. Always call exactly one tool at a time. Never use placeholders in generated code.\n"
+                "8. Use save_memory whenever you discover a critical schema detail, fix a bug, or receive a key preference from the user so you remember it in future runs."
+                f"{memories_text}"
             )
         )
         self.executor = create_react_agent(

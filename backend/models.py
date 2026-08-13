@@ -84,6 +84,8 @@ class Project(Base):
     created_by = relationship("User")
     instances = relationship("Instance", back_populates="project", cascade="all, delete-orphan")
     interactions = relationship("Interaction", back_populates="project", cascade="all, delete-orphan")
+    memories = relationship("AgentMemory", back_populates="project", cascade="all, delete-orphan")
+
 
 
 class Instance(Base):
@@ -365,3 +367,20 @@ class PasswordResetToken(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class AgentMemory(Base):
+    __tablename__ = "agent_memories"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
+    category = Column(String(32), nullable=False, index=True)  # e.g., 'schema_insight', 'odoo_gotcha', 'user_preference', 'module_pattern'
+    key = Column(String(128), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    confidence = Column(Float, nullable=False, default=1.0)
+    usage_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    project = relationship("Project", back_populates="memories")
+

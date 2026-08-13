@@ -1308,6 +1308,8 @@ def create_deployment(project_id: int, payload: schemas.DeploymentCreate, user: 
     ).order_by(models.ValidationRun.created_at.desc()).first()
     if not validation:
         raise HTTPException(status_code=409, detail="Only a passed immutable validation artifact can be deployed")
+
+
     if not instance.deployment_config_encrypted:
         raise HTTPException(status_code=409, detail="Configure the deployment bridge or Odoo.sh repository first")
     if instance.environment == "production":
@@ -1321,10 +1323,47 @@ def create_deployment(project_id: int, payload: schemas.DeploymentCreate, user: 
         project_id=project_id, instance_id=instance.id, artifact_id=artifact.id, validation_id=validation.id,
         environment=instance.environment, requested_by_id=user.id, rollback_plan=payload.rollback_plan,
     )
-    db.add(deployment); db.flush()
-    audit(db, "deployment.requested", user.id, project_id, {"deployment_id": deployment.id, "artifact_digest": artifact.digest}, risk_class="E", result="pending_approval")
-    db.commit(); db.refresh(deployment)
+    db.add(deployment)
+    db.commit()
+    db.refresh(deployment)
     return deployment
+
+
+@app.get("/projects/{project_id}/memories", response_model=list[schemas.MemoryOut])
+def list_project_memories(project_id: int, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    return db.query(models.AgentMemory).filter(
+        (models.AgentMemory.project_id == project_id) | (models.AgentMemory.project_id.is_(None))
+    ).order_by(models.AgentMemory.updated_at.desc()).all()
+
+
+@app.post("/projects/{project_id}/memories", response_model=schemas.MemoryOut, status_code=201)
+def create_project_memory(project_id: int, payload: schemas.MemoryCreate, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    mem = models.AgentMemory(
+        project_id=project_id,
+        category=payload.category,
+        key=payload.key,
+        content=payload.content,
+        confidence=payload.confidence,
+    )
+    db.add(mem)
+    db.commit()
+    db.refresh(mem)
+    return mem
+
+
+@app.delete("/memories/{memory_id}", status_code=204)
+def delete_memory(memory_id: int, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    mem = db.get(models.AgentMemory, memory_id)
+    if not mem:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    if mem.project_id:
+        require_project(db, user, mem.project_id)
+    db.delete(mem)
+    db.commit()
+    return None
+
 
 
 @app.post("/deployments/{deployment_id}/decision", response_model=schemas.DeploymentOut)
