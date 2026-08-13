@@ -17,6 +17,8 @@ export type WorkspaceEntry = { path: string; type: "file" | "directory"; size?: 
 export type Requirement = { id: number; title: string; description: string; acceptance_criteria: string; status: string };
 export type Artifact = { id: string; name: string; version: string; digest: string; path: string; status: string; created_at: string };
 export type Deployment = { id: string; instance_id: number; artifact_id: string; environment: string; status: string; requested_by_id: number; approved_by_id: number | null; rollback_plan: string; logs: string; external_job_id: string | null; created_at: string };
+export type AgentMemory = { id: number; project_id: number | null; category: string; key: string; content: string; confidence: number; usage_count: number; created_at: string; updated_at: string };
+
 
 let csrfToken = "";
 
