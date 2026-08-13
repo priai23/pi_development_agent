@@ -102,7 +102,7 @@ export default function AgentStatus({ currentAction, isThinking, tokenInputs = 0
     return (
       <div className="inline-flex items-center gap-2 rounded-full border border-amber-400/50 bg-amber-50 px-3.5 py-1.5 text-xs font-medium text-amber-700 dark:border-amber-600/30 dark:bg-amber-950/40 dark:text-amber-300">
         <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
-        No activity for 30s — agent may be stuck
+        No activity for 60s — agent may be stuck
       </div>
     );
   }

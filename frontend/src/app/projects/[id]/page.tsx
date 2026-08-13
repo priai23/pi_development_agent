@@ -92,7 +92,7 @@ export default function ProjectWorkspace() {
     if (heartbeatRef.current) clearInterval(heartbeatRef.current);
   }, []);
 
-  // 30s heartbeat: detect agent hang
+  // 60s heartbeat: detect agent hang
   useEffect(() => {
     if (!loading && !deciding) {
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
@@ -103,7 +103,7 @@ export default function ProjectWorkspace() {
     lastEventAt.current = Date.now();
     setIsStuck(false);
     heartbeatRef.current = setInterval(() => {
-      if (Date.now() - lastEventAt.current > 30_000) setIsStuck(true);
+      if (Date.now() - lastEventAt.current > 60_000) setIsStuck(true);
     }, 5_000);
     return () => { if (heartbeatRef.current) clearInterval(heartbeatRef.current); };
   }, [loading, deciding]);
