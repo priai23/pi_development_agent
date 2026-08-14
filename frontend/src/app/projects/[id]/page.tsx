@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Bot, Brain, Code2, Database, FileText, Folder, GitBranch, Layers, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, Send } from "lucide-react";
+import { AlertTriangle, Bot, Brain, Code2, Database, FileText, Folder, GitBranch, History, Layers, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, Send, Square, Trash2 } from "lucide-react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
@@ -10,7 +10,7 @@ import AgentStatus from "@/components/AgentStatus";
 import ActivityStepper from "@/components/ActivityStepper";
 import LearnedMemories from "@/components/LearnedMemories";
 import CodeDiffViewer from "@/components/CodeDiffViewer";
-import { apiFetch, AgentRun, Artifact, ChatMessage, Deployment, followRun, Instance, PendingAction, Project, Step, ToolEvent, WorkspaceEntry, visibleContent } from "@/lib/api";
+import { apiFetch, AgentRun, AgentQuestion, Artifact, ChatMessage, deleteRun, Deployment, FinalReport, followRun, Instance, PendingAction, Project, Step, ToolEvent, WorkspaceEntry, visibleContent } from "@/lib/api";
 
 type PendingRecord = { id: string; tool_name: string; preview: Record<string, unknown>; risk_class: string; expires_at: string };
 
@@ -41,6 +41,11 @@ export default function ProjectWorkspace() {
   const [isThinking, setIsThinking] = useState(false);
   const [deciding, setDeciding] = useState(false);
   const [isStuck, setIsStuck] = useState(false);
+  const [agentQuestion, setAgentQuestion] = useState<AgentQuestion | null>(null);
+  const [questionAnswer, setQuestionAnswer] = useState("");
+  const [submittingAnswer, setSubmittingAnswer] = useState(false);
+  const [finalReport, setFinalReport] = useState<FinalReport | null>(null);
+  const [thinkingText, setThinkingText] = useState<string | null>(null);
   const [showLeftSidebar, setShowLeftSidebar] = useState(true);
   const [showRightPanel, setShowRightPanel] = useState(true);
   const [rightPanelWidth, setRightPanelWidth] = useState(520);
@@ -52,6 +57,15 @@ export default function ProjectWorkspace() {
   const [diffContent, setDiffContent] = useState("");
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [runs, setRuns] = useState<AgentRun[]>([]);
+  const [showHistoryModal, setShowHistoryModal] = useState(false);
+  // A2A Supervisor task graph state
+  const [supervisorTaskGraph, setSupervisorTaskGraph] = useState<Array<{ task_id: string; title: string; status: string; risk_class: number; retry_count: number; heartbeat_at: string | null }> | null>(null);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [recoveringTaskId, setRecoveringTaskId] = useState<string | null>(null);
+  const [finalReportSeen, setFinalReportSeen] = useState(false);
+  const [plannerModel, setPlannerModel] = useState("gpt-4o");
+  const [fallbackModel, setFallbackModel] = useState("gpt-4o-mini");
   const bottom = useRef<HTMLDivElement>(null);
   const discoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const discoverySequence = useRef(0);
@@ -137,9 +151,13 @@ export default function ProjectWorkspace() {
       setProject(projectData); setInstances(instanceData); setChat(chatData);
       setPending(pendingData ? { id: pendingData.id, tool: pendingData.tool_name, preview: pendingData.preview, risk_class: pendingData.risk_class } : null);
       // Restore step history from the last run
-      const runs = await apiFetch<AgentRun[]>(`/projects/${projectId}/runs`).catch(() => [] as AgentRun[]);
-      if (runs.length > 0) {
-        const events = await apiFetch<ToolEvent[]>(`/runs/${runs[0].id}/events`).catch(() => [] as ToolEvent[]);
+      const runsData = await apiFetch<AgentRun[]>(`/projects/${projectId}/runs`).catch(() => [] as AgentRun[]);
+      setRuns(runsData);
+      if (runsData.length > 0) {
+        if (runsData[0].status === "running" || runsData[0].status === "cancelling") {
+          setActiveRunId(runsData[0].id);
+        }
+        const events = await apiFetch<ToolEvent[]>(`/runs/${runsData[0].id}/events`).catch(() => [] as ToolEvent[]);
         const rebuilt: Step[] = [];
         for (const ev of events) {
           if (ev.event_type === "tool.started") {
@@ -244,6 +262,24 @@ export default function ProjectWorkspace() {
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Connection failed"); setLoading(false); }
   };
 
+  const autoSelectFirstFile = useCallback(async () => {
+    try {
+      const treeData = await apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree`).catch(() => []);
+      const diffData = await apiFetch<{ diff: string }>(`/projects/${projectId}/workspace/diff`).catch(() => ({ diff: "" }));
+      setEntries(treeData);
+      setDiffContent(diffData.diff);
+      const fileEntries = treeData.filter((e) => e.type === "file");
+      if (fileEntries.length > 0) {
+        const target = fileEntries.find((f) => f.path.includes("models/") || f.path.includes("views/") || f.path.includes("manifest")) || fileEntries[0];
+        setSelectedFile(target.path);
+        setRightPanelTab("code");
+        void openFile(target.path);
+      }
+    } catch {
+      // ignore
+    }
+  }, [projectId]);
+
   // Shared helper — wires SSE events to structured steps, heartbeat, tokens
   const handleRunEvent = (runEvent: ToolEvent, responseRef: { current: string }, setResponse: (r: string) => void) => {
     lastEventAt.current = Date.now();
@@ -256,9 +292,11 @@ export default function ProjectWorkspace() {
     }
     if (runEvent.event_type === "tool.started") {
       const tool = String(runEvent.payload.tool);
-      setCurrentTool(tool);
-      setIsThinking(false);
-      setSteps(prev => [...prev, { tool, label: tool.replace(/_/g, " "), status: "running", startedAt: Date.now() }]);
+      if (tool !== "emit_thinking" && tool !== "thinking") {
+        setCurrentTool(tool);
+        setIsThinking(false);
+        setSteps(prev => [...prev, { tool, label: tool.replace(/_/g, " "), status: "running", startedAt: Date.now() }]);
+      }
     }
     if (runEvent.event_type === "tool.completed") {
       const tool = String(runEvent.payload.tool);
@@ -270,7 +308,8 @@ export default function ProjectWorkspace() {
         if (idx === -1) return prev;
         const realIdx = prev.length - 1 - idx;
         const next = [...prev];
-        next[realIdx] = { ...next[realIdx], status: "done", result: raw, elapsed: (Date.now() - next[realIdx].startedAt) / 1000 };
+        const elapsedSec = Math.max(0.1, (Date.now() - next[realIdx].startedAt) / 1000);
+        next[realIdx] = { ...next[realIdx], status: "done", result: raw, elapsed: elapsedSec };
         return next;
       });
     }
@@ -284,6 +323,59 @@ export default function ProjectWorkspace() {
       setCurrentTool(null);
       setPending({ id: String(runEvent.payload.action_id), tool: String(runEvent.payload.tool), risk_class: String(runEvent.payload.risk_class), preview: runEvent.payload.preview as Record<string, unknown> });
     }
+    if (runEvent.event_type === "thinking") {
+      setThinkingText(String(runEvent.payload.message || ""));
+    }
+    if (runEvent.event_type === "question") {
+      setIsThinking(false);
+      setCurrentTool(null);
+      setAgentQuestion({ question: String(runEvent.payload.question || ""), options: (runEvent.payload.options as string[]) || [] });
+    }
+    if (runEvent.event_type === "final_report") {
+      setFinalReportSeen(true);
+      setFinalReport({
+        outcome: String(runEvent.payload.outcome || "SUCCESS") as "SUCCESS" | "PARTIAL" | "FAILED",
+        done: (runEvent.payload.done as string[]) || [],
+        verification: String(runEvent.payload.verification || ""),
+        errors: String(runEvent.payload.errors || ""),
+        pending_approvals: String(runEvent.payload.pending_approvals || ""),
+      });
+      void autoSelectFirstFile();
+    }
+    // ── A2A Supervisor events ────────────────────────────────────────────────
+    if (runEvent.event_type === "supervisor.plan") {
+      const graph = runEvent.payload.task_graph as typeof supervisorTaskGraph;
+      setSupervisorTaskGraph(graph);
+      setActiveTaskId(String(runEvent.payload.active_task_id || ""));
+    }
+    if (runEvent.event_type === "task.started") {
+      setActiveTaskId(String(runEvent.payload.task_id || ""));
+      setRecoveringTaskId(null);
+      // Update status in local graph copy
+      setSupervisorTaskGraph(prev => prev ? prev.map(t =>
+        t.task_id === runEvent.payload.task_id ? { ...t, status: "in_progress" } : t
+      ) : prev);
+    }
+    if (runEvent.event_type === "task.recovering") {
+      setRecoveringTaskId(String(runEvent.payload.task_id || ""));
+      setIsStuck(false); // clear the generic stuck indicator
+      setSupervisorTaskGraph(prev => prev ? prev.map(t =>
+        t.task_id === runEvent.payload.task_id
+          ? { ...t, status: "pending", retry_count: Number(runEvent.payload.attempt || 0) }
+          : t
+      ) : prev);
+    }
+    if (runEvent.event_type === "task.failed") {
+      setSupervisorTaskGraph(prev => prev ? prev.map(t =>
+        t.task_id === runEvent.payload.task_id ? { ...t, status: "failed" } : t
+      ) : prev);
+    }
+    if (runEvent.event_type === "supervisor.complete") {
+      const graph = runEvent.payload.task_graph as typeof supervisorTaskGraph;
+      setSupervisorTaskGraph(graph);
+      setActiveTaskId(null);
+      setRecoveringTaskId(null);
+    }
   };
 
   const send = async (event: FormEvent) => {
@@ -291,11 +383,18 @@ export default function ProjectWorkspace() {
     const text = message.trim(); if (!text || pending) return;
     setMessage(""); setError(""); setLoading(true); setSteps([]); setUsage(""); setTokenInputs(0);
     setCurrentTool(null); setIsThinking(true);
-    // Don't optimistically add an empty agent bubble — backend now only saves non-empty responses
+    setSupervisorTaskGraph(null); setActiveTaskId(null); setRecoveringTaskId(null); setFinalReportSeen(false);
     setChat((current) => [...current, { role: "user", content: text }]);
     const responseRef = { current: "" };
     try {
-      const run = await apiFetch<AgentRun>(`/projects/${projectId}/runs`, { method: "POST", body: JSON.stringify({ message: text }) });
+      const run = await apiFetch<AgentRun>(`/projects/${projectId}/runs`, { 
+        method: "POST", 
+        body: JSON.stringify({ 
+          message: text,
+          planner_model: plannerModel,
+          fallback_model: fallbackModel
+        }) 
+      });
       setActiveRunId(run.id);
       const finished = await followRun(run.id, (runEvent) => {
         handleRunEvent(runEvent, responseRef, (r) => setChat((cur) => {
@@ -314,7 +413,7 @@ export default function ProjectWorkspace() {
         return current;
       });
     }
-    finally { setLoading(false); setActiveRunId(null); setIsThinking(false); setCurrentTool(null); }
+    finally { setLoading(false); setActiveRunId(null); setIsThinking(false); setCurrentTool(null); void autoSelectFirstFile(); }
   };
 
   const decide = async (decision: "approve" | "reject") => {
@@ -339,13 +438,74 @@ export default function ProjectWorkspace() {
         // ignore
       }
     }
-    finally { setDeciding(false); setLoading(false); setIsThinking(false); setCurrentTool(null); }
+    finally { setDeciding(false); setLoading(false); setIsThinking(false); setCurrentTool(null); void autoSelectFirstFile(); }
+  };
+
+  const submitAnswer = async () => {
+    if (!questionAnswer.trim() || submittingAnswer) return;
+    const answer = questionAnswer.trim();
+    setAgentQuestion(null);
+    setQuestionAnswer("");
+    setSubmittingAnswer(true);
+    setLoading(true);
+    setIsThinking(true);
+    setChat((current) => [...current, { role: "agent", content: "" }]);
+    const responseRef = { current: "" };
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001"}/projects/${projectId}/actions/answer`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": document.cookie.match(/csrf_token=([^;]+)/)?.[1] ?? "" },
+        body: JSON.stringify({ answer }),
+      });
+      if (!response.ok) throw new Error("Failed to submit answer");
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        responseRef.current += decoder.decode(value, { stream: true });
+        setChat((cur) => [...cur.slice(0, -1), { role: "agent", content: responseRef.current }]);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Failed to submit answer");
+    } finally {
+      setSubmittingAnswer(false);
+      setLoading(false);
+      setIsThinking(false);
+      setCurrentTool(null);
+    }
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       void send(e as unknown as FormEvent);
+    }
+  };
+
+  const handleDeleteRun = async (runId: string) => {
+    try {
+      await deleteRun(runId);
+      setRuns((prev) => prev.filter((r) => r.id !== runId));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Failed to delete run");
+    }
+  };
+
+  const handleClearAllHistory = async () => {
+    if (!window.confirm("Are you sure you want to clear all chat history and past runs for this project?")) return;
+    try {
+      await apiFetch(`/projects/${projectId}/chat`, { method: "DELETE" });
+      setChat([]);
+      setSteps([]);
+      setRuns([]);
+      setFinalReport(null);
+      setThinkingText(null);
+      setPending(null);
+      setShowHistoryModal(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Failed to clear chat history");
     }
   };
 
@@ -363,8 +523,21 @@ export default function ProjectWorkspace() {
       setIsThinking(false);
       setIsStuck(false);
       setActiveRunId(null);
+      setAgentQuestion(null);
+      setQuestionAnswer("");
+      setFinalReport(null);
+      setThinkingText(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Failed to reset chat");
+    }
+  };
+
+  const handleStopRun = async () => {
+    if (!activeRunId) return;
+    try {
+      await apiFetch(`/runs/${activeRunId}/cancel`, { method: "POST" });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Failed to stop run");
     }
   };
 
@@ -372,24 +545,54 @@ export default function ProjectWorkspace() {
   if (!project) return <div className="p-8 text-red-600">{error || "Project not found"}</div>;
   if (!instances.length) return (
     <div className="mx-auto max-w-xl p-8">
-      <h1 className="text-3xl font-bold">{project.name}</h1><p className="mt-2 text-gray-500">Connect an approved Odoo host. Credentials are encrypted and never returned.</p>
-      <form onSubmit={connect} className="mt-8 space-y-4 rounded-2xl border p-6 dark:border-white/10">
-        <label className="block text-sm">Server URL <span className="text-xs text-gray-500">(database discovery runs automatically)</span><div className="relative"><input type="url" required value={url} onChange={(event) => changeUrl(event.target.value)} onBlur={finishUrlEntry} placeholder="https://odoo.internal.example" className="mt-1 w-full rounded-xl border px-4 py-3 pr-10 dark:border-white/10 dark:bg-black" />{detectingDatabases && <Loader2 className="absolute right-3 top-4 h-4 w-4 animate-spin text-blue-600" />}</div></label>
-        <label className="block text-sm">Database
+      <h1 className="text-3xl font-bold">{project.name}</h1>
+      <p className="mt-2 text-sm text-gray-400">
+        Connect to hosted Odoo (Odoo.sh, Odoo Online, Cloud) or local ERP instance. Credentials are encrypted securely.
+      </p>
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        <button type="button" onClick={() => changeUrl("https://my-company.odoo.com")} className="rounded-lg border border-purple-500/30 bg-purple-500/10 px-2.5 py-1 text-xs text-purple-300 hover:bg-purple-500/20 transition">
+          ☁️ Odoo Online (*.odoo.com)
+        </button>
+        <button type="button" onClick={() => changeUrl("https://my-company.odoo.sh")} className="rounded-lg border border-blue-500/30 bg-blue-500/10 px-2.5 py-1 text-xs text-blue-300 hover:bg-blue-500/20 transition">
+          🚀 Odoo.sh (*.odoo.sh)
+        </button>
+        <button type="button" onClick={() => changeUrl("http://localhost:8069")} className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/20 transition">
+          💻 Local Odoo (localhost:8069)
+        </button>
+      </div>
+
+      <form onSubmit={connect} className="mt-6 space-y-4 rounded-2xl border p-6 dark:border-white/10">
+        <label className="block text-sm font-medium">
+          Server URL <span className="text-xs text-gray-500 font-normal">(Hosted Odoo or Local ERP)</span>
+          <div className="relative mt-1">
+            <input
+              type="url"
+              required
+              value={url}
+              onChange={(event) => changeUrl(event.target.value)}
+              onBlur={finishUrlEntry}
+              placeholder="https://your-company.odoo.com or http://localhost:8069"
+              className="w-full rounded-xl border px-4 py-3 pr-10 dark:border-white/10 dark:bg-black text-sm"
+            />
+            {detectingDatabases && <Loader2 className="absolute right-3 top-3.5 h-4 w-4 animate-spin text-blue-600" />}
+          </div>
+        </label>
+        <label className="block text-sm font-medium">Database
           {detectedDatabases.length > 1 ? (
-            <select required value={dbName} onChange={(event) => setDbName(event.target.value)} className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black">
+            <select required value={dbName} onChange={(event) => setDbName(event.target.value)} className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm">
               <option value="">Select a database…</option>
               {detectedDatabases.map((database) => <option key={database} value={database}>{database}</option>)}
             </select>
           ) : (
-            <input required value={dbName} onChange={(event) => setDbName(event.target.value)} readOnly={detectedDatabases.length === 1} placeholder={detectingDatabases ? "Discovering databases…" : "Database name"} className="mt-1 w-full rounded-xl border px-4 py-3 read-only:bg-gray-50 dark:border-white/10 dark:bg-black dark:read-only:bg-white/5" />
+            <input required value={dbName} onChange={(event) => setDbName(event.target.value)} readOnly={detectedDatabases.length === 1} placeholder={detectingDatabases ? "Discovering databases…" : "Database name (e.g. production)"} className="mt-1 w-full rounded-xl border px-4 py-3 read-only:bg-gray-50 dark:border-white/10 dark:bg-black dark:read-only:bg-white/5 text-sm" />
           )}
           {discoveryMessage && <span className="mt-1 block text-xs text-gray-500">{discoveryMessage}</span>}
         </label>
-        <label className="block text-sm">Authentication<select value={authMethod} onChange={(event) => setAuthMethod(event.target.value as "json2" | "xmlrpc")} className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black"><option value="json2">Odoo 19 JSON-2 API key (recommended)</option><option value="xmlrpc">XML-RPC username and password</option></select></label>
-        {authMethod === "json2" ? <label className="block text-sm">Scoped API key<input type="password" required value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="off" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black" /></label> : <><label className="block text-sm">Username<input required value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black" /></label><label className="block text-sm">Password<input type="password" required value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black" /></label></>}
+        <label className="block text-sm font-medium">Authentication<select value={authMethod} onChange={(event) => setAuthMethod(event.target.value as "json2" | "xmlrpc")} className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm"><option value="json2">Odoo 19 JSON-2 API key (recommended)</option><option value="xmlrpc">XML-RPC username and password</option></select></label>
+        {authMethod === "json2" ? <label className="block text-sm font-medium">Scoped API key<input type="password" required value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="off" placeholder="Enter API key" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label> : <><label className="block text-sm font-medium">Username<input required value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="admin@example.com" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label><label className="block text-sm font-medium">Password<input type="password" required value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Password" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label></>}
         {error && <p className="text-sm text-red-600">{error}</p>}
-        <button disabled={loading || detectingDatabases} className="w-full rounded-xl bg-blue-600 py-3 font-medium text-white disabled:opacity-50">{loading ? "Verifying…" : detectingDatabases ? "Discovering databases…" : "Verify and connect"}</button>
+        <button disabled={loading || detectingDatabases} className="w-full rounded-xl bg-blue-600 py-3 font-medium text-white disabled:opacity-50 transition active:scale-95">{loading ? "Verifying…" : detectingDatabases ? "Discovering databases…" : "Verify and connect"}</button>
       </form>
     </div>
   );
@@ -404,6 +607,20 @@ export default function ProjectWorkspace() {
             <Database className="mb-1.5 h-4 w-4 text-blue-600" />
             <p className="truncate text-xs font-mono">{instances[0].url}</p>
             <p className="mt-1 text-[10px] uppercase font-semibold text-gray-500">{instances[0].environment} · {instances[0].status}</p>
+          </div>
+          <div className="mt-4 rounded-xl border p-3.5 dark:border-white/10">
+            <label className="block text-[10px] font-semibold uppercase text-gray-500 mb-1">A2A Planner Model</label>
+            <select value={plannerModel} onChange={(e) => setPlannerModel(e.target.value)} className="w-full rounded-lg border px-2 py-1.5 text-xs dark:bg-black dark:border-white/10 focus:ring-1 focus:ring-blue-500 transition">
+              <option value="gpt-4o">gpt-4o</option>
+              <option value="gpt-4o-mini">gpt-4o-mini</option>
+              <option value="o1-mini">o1-mini</option>
+              <option value="o1-preview">o1-preview</option>
+            </select>
+            <label className="block text-[10px] font-semibold uppercase text-gray-500 mt-3 mb-1">Fallback Model</label>
+            <select value={fallbackModel} onChange={(e) => setFallbackModel(e.target.value)} className="w-full rounded-lg border px-2 py-1.5 text-xs dark:bg-black dark:border-white/10 focus:ring-1 focus:ring-blue-500 transition">
+              <option value="gpt-4o-mini">gpt-4o-mini</option>
+              <option value="gpt-4o">gpt-4o</option>
+            </select>
           </div>
           <Link href={`/projects/${projectId}/workspace`} className="mt-4 block rounded-xl border p-2.5 text-xs hover:bg-black/5 dark:border-white/10">
             Workspace & lifecycle
@@ -437,6 +654,13 @@ export default function ProjectWorkspace() {
             >
               <Plus className="h-3 w-3" />
               New Chat
+            </button>
+            <button
+              onClick={() => setShowHistoryModal(true)}
+              className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] font-medium text-gray-400 transition hover:bg-white/10 hover:text-white active:scale-95"
+            >
+              <History className="h-3 w-3 text-purple-400" />
+              History ({runs.length})
             </button>
           </div>
           <div className="flex items-center gap-4">
@@ -556,7 +780,7 @@ export default function ProjectWorkspace() {
               >
                 <div className="flex items-center gap-2 font-semibold text-amber-800 dark:text-amber-300">
                   <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-                  <span>Class {pending.risk_class} action awaiting approval</span>
+                  <span>Class {pending.risk_class} action — approval required</span>
                 </div>
                 <p className="mt-2 font-mono text-xs text-amber-900/80 dark:text-amber-200/80">
                   {pending.tool}
@@ -584,11 +808,110 @@ export default function ProjectWorkspace() {
             )}
           </AnimatePresence>
 
+          {/* Question Card (Protocol 3) */}
+          <AnimatePresence>
+            {agentQuestion && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.96, y: 8 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.96, y: 4 }}
+                transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+                className="max-w-2xl rounded-2xl border border-blue-400/60 bg-blue-50/90 p-5 text-sm shadow-sm backdrop-blur-md dark:border-blue-500/30 dark:bg-blue-950/30"
+              >
+                <div className="flex items-center gap-2 font-semibold text-blue-800 dark:text-blue-300">
+                  <Brain className="h-5 w-5 text-blue-500 dark:text-blue-400" />
+                  <span>Agent needs clarification</span>
+                </div>
+                <p className="mt-2.5 text-sm text-blue-900/90 dark:text-blue-100/90">{agentQuestion.question}</p>
+                {agentQuestion.options.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {agentQuestion.options.map((opt, i) => (
+                      <button
+                        key={i}
+                        onClick={() => setQuestionAnswer(opt)}
+                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition ${questionAnswer === opt ? "border-blue-500 bg-blue-600 text-white" : "border-blue-200 bg-white/80 text-blue-800 hover:bg-blue-50 dark:border-blue-500/30 dark:bg-blue-900/30 dark:text-blue-200"}`}
+                      >
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <textarea
+                  value={questionAnswer}
+                  onChange={(e) => setQuestionAnswer(e.target.value)}
+                  placeholder="Type your answer here…"
+                  rows={2}
+                  className="mt-3 w-full rounded-xl border border-blue-200 bg-white/90 px-3 py-2 text-xs text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-400 dark:border-blue-500/30 dark:bg-blue-900/20 dark:text-gray-100"
+                />
+                <button
+                  disabled={!questionAnswer.trim() || submittingAnswer}
+                  onClick={() => void submitAnswer()}
+                  className="mt-3 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-transform active:scale-95 disabled:opacity-50"
+                >
+                  {submittingAnswer ? "Sending…" : "Submit Answer"}
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Thinking Text (Protocol 2 — muted italic inline) */}
+          <AnimatePresence>
+            {thinkingText && loading && (
+              <motion.p
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="max-w-2xl pl-9 text-xs italic text-gray-400 dark:text-gray-500"
+              >
+                {thinkingText}
+              </motion.p>
+            )}
+          </AnimatePresence>
+
+          {/* Final Report Card (Protocol 4 — pinned, non-collapsible) */}
+          {finalReport && (
+            <div className={`max-w-2xl rounded-2xl border p-5 text-sm backdrop-blur-md ${
+              finalReport.outcome === "SUCCESS" ? "border-emerald-500/40 bg-emerald-950/20" :
+              finalReport.outcome === "PARTIAL" ? "border-amber-500/40 bg-amber-950/20" :
+              "border-red-500/40 bg-red-950/20"
+            }`}>
+              <div className="flex items-center gap-2.5">
+                <span className={`rounded-md px-2.5 py-0.5 text-xs font-bold tracking-wide ${
+                  finalReport.outcome === "SUCCESS" ? "bg-emerald-500/20 text-emerald-300" :
+                  finalReport.outcome === "PARTIAL" ? "bg-amber-500/20 text-amber-300" :
+                  "bg-red-500/20 text-red-300"
+                }`}>
+                  {finalReport.outcome}
+                </span>
+                <span className="font-semibold text-gray-200">Final Report</span>
+              </div>
+              <ul className="mt-3 space-y-1">
+                {finalReport.done.map((item, i) => (
+                  <li key={i} className="flex items-start gap-2 text-xs text-gray-300">
+                    <span className="mt-0.5 text-emerald-400">✓</span>
+                    {item}
+                  </li>
+                ))}
+              </ul>
+              {finalReport.verification && (
+                <p className="mt-3 text-xs text-gray-400"><span className="font-semibold text-gray-300">Verification:</span> {finalReport.verification}</p>
+              )}
+              {finalReport.errors && (
+                <pre className="mt-3 max-h-40 overflow-auto rounded-lg bg-black/40 p-2.5 font-mono text-[11px] text-red-300 border border-red-500/20">
+                  {finalReport.errors}
+                </pre>
+              )}
+            </div>
+          )}
+
           {/* Activity Stepper */}
           <ActivityStepper
             steps={steps}
             usage={usage}
             isStuck={isStuck}
+            supervisorTaskGraph={supervisorTaskGraph}
+            activeTaskId={activeTaskId}
+            recoveringTaskId={recoveringTaskId}
             onOpenDiff={() => {
               setShowRightPanel(true);
               setRightPanelTab("diff");
@@ -629,17 +952,28 @@ export default function ProjectWorkspace() {
               onChange={(e) => setMessage(e.target.value)}
               onKeyDown={handleKeyDown}
               disabled={loading || Boolean(pending)}
-              placeholder={pending ? "Resolve the pending action first" : "Ask the agent… (⌘↵ to send)"}
+              placeholder={pending ? "Resolve the pending action first" : loading ? "Agent is working…" : "Ask the agent… (⌘↵ to send)"}
               className="w-full resize-none overflow-hidden rounded-2xl border border-white/10 bg-zinc-800 px-5 py-3 pr-12 text-sm text-white placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500/60"
               style={{ fieldSizing: "content", maxHeight: "9rem" } as React.CSSProperties}
             />
-            <button
-              type="submit"
-              disabled={loading || !message.trim() || Boolean(pending)}
-              className="absolute bottom-2 right-2 rounded-xl bg-blue-600 p-2 text-white transition-transform hover:bg-blue-500 active:scale-95 disabled:opacity-30"
-            >
-              <Send className="h-4 w-4" />
-            </button>
+            {loading && activeRunId ? (
+              <button
+                type="button"
+                onClick={() => void handleStopRun()}
+                className="absolute bottom-2 right-2 rounded-xl bg-red-600/20 p-2 text-red-400 transition-transform hover:bg-red-600/40 hover:text-red-300 active:scale-95"
+                title="Stop generation"
+              >
+                <Square className="h-4 w-4 fill-current" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={loading || !message.trim() || Boolean(pending)}
+                className="absolute bottom-2 right-2 rounded-xl bg-blue-600 p-2 text-white transition-transform hover:bg-blue-500 active:scale-95 disabled:opacity-30"
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            )}
           </div>
           {usage && <p className="mt-1.5 text-center font-mono text-[10px] text-gray-600">{usage}</p>}
         </form>
@@ -799,6 +1133,90 @@ export default function ProjectWorkspace() {
         </aside>
         </>
       )}
+
+      {/* Chat History & Past Runs Modal Drawer */}
+      <AnimatePresence>
+        {showHistoryModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="w-full max-w-2xl rounded-2xl border border-white/10 bg-zinc-950 p-6 shadow-2xl space-y-4 max-h-[85vh] flex flex-col"
+            >
+              <div className="flex items-center justify-between border-b border-white/10 pb-4">
+                <div className="flex items-center gap-2.5">
+                  <History className="h-5 w-5 text-purple-400" />
+                  <h2 className="text-lg font-bold text-white">Chat History & Past Runs</h2>
+                </div>
+                <div className="flex items-center gap-2">
+                  {runs.length > 0 && (
+                    <button
+                      onClick={() => void handleClearAllHistory()}
+                      className="flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-950/30 px-3 py-1.5 text-xs font-semibold text-red-300 hover:bg-red-900/50 transition active:scale-95"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" /> Clear All History
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setShowHistoryModal(false)}
+                    className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-gray-400 hover:bg-white/10 hover:text-white transition"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto space-y-3 pr-1">
+                {runs.length === 0 ? (
+                  <div className="p-8 text-center text-xs text-gray-500">No past runs recorded for this project yet.</div>
+                ) : (
+                  runs.map((runItem) => (
+                    <div
+                      key={runItem.id}
+                      className="flex items-start justify-between gap-4 rounded-xl border border-white/5 bg-zinc-900/80 p-4 transition hover:border-white/20"
+                    >
+                      <div className="space-y-1.5 min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
+                            runItem.status === "succeeded" ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30" :
+                            runItem.status === "failed" ? "bg-red-500/20 text-red-300 border border-red-500/30" :
+                            "bg-gray-500/20 text-gray-400 border border-gray-500/30"
+                          }`}>
+                            {runItem.status}
+                          </span>
+                          <span className="text-[11px] font-mono text-gray-500">
+                            {new Date(runItem.created_at).toLocaleString()}
+                          </span>
+                          {runItem.cost_usd > 0 && (
+                            <span className="text-[10px] font-mono text-purple-300 bg-purple-500/10 px-1.5 py-0.5 rounded">
+                              ${Number(runItem.cost_usd).toFixed(4)}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-gray-200 font-medium line-clamp-2 leading-relaxed">
+                          {runItem.prompt || "Agent task execution"}
+                        </p>
+                        {runItem.error_message && (
+                          <p className="text-[11px] text-red-400 font-mono line-clamp-1">{runItem.error_message}</p>
+                        )}
+                      </div>
+
+                      <button
+                        onClick={() => void handleDeleteRun(runItem.id)}
+                        className="rounded-lg p-2 text-gray-500 hover:bg-red-500/20 hover:text-red-400 transition"
+                        title="Delete this run"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

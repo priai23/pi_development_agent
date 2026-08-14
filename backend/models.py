@@ -217,6 +217,13 @@ class AgentRun(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
+    # A2A task decomposition — Supervisor task graph
+    task_graph = Column(JSON, nullable=True)             # list[TaskGraphItem] — ordered task plan
+    active_task_id = Column(String(64), nullable=True)   # currently executing sub-task id
+    subtask_heartbeat_at = Column(DateTime(timezone=True), nullable=True)  # per-task heartbeat
+    task_retries = Column(JSON, nullable=True)            # {task_id: retry_count}
+    planner_model = Column(String(64), nullable=True)     # model to use for planning
+    fallback_model = Column(String(64), nullable=True)    # fallback model
 
 
 class ToolEvent(Base):

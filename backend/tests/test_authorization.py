@@ -6,6 +6,7 @@ from sqlalchemy.pool import StaticPool
 
 import models
 import main
+import schemas
 from auth import require_project
 
 
@@ -77,3 +78,18 @@ def test_class_c_is_decided_by_requester(db):
     db.add(action); db.commit()
     assert main.can_approve(db, requester, action) is True
     assert main.can_approve(db, other, action) is False
+
+
+def test_duplicate_project_name_rejected(db):
+    admin = models.User(email="admin-dup@example.com", password_hash="unused", role="admin")
+    organization = models.Organization(name="Dup Org")
+    db.add_all([admin, organization]); db.flush()
+    payload1 = schemas.ProjectCreate(name="Unique Name", organization_id=organization.id)
+    main.create_project(payload1, user=admin, db=db)
+    
+    payload2 = schemas.ProjectCreate(name="unique name", organization_id=organization.id)
+    with pytest.raises(HTTPException) as exc:
+        main.create_project(payload2, user=admin, db=db)
+    assert exc.value.status_code == 409
+    assert "already exists" in exc.value.detail
+

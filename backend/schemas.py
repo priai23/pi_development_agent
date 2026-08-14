@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, EmailStr, Field
 
@@ -24,6 +24,16 @@ class UserOut(ORMModel):
 class AuthState(BaseModel):
     user: UserOut
     csrf_token: str
+
+
+class SetupStatusOut(BaseModel):
+    needs_setup: bool
+    user_count: int
+
+
+class SetupAdminRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=12)
 
 
 class AdminUserCreate(BaseModel):
@@ -140,6 +150,10 @@ class ActionDecision(BaseModel):
     decision: Literal["approve", "reject"]
 
 
+class QuestionAnswer(BaseModel):
+    answer: str
+
+
 class PendingActionOut(ORMModel):
     id: str
     tool_name: str
@@ -167,6 +181,8 @@ class LLMSettingsUpdate(BaseModel):
 class RunCreate(BaseModel):
     message: str = Field(min_length=1, max_length=20_000)
     queue_if_busy: bool = False
+    planner_model: str | None = None
+    fallback_model: str | None = None
 
 
 class RunOut(ORMModel):
@@ -185,6 +201,38 @@ class RunOut(ORMModel):
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    task_graph: list[Any] | None = None
+    active_task_id: str | None = None
+    planner_model: str | None = None
+    fallback_model: str | None = None
+
+
+# ─── A2A Task Decomposition Schemas ───────────────────────────────────────────
+
+class TaskGraphItem(BaseModel):
+    """A single node in the Supervisor task graph."""
+    task_id: str                                               # e.g. 'task_02_extend_models'
+    title: str                                                 # human-readable label
+    risk_class: int = 1                                        # 1=read, 2=reversible-write, 3=destructive
+    depends_on: list[str] = []                                 # task_ids this task depends on
+    status: Literal["pending", "in_progress", "blocked", "done", "failed"] = "pending"
+    retry_count: int = 0
+    max_retries: int = 2                                       # configurable per task
+    context_bundle: dict[str, Any] = {}                        # scoped context slice passed to worker
+    result: dict[str, Any] | None = None                      # result reported back to supervisor
+    heartbeat_at: str | None = None                           # ISO timestamp of last sub-task heartbeat
+
+
+class HandoffMessage(BaseModel):
+    """Supervisor ↔ Worker message envelope."""
+    task_id: str
+    parent_run_id: str
+    depends_on: list[str] = []
+    status: Literal["pending", "in_progress", "blocked", "done", "failed"]
+    context_bundle: dict[str, Any] = {}
+    result: dict[str, Any] | None = None
+    heartbeat_at: str | None = None
+    retry_count: int = 0
 
 
 class ToolEventOut(ORMModel):

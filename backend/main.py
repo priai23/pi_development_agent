@@ -17,7 +17,7 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from sqlalchemy.orm import Session
 
@@ -46,9 +46,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ERP Agentic Implementation API",
     lifespan=lifespan,
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_host_list)
 app.add_middleware(
@@ -62,7 +62,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def csrf_protection(request: Request, call_next):
-    if request.method not in {"GET", "HEAD", "OPTIONS"} and request.url.path != "/auth/login":
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in {"/auth/login", "/auth/setup-admin"}:
         session_token = request.cookies.get(SESSION_COOKIE)
         csrf_token = request.headers.get("X-CSRF-Token")
         if session_token:
@@ -79,19 +79,19 @@ def validate_erp_url(value: str, db: Session | None = None) -> str:
     parsed = urlparse(value.rstrip("/"))
     host = (parsed.hostname or "").lower()
     if not host or parsed.username or parsed.password:
-        raise HTTPException(status_code=400, detail="Invalid ERP URL")
+        raise HTTPException(status_code=400, detail="Invalid ERP URL format. Please enter e.g. https://yourcompany.odoo.com")
     policies = db.query(models.HostPolicy).filter(models.HostPolicy.is_active.is_(True)).all() if db else []
     policy = next((item for item in policies if host == item.hostname_pattern or (item.hostname_pattern.startswith(".") and host.endswith(item.hostname_pattern))), None)
-    bootstrap_allowed = any(host == entry or (entry.startswith(".") and host.endswith(entry)) for entry in settings.allowed_hosts)
+    bootstrap_allowed = any(entry == "*" or host == entry or (entry.startswith(".") and host.endswith(entry)) for entry in settings.allowed_hosts)
     if not bootstrap_allowed and not policy:
-        raise HTTPException(status_code=400, detail="ERP host is not allowed")
+        raise HTTPException(status_code=400, detail=f"ERP host '{host}' is not allowed")
     require_https = policy.require_https if policy else host not in {"localhost", "127.0.0.1"}
     if require_https and parsed.scheme != "https":
-        raise HTTPException(status_code=400, detail="ERP URL must use HTTPS")
+        raise HTTPException(status_code=400, detail="Hosted ERP URLs must use HTTPS (e.g. https://your-company.odoo.com)")
     try:
         addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
     except socket.gaierror as exc:
-        raise HTTPException(status_code=400, detail="ERP host could not be resolved") from exc
+        raise HTTPException(status_code=400, detail=f"ERP host '{host}' could not be resolved. Please check the URL.") from exc
     allow_private = policy.allow_private_network if policy else host in {"localhost", "127.0.0.1"}
     if not allow_private and any(ipaddress.ip_address(item[4][0]).is_private for item in addresses):
         raise HTTPException(status_code=400, detail="ERP host resolves to a private network address")
@@ -135,6 +135,470 @@ async def project_agent(request: Request, db: Session, project: models.Project) 
         key,
         "https://openrouter.ai/api/v1" if key else None,
     )
+
+
+BACKEND_UI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PI ERP Agent - Backend Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: rgba(17, 24, 39, 0.75);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --text: #f3f4f6;
+      --text-muted: #9ca3af;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --accent: #8b5cf6;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background-image: 
+        radial-gradient(at 10% 10%, rgba(59, 130, 246, 0.12) 0px, transparent 50%),
+        radial-gradient(at 90% 90%, rgba(139, 92, 246, 0.12) 0px, transparent 50%);
+    }
+    header {
+      border-bottom: 1px solid var(--card-border);
+      background: rgba(11, 15, 25, 0.8);
+      backdrop-filter: blur(12px);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+    .header-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 1rem 1.5rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .logo {
+      width: 36px;
+      height: 36px;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 1.1rem;
+      color: #fff;
+      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.4);
+    }
+    .brand-title h1 { font-size: 1.15rem; font-weight: 700; letter-spacing: -0.01em; }
+    .brand-title p { font-size: 0.75rem; color: var(--text-muted); }
+    .nav-links { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.5rem 0.9rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      text-decoration: none;
+      transition: all 0.2s ease;
+      cursor: pointer;
+      border: 1px solid transparent;
+    }
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3);
+    }
+    .btn-primary:hover { background: var(--primary-hover); transform: translateY(-1px); }
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text);
+      border-color: var(--card-border);
+    }
+    .btn-secondary:hover { background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.2); }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .badge-success { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .pulse-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background-color: currentColor;
+      box-shadow: 0 0 8px currentColor;
+    }
+
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem;
+      flex: 1;
+      width: 100%;
+    }
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1.25rem;
+      margin-bottom: 2rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 1.25rem;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+    }
+    .card-title { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); font-weight: 600; }
+    .card-value { font-size: 1.8rem; font-weight: 700; margin-top: 0.5rem; color: var(--text); }
+    .card-desc { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem; }
+
+    .setup-banner {
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(139, 92, 246, 0.15));
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      border-radius: 16px;
+      padding: 1.75rem;
+      margin-bottom: 2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .setup-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+    .setup-header h2 { font-size: 1.3rem; font-weight: 700; color: #fff; }
+
+    .form-group { margin-bottom: 1.25rem; }
+    .form-label { display: block; font-size: 0.85rem; font-weight: 500; margin-bottom: 0.4rem; color: var(--text); }
+    .form-input, .form-select {
+      width: 100%;
+      padding: 0.7rem 1rem;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      color: #fff;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .form-input:focus, .form-select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); }
+    
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; text-align: left; font-size: 0.85rem; }
+    th { padding: 0.75rem 1rem; color: var(--text-muted); font-weight: 600; border-bottom: 1px solid var(--card-border); }
+    td { padding: 0.75rem 1rem; border-bottom: 1px solid rgba(255, 255, 255, 0.04); }
+    
+    .alert { padding: 0.75rem 1rem; border-radius: 10px; font-size: 0.85rem; margin-bottom: 1rem; }
+    .alert-error { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); color: #fca5a5; }
+    .alert-success { background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: #6ee7b7; }
+    
+    footer { text-align: center; padding: 1.5rem; color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var(--card-border); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-container">
+      <div class="brand">
+        <div class="logo">PI</div>
+        <div class="brand-title">
+          <h1>PI ERP Implementation Backend</h1>
+          <p>FastAPI Engine & LangGraph Agent Runtime</p>
+        </div>
+      </div>
+      <div class="nav-links">
+        <span id="status-badge" class="badge badge-success"><span class="pulse-dot"></span> System Live</span>
+        <a href="http://localhost:3000" target="_blank" class="btn btn-primary">🚀 Launch Web UI</a>
+        <a href="/docs" class="btn btn-secondary">⚡ Swagger Docs</a>
+        <a href="/redoc" class="btn btn-secondary">📘 ReDoc</a>
+        <a href="/health" target="_blank" class="btn btn-secondary">🟢 Health</a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="metrics-grid">
+      <div class="card">
+        <div class="card-title">Backend API Health</div>
+        <div id="health-value" class="card-value" style="color: var(--success);">Operational</div>
+        <div class="card-desc">PostgreSQL & FastAPI Engine ready</div>
+      </div>
+      <div class="card">
+        <div class="card-title">User Accounts</div>
+        <div id="users-value" class="card-value">--</div>
+        <div id="users-desc" class="card-desc">Checking account setup status…</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Active Organizations</div>
+        <div id="orgs-value" class="card-value">--</div>
+        <div class="card-desc">Configured ERP tenant spaces</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Projects</div>
+        <div id="projects-value" class="card-value">--</div>
+        <div class="card-desc">Implementation & workflow agents</div>
+      </div>
+    </div>
+
+    <div id="setup-container"></div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h2 style="font-size: 1.1rem; font-weight: 600; margin-bottom: 0.5rem;">🔑 Account Creation & Management</h2>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">Create new member or admin accounts directly from the Backend Console.</p>
+        <form id="create-user-form">
+          <div id="form-msg"></div>
+          <div class="form-group">
+            <label class="form-label">Email Address</label>
+            <input type="email" id="user-email" required placeholder="admin@example.com" class="form-input">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Password (min 12 characters)</label>
+            <input type="password" id="user-password" required minlength="12" placeholder="••••••••••••" class="form-input">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Account Role</label>
+            <select id="user-role" class="form-select">
+              <option value="admin">Administrator</option>
+              <option value="member">Member</option>
+            </select>
+          </div>
+          <button type="submit" id="create-btn" class="btn btn-primary" style="width: 100%; justify-content: center;">Create Account</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2 style="font-size: 1.1rem; font-weight: 600; margin-bottom: 0.5rem;">⚡ API Endpoints & Docs Quick Actions</h2>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;">Directly inspect backend endpoints and OpenAPI specifications.</p>
+        <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+          <a href="/docs" class="btn btn-secondary" style="justify-content: space-between;">
+            <span>Interactive OpenAPI Swagger UI</span> <span>/docs &rarr;</span>
+          </a>
+          <a href="/redoc" class="btn btn-secondary" style="justify-content: space-between;">
+            <span>Detailed ReDoc Documentation</span> <span>/redoc &rarr;</span>
+          </a>
+          <a href="/openapi.json" target="_blank" class="btn btn-secondary" style="justify-content: space-between;">
+            <span>Raw OpenAPI Schema JSON</span> <span>/openapi.json &rarr;</span>
+          </a>
+          <a href="/health" target="_blank" class="btn btn-secondary" style="justify-content: space-between;">
+            <span>Backend Health Endpoint</span> <span>/health &rarr;</span>
+          </a>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <p>PI ERP Implementation Agent &copy; 2026 • Security-Hardened FastAPI & LangGraph Architecture</p>
+  </footer>
+
+  <script>
+    async function loadBackendState() {
+      try {
+        const setupRes = await fetch('/auth/setup-status');
+        const setupData = await setupRes.json();
+        
+        document.getElementById('users-value').innerText = setupData.user_count;
+        const usersDesc = document.getElementById('users-desc');
+        const setupContainer = document.getElementById('setup-container');
+
+        if (setupData.needs_setup) {
+          usersDesc.innerText = 'No accounts exist yet. Setup required!';
+          setupContainer.innerHTML = `
+            <div class="setup-banner">
+              <div class="setup-header">
+                <div>
+                  <h2>🚀 Initial Administrator Setup Required</h2>
+                  <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem;">
+                    The PostgreSQL database has 0 user accounts. Create your initial administrator account below.
+                  </p>
+                </div>
+                <span class="badge badge-warning"><span class="pulse-dot"></span> Setup Required</span>
+              </div>
+              <form id="setup-admin-form" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; align-items: flex-end;">
+                <div class="form-group" style="margin-bottom: 0;">
+                  <label class="form-label">Admin Email</label>
+                  <input type="email" id="setup-email" required placeholder="admin@example.com" class="form-input">
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                  <label class="form-label">Admin Password (min 12 chars)</label>
+                  <input type="password" id="setup-password" required minlength="12" placeholder="••••••••••••" class="form-input">
+                </div>
+                <button type="submit" class="btn btn-primary" style="height: 42px; justify-content: center;">Initialize Admin</button>
+              </form>
+              <div id="setup-msg"></div>
+            </div>
+          `;
+          document.getElementById('setup-admin-form').addEventListener('submit', handleSetupAdmin);
+        } else {
+          usersDesc.innerText = setupData.user_count + ' registered account(s)';
+          setupContainer.innerHTML = `
+            <div class="card" style="margin-bottom: 2rem; background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.2);">
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <div>
+                  <h3 style="font-size: 1rem; font-weight: 600; color: #6ee7b7;">✓ Backend System Configured</h3>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.2rem;">
+                    Administrator account active. Access the Web UI or manage accounts below.
+                  </p>
+                </div>
+                <a href="http://localhost:3000/login" class="btn btn-primary">Sign in on Web UI &rarr;</a>
+              </div>
+            </div>
+          `;
+        }
+
+        try {
+          const orgRes = await fetch('/organizations');
+          if (orgRes.ok) {
+            const orgs = await orgRes.json();
+            document.getElementById('orgs-value').innerText = orgs.length;
+          }
+          const projRes = await fetch('/projects');
+          if (projRes.ok) {
+            const projs = await projRes.json();
+            document.getElementById('projects-value').innerText = projs.length;
+          }
+        } catch(e) {}
+      } catch (err) {
+        console.error('Failed to load status:', err);
+      }
+    }
+
+    async function handleSetupAdmin(e) {
+      e.preventDefault();
+      const email = document.getElementById('setup-email').value;
+      const password = document.getElementById('setup-password').value;
+      const msg = document.getElementById('setup-msg');
+      msg.innerHTML = '';
+      try {
+        const res = await fetch('/auth/setup-admin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          msg.innerHTML = '<div class="alert alert-success">✓ Admin account created successfully! Redirecting to Web UI…</div>';
+          setTimeout(() => { window.location.href = 'http://localhost:3000/login'; }, 1500);
+        } else {
+          msg.innerHTML = `<div class="alert alert-error">${data.detail || 'Failed to setup admin account'}</div>`;
+        }
+      } catch (err) {
+        msg.innerHTML = `<div class="alert alert-error">${err.message}</div>`;
+      }
+    }
+
+    document.getElementById('create-user-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('user-email').value;
+      const password = document.getElementById('user-password').value;
+      const role = document.getElementById('user-role').value;
+      const msg = document.getElementById('form-msg');
+      msg.innerHTML = '';
+      try {
+        const res = await fetch('/admin/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password, role, organization_ids: [] })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          msg.innerHTML = '<div class="alert alert-success">✓ Account created successfully!</div>';
+          document.getElementById('user-email').value = '';
+          document.getElementById('user-password').value = '';
+          loadBackendState();
+        } else {
+          msg.innerHTML = `<div class="alert alert-error">${data.detail || 'Failed to create account. Make sure you are authenticated as admin or perform initial setup.'}</div>`;
+        }
+      } catch (err) {
+        msg.innerHTML = `<div class="alert alert-error">${err.message}</div>`;
+      }
+    });
+
+    loadBackendState();
+  </script>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def backend_dashboard():
+    return HTMLResponse(content=BACKEND_UI_HTML)
+
+
+@app.get("/auth/setup-status", response_model=schemas.SetupStatusOut)
+def setup_status(db: Session = Depends(get_db)):
+    user_count = db.query(models.User).count()
+    return schemas.SetupStatusOut(needs_setup=(user_count == 0), user_count=user_count)
+
+
+@app.post("/auth/setup-admin", response_model=schemas.AuthState)
+def setup_admin(payload: schemas.SetupAdminRequest, response: Response, db: Session = Depends(get_db)):
+    user_count = db.query(models.User).count()
+    if user_count > 0:
+        raise HTTPException(status_code=400, detail="Initial setup is already complete. Use /admin/users to manage accounts.")
+    user = models.User(
+        email=payload.email.lower(),
+        password_hash=hash_password(payload.password),
+        role="admin",
+        must_change_password=False,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    session_token, csrf_token = new_token(), new_token()
+    expires = datetime.now(timezone.utc) + timedelta(hours=settings.session_hours)
+    db.add(
+        models.UserSession(
+            user_id=user.id,
+            token_hash=token_hash(session_token),
+            csrf_hash=token_hash(csrf_token),
+            expires_at=expires,
+        )
+    )
+    audit(db, "auth.setup_admin", user.id, None, {})
+    db.commit()
+
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_token,
+        httponly=True,
+        secure=settings.secure_cookies,
+        samesite="strict",
+        max_age=settings.session_hours * 3600,
+    )
+    response.set_cookie(
+        CSRF_COOKIE,
+        csrf_token,
+        httponly=False,
+        secure=settings.secure_cookies,
+        samesite="strict",
+        max_age=settings.session_hours * 3600,
+    )
+    return schemas.AuthState(user=user, csrf_token=csrf_token)
 
 
 @app.get("/health")
@@ -438,8 +902,15 @@ def create_project(payload: schemas.ProjectCreate, user: models.User = Depends(c
         raise HTTPException(status_code=403, detail="Organization access denied")
     if not db.get(models.Organization, payload.organization_id):
         raise HTTPException(status_code=400, detail="Unknown organization")
+    project_name = payload.name.strip()
+    existing = db.query(models.Project).filter(
+        models.Project.organization_id == payload.organization_id,
+        models.Project.name.ilike(project_name),
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"A project named '{project_name}' already exists in this organization.")
     project = models.Project(
-        name=payload.name.strip(),
+        name=project_name,
         organization_id=payload.organization_id,
         created_by_id=user.id,
         workspace_slug=f"project-{uuid4().hex}",
@@ -838,6 +1309,16 @@ def retry_run(run_id: str, user: models.User = Depends(current_user), db: Sessio
     return run
 
 
+@app.delete("/runs/{run_id}", status_code=204)
+def delete_run(run_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    run = db.get(models.AgentRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    require_project(db, user, run.project_id)
+    db.delete(run)
+    db.commit()
+
+
 @app.get("/runs/{run_id}/events", response_model=list[schemas.ToolEventOut])
 def run_events(run_id: str, after: int = 0, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     run = db.get(models.AgentRun, run_id)
@@ -1001,7 +1482,7 @@ async def decide_action(project_id: int, action_id: str, payload: schemas.Action
         raise HTTPException(status_code=403, detail="Only the requesting user can decide this action")
     now = datetime.now(timezone.utc)
     if action.status != "pending" or action.expires_at <= now:
-        raise HTTPException(status_code=409, detail="Action is no longer pending")
+        raise HTTPException(status_code=409, detail="This action has expired. Please stop the agent and request a new one.")
     agent = await project_agent(request, db, project)
     call = await agent.pending_call(action.thread_id)
     if not call or call["id"] != action.tool_call_id or call["name"] != action.tool_name or call["args"] != action.arguments:
@@ -1029,6 +1510,37 @@ async def decide_action(project_id: int, action_id: str, payload: schemas.Action
                     stored.status = "executed" if succeeded else "failed"
                 save_db.add(models.Interaction(project_id=project_id, role="agent", content=response_text))
                 audit(save_db, "agent.action_result", user.id, project_id, {"action_id": action_id, "succeeded": succeeded})
+                save_db.commit()
+
+    return StreamingResponse(events(), media_type="text/plain")
+
+
+@app.post("/projects/{project_id}/actions/answer")
+async def answer_question_endpoint(project_id: int, payload: schemas.QuestionAnswer, request: Request, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    """Resume the agent after an ask_question pause by supplying the user's answer."""
+    project = require_project(db, user, project_id)
+    agent = await project_agent(request, db, project)
+    run = db.query(models.AgentRun).filter(
+        models.AgentRun.project_id == project_id,
+        models.AgentRun.status.in_(["running", "queued"]),
+    ).order_by(models.AgentRun.created_at.desc()).first()
+    if not run:
+        raise HTTPException(status_code=409, detail="No active agent run awaiting an answer")
+    await agent.answer_question(run.thread_id, payload.answer)
+    audit(db, "agent.question_answered", user.id, project_id, {"run_id": run.id})
+    db.commit()
+
+    async def events():
+        response_text = ""
+        try:
+            async for chunk in agent.stream(None, run.thread_id):
+                response_text += chunk
+                yield chunk
+        except Exception:
+            yield "Could not resume after question answer."
+        finally:
+            with SessionLocal() as save_db:
+                save_db.add(models.Interaction(project_id=project_id, role="agent", content=response_text))
                 save_db.commit()
 
     return StreamingResponse(events(), media_type="text/plain")

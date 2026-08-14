@@ -2,6 +2,7 @@ export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001
 
 export type User = { id: number; email: string; role: "admin" | "member"; is_active: boolean; must_change_password: boolean };
 export type AuthState = { user: User; csrf_token: string };
+export type SetupStatus = { needs_setup: boolean; user_count: number };
 export type Organization = { id: number; name: string; created_at: string; monthly_budget_usd: number | null; budget_warning_percent: number };
 export type Instance = { id: number; project_id: number; erp_type: string; url: string; db_name: string | null; username: string | null; environment: "staging" | "production"; hosting_type: "on_premise" | "odoo_sh"; auth_method: "json2" | "xmlrpc"; status: string; is_active: boolean; version_info: Record<string, unknown>; capabilities: Record<string, unknown>; bridge_status: string; last_tested_at: string | null; last_error: string | null; created_at: string };
 export type Project = { id: number; name: string; organization_id: number; created_by_id: number; workspace_slug: string; phase: string; created_at: string; instances: Instance[] };
@@ -12,6 +13,8 @@ export type AuditEvent = { id: number; event_type: string; project_id: number | 
 export type AgentRun = { id: string; project_id: number; status: string; prompt: string; support_id: string; error_message: string | null; retryable: boolean; cost_usd: number; created_at: string };
 export type ToolEvent = { id: number; run_id: string; sequence: number; event_type: string; payload: Record<string, unknown>; created_at: string };
 export type Step = { tool: string; label: string; status: "running" | "done" | "failed"; result?: string; startedAt: number; elapsed?: number };
+export type AgentQuestion = { question: string; options: string[] };
+export type FinalReport = { outcome: "SUCCESS" | "PARTIAL" | "FAILED"; done: string[]; verification: string; errors: string; pending_approvals: string };
 
 export type WorkspaceEntry = { path: string; type: "file" | "directory"; size?: number };
 export type Requirement = { id: number; title: string; description: string; acceptance_criteria: string; status: string };
@@ -40,6 +43,23 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
+
+export async function getSetupStatus(): Promise<SetupStatus> {
+  return apiFetch<SetupStatus>("/auth/setup-status");
+}
+
+export async function setupAdmin(email: string, password: string): Promise<AuthState> {
+  return apiFetch<AuthState>("/auth/setup-admin", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  });
+}
+
+export async function deleteRun(runId: string): Promise<void> {
+  return apiFetch<void>(`/runs/${runId}`, { method: "DELETE" });
+}
+
+
 
 export async function streamRequest(path: string, body: unknown, onChunk: (text: string) => void): Promise<void> {
   const headers = new Headers({ "Content-Type": "application/json" });

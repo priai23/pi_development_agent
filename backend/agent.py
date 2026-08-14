@@ -132,6 +132,9 @@ class PiERPClient:
         raise NotImplementedError("Pi ERP connectivity is not implemented")
 
 
+QUESTION_SENTINEL = "__QUESTION_PENDING__"
+
+
 class ERPImplementationAgent:
     TOOL_REGISTRY_VERSION = "1.0"
     SAFE_TOOLS = {
@@ -146,28 +149,27 @@ class ERPImplementationAgent:
         "list_directory",
         "read_file",
         "check_deployment_status",
-        # Workspace file writes are git-backed and fully reversible — auto-approve
-        "create_directory",
-        "write_file",
-        "patch_file",
         "save_memory",
         "search_memory",
     }
+    # Class 1 = read-only (SAFE_TOOLS); Class 2 = reversible writes; Class 3 = destructive/live
     RISK_CLASSES = {
-        "create_directory": "C",
-        "write_file": "C",
-        "update_company_contact": "D",
-        "configure_sales": "C",
-        "configure_purchase": "C",
-        "configure_inventory": "D",
-        "create_partner": "C",
-        "create_product": "C",
-        "create_quotation": "C",
-        "create_rfq": "C",
-        "create_crm_lead": "C",
-        "create_draft_invoice": "D",
-        "package_module": "C",
-        "execute_deployment": "D",
+        "create_directory": 2,
+        "write_file": 2,
+        "patch_file": 2,
+        "verify_module_installation": 2,
+        "update_company_contact": 3,
+        "configure_sales": 2,
+        "configure_purchase": 2,
+        "configure_inventory": 3,
+        "create_partner": 2,
+        "create_product": 2,
+        "create_quotation": 2,
+        "create_rfq": 2,
+        "create_crm_lead": 2,
+        "create_draft_invoice": 3,
+        "package_module": 2,
+        "execute_deployment": 3,
     }
     TOOL_POLICIES: dict[str, dict[str, str]] = {}
 
@@ -204,7 +206,11 @@ class ERPImplementationAgent:
             kwargs["api_key"] = api_key
         if base_url:
             kwargs["base_url"] = base_url
-        llm = ChatOpenAI(**kwargs)
+        fallback_kwargs = kwargs.copy()
+        fallback_kwargs["model"] = "anthropic/claude-3.5-sonnet"
+        fallback_llm = ChatOpenAI(**fallback_kwargs)
+        llm = ChatOpenAI(**kwargs).with_fallbacks([fallback_llm])
+        self.llm = llm
 
         @tool
         def inspect_instance() -> str:
@@ -234,50 +240,62 @@ class ERPImplementationAgent:
 
         @tool
         def inspect_odoo_schema(model_names: list[str]) -> str:
-            """Inspect field names and types for Odoo models. Returns relational fields first, then up to 40 scalar fields - enough for scaffolding."""
+            """Inspect field names and types for Odoo models. Returns relational fields first, then up to 15 scalar fields - enough for scaffolding. DO NOT pass more than 3 models at once!"""
+            if len(model_names) > 3:
+                return "ERROR: You requested too many models at once. Please inspect a maximum of 3 models at a time to avoid exceeding context limits."
             result = {}
-            for model_name in model_names:
-                models = self.client.search_read("ir.model", [("model", "=", model_name)], ["id", "name", "model"], 1)
-                if not models:
-                    result[model_name] = "Model not found"
-                    continue
-                # Relational fields first (always include) — these define the model's relationships
-                relational = self.client.search_read(
-                    "ir.model.fields",
-                    [("model", "=", model_name), ("ttype", "in", ["many2one", "one2many", "many2many"])],
-                    ["name", "ttype", "relation"], 50,
-                )
-                # Top scalar fields for field name awareness
-                scalar = self.client.search_read(
-                    "ir.model.fields",
-                    [("model", "=", model_name), ("ttype", "not in", ["many2one", "one2many", "many2many"])],
-                    ["name", "ttype"], 40,
-                )
-                result[model_name] = {"model": models[0], "relational_fields": relational, "scalar_fields": scalar}
-            return json.dumps(result)
+            try:
+                for model_name in model_names:
+                    models = self.client.search_read("ir.model", [("model", "=", model_name)], ["id", "name", "model"], 1)
+                    if not models:
+                        result[model_name] = "Model not found"
+                        continue
+                    # Relational fields first (always include) — these define the model's relationships
+                    relational = self.client.search_read(
+                        "ir.model.fields",
+                        [("model", "=", model_name), ("ttype", "in", ["many2one", "one2many", "many2many"])],
+                        ["name", "ttype", "relation"], 25,
+                    )
+                    # Top scalar fields for field name awareness
+                    scalar = self.client.search_read(
+                        "ir.model.fields",
+                        [("model", "=", model_name), ("ttype", "not in", ["many2one", "one2many", "many2many"])],
+                        ["name", "ttype"], 15,
+                    )
+                    result[model_name] = {"model": models[0], "relational_fields": relational, "scalar_fields": scalar}
+                import yaml
+                return yaml.dump(result, sort_keys=False)
+            except Exception as e:
+                return f"ERROR communicating with Odoo: {str(e)}"
 
         @tool
         def inspect_views(model_name: str) -> str:
-            """List base views and window actions registered for an Odoo model. Returns only top-level (non-inherited) views."""
-            views = self.client.search_read(
-                "ir.ui.view",
-                [("model", "=", model_name), ("inherit_id", "=", False), ("active", "=", True)],
-                ["name", "type", "id"],
-                20
-            )
-            actions = self.client.search_read("ir.actions.act_window", [("res_model", "=", model_name)], ["name", "view_mode"], 10)
-            return json.dumps({"base_views": views, "actions": actions})
+            """Read standard views (form, tree, search) for a model."""
+            try:
+                views = self.client.search_read(
+                    "ir.ui.view",
+                    [("model", "=", model_name), ("type", "in", ["form", "tree", "search"])],
+                    ["name", "type", "arch_db"], 5,
+                )
+                import yaml
+                return yaml.dump(views, sort_keys=False)
+            except Exception as e:
+                return f"ERROR communicating with Odoo: {str(e)}"
 
         @tool
         def inspect_access(model_name: str) -> str:
             """Inspect access-control and record-rule metadata for a model."""
-            models = self.client.search_read("ir.model", [("model", "=", model_name)], ["id"], 1)
-            if not models:
-                return "Model not found"
-            model_id = models[0]["id"]
-            access = self.client.search_read("ir.model.access", [("model_id", "=", model_id)], ["name", "group_id", "perm_read", "perm_write", "perm_create", "perm_unlink"], 100)
-            rules = self.client.search_read("ir.rule", [("model_id", "=", model_id)], ["name", "groups", "domain_force", "perm_read", "perm_write", "perm_create", "perm_unlink"], 100)
-            return json.dumps({"access": access, "rules": rules})
+            try:
+                models = self.client.search_read("ir.model", [("model", "=", model_name)], ["id"], 1)
+                if not models:
+                    return "Model not found"
+                model_id = models[0]["id"]
+                access = self.client.search_read("ir.model.access", [("model_id", "=", model_id)], ["name", "group_id", "perm_read", "perm_write", "perm_create", "perm_unlink"], 100)
+                rules = self.client.search_read("ir.rule", [("model_id", "=", model_id)], ["name", "groups", "domain_force", "perm_read", "perm_write", "perm_create", "perm_unlink"], 100)
+                import yaml
+                return yaml.dump({"access": access, "rules": rules}, sort_keys=False)
+            except Exception as e:
+                return f"ERROR communicating with Odoo: {str(e)}"
 
         @tool
         def inspect_master_data(data_type: str, query: str = "", limit: int = 25) -> str:
@@ -296,12 +314,17 @@ class ERPImplementationAgent:
                 return "Unsupported master-data type"
             model, fields = registry[data_type]
             domain = [("name", "ilike", query)] if query else []
-            return json.dumps(self.client.search_read(model, domain, fields, min(max(limit, 1), 100)))
+            try:
+                import yaml
+                return yaml.dump(self.client.search_read(model, domain, fields, min(max(limit, 1), 100)), sort_keys=False)
+            except Exception as e:
+                return f"ERROR communicating with Odoo: {str(e)}"
 
         @tool
         def list_directory(path: str = "") -> str:
             """List a directory inside this project's workspace."""
-            return json.dumps(self.workspace.list_directory(path))
+            import yaml
+            return yaml.dump(self.workspace.list_directory(path), sort_keys=False)
 
         @tool
         def read_file(path: str) -> str:
@@ -330,7 +353,9 @@ class ERPImplementationAgent:
                     _ET.fromstring(content) if not content.strip().startswith("<?xml") else _ET.fromstring(content.split("\n", 1)[-1])
                 except _ET.ParseError as exc:
                     return f"XML_ERROR in {path}: {exc}. Fix the XML and call write_file again."
-            return self.workspace.write_file(path, content)
+            added_lines = len(content.splitlines())
+            self.workspace.write_file(path, content)
+            return f"Wrote {path} (+{added_lines} -0)"
 
         @tool
         def patch_file(path: str, old_str: str, new_str: str) -> str:
@@ -341,7 +366,10 @@ class ERPImplementationAgent:
                 return f"PATCH_ERROR: old_str not found in {path}. Use read_file to check the current content."
             if count > 1:
                 return f"PATCH_ERROR: old_str appears {count} times in {path}. Make old_str more specific."
-            return self.workspace.write_file(path, current.replace(old_str, new_str, 1))
+            old_lines = len(old_str.splitlines())
+            new_lines = len(new_str.splitlines())
+            self.workspace.write_file(path, current.replace(old_str, new_str, 1))
+            return f"Patched {path} (+{new_lines} -{old_lines})"
 
         @tool
         def save_memory(category: str, key: str, content: str) -> str:
@@ -653,7 +681,6 @@ class ERPImplementationAgent:
         self.tools.append(update_task_plan)
         self.tools.append(verify_module_installation)
         ERPImplementationAgent.SAFE_TOOLS.add("update_task_plan")
-        ERPImplementationAgent.SAFE_TOOLS.add("verify_module_installation")
 
         kb_path = Path(__file__).parent.parent / "skills" / "odoo19-dev" / "Odoo19_Dev_Customization_KB.md"
         self._kb_path = kb_path  # stored for the read_knowledge_base tool below
@@ -667,6 +694,35 @@ class ERPImplementationAgent:
         # Add to SAFE_TOOLS so it doesn't require approval
         ERPImplementationAgent.SAFE_TOOLS.add("read_knowledge_base")
 
+        # ── Protocol tools (all Class 1 — no approval required) ──────────────
+        @tool
+        def emit_thinking(message: str) -> str:
+            """[PROTOCOL 2] Emit a short thinking statement so the user can follow your reasoning. Call this before every tool call. message should be 1-3 sentences of plain-language reasoning — not a summary of the tool you are about to call, but WHY you are doing it."""
+            self.activity_events.append(("thinking", {"message": message}))
+            return "ok"
+
+        @tool
+        def ask_question(question: str, options: list[str] | None = None) -> str:
+            """[PROTOCOL 3] Ask the user a clarifying question and pause execution until they answer. Use when the task is ambiguous in a way that would produce materially different implementations, when required info is missing, or after 2 failed self-correction attempts on the same error. question should be specific. options should be 2-4 concrete choices when possible."""
+            self.activity_events.append(("question", {"question": question, "options": options or []}))
+            return QUESTION_SENTINEL
+
+        @tool
+        def emit_final_report(outcome: str, done: list[str], verification: str, errors: str = "", pending_approvals: str = "") -> str:
+            """[PROTOCOL 4] Emit the final run report. Call this EXACTLY ONCE at the end of every task — success or failure. outcome must be one of: SUCCESS, PARTIAL, FAILED. done is a list of concrete changes made. verification describes what was checked to confirm it works. errors should contain exact error text (not paraphrased) if PARTIAL or FAILED. Never report SUCCESS without a real verification step."""
+            self.activity_events.append(("final_report", {
+                "outcome": outcome,
+                "done": done,
+                "verification": verification,
+                "errors": errors,
+                "pending_approvals": pending_approvals,
+            }))
+            return "final_report_emitted"
+
+        for proto_tool in [emit_thinking, ask_question, emit_final_report]:
+            self.tools.append(proto_tool)
+            ERPImplementationAgent.SAFE_TOOLS.add(proto_tool.name)
+
         memories_text = ""
         if self.project_id:
             with SessionLocal() as db:
@@ -679,20 +735,48 @@ class ERPImplementationAgent:
 
         prompt = SystemMessage(
             content=(
-                "You are an expert autonomous Odoo 19 ERP implementation agent. "
-                "Every ERP schema fact must come from a tool result. "
-                "Use only the registered typed tools.\n\n"
-                "When requested to build, customize, or scaffold a module:\n"
-                "1. Emit a live task checklist at the start of work using update_task_plan (e.g. ['Inspect schema', 'Write module models & views', 'Package module', 'Verify installation'])\n"
-                "2. Inspect the live database schema (inspect_odoo_schema / inspect_views) ONCE to verify model names and fields. Do NOT repeat if you already have results in this session.\n"
-                "3. If uncertain about Odoo 19 syntax (ORM fields, view arch, manifest format), call read_knowledge_base ONCE.\n"
-                "4. Create directories with create_directory, then write files with write_file.\n"
-                "5. If write_file returns SYNTAX_ERROR or XML_ERROR, fix the content and call write_file again immediately with exact traceback feedback.\n"
-                "6. After files are written, call package_module to validate.\n"
-                "7. Call verify_module_installation to execute explicit XML-RPC checks confirming module state == 'installed' and ORM models exist in database.\n"
-                "8. ALWAYS include a dedicated section titled 'Where to find it inside Odoo 19:' at the end of your final response after building or customizing a module. Specify the exact Apps search name, Odoo top menu path (e.g. Inventory / Operations / Reorder Alerts), and form view smart buttons or field locations.\n"
+                "You are the Primacy ERP Implementation Agent — an autonomous engineer that builds, validates, "
+                "installs, and maintains Odoo 19 modules. The user watches your work live in a split-pane IDE. "
+                "You MUST follow all four protocols below on every task, with no exceptions.\n\n"
+
+                "═══ PROTOCOL 1 — PERMISSION GATING ═══\n"
+                "Before any write/modify/execute action, classify its risk and act accordingly:\n"
+                "- Class 1 (read-only, auto-proceed): inspect_*, read_file, list_directory — call emit_thinking first, then proceed.\n"
+                "- Class 2 (reversible write, requires approval): create_directory, write_file, patch_file, new models/views — the system will auto-pause for user approval.\n"
+                "- Class 3 (destructive/live, requires explicit confirmation): execute_deployment, configure_inventory, update_company_contact, create_draft_invoice — the approval card will warn the user what can break.\n"
+                "Never batch multiple Class 2/3 actions under a single approval. One approval = one described action.\n"
+                "If the user denies an action: stop that plan branch, acknowledge the denial, and ask for an alternative.\n\n"
+
+                "═══ PROTOCOL 2 — REAL-TIME VISIBILITY ═══\n"
+                "Call emit_thinking BEFORE every tool call — no exceptions. "
+                "The message must say WHY you are doing the next step (1-3 sentences), not just what tool you'll call. "
+                "Never let more than one logical step pass without a visible event. "
+                "If a tool is slow, emit_thinking first so the user isn't left watching a blank screen.\n\n"
+
+                "═══ PROTOCOL 3 — ASK WHEN CONFUSED ═══\n"
+                "Call ask_question (which pauses execution) when any of the following are true:\n"
+                "- Two reasonable implementations would produce materially different results.\n"
+                "- Required information is missing and cannot be inferred from schema inspection or the KB.\n"
+                "- An action conflicts with an existing customization and the right resolution is not obvious.\n"
+                "- You have attempted the same fix TWICE and it is still failing — stop and ask, do not retry blindly.\n"
+                "Do NOT ask about things you can verify via inspect_odoo_schema, inspect_views, or read_knowledge_base.\n\n"
+
+                "═══ PROTOCOL 4 — FINAL REPORT ═══\n"
+                "Call emit_final_report EXACTLY ONCE at the end of every task (success or failure). "
+                "Never report outcome=SUCCESS without having called verify_module_installation or equivalent verification. "
+                "'The write call did not error' is NOT sufficient evidence of success.\n\n"
+
+                "═══ MODULE BUILD PROCEDURE ═══\n"
+                "1. Call emit_thinking with your reasoning, then update_task_plan with the ordered steps.\n"
+                "2. Inspect the live schema (inspect_odoo_schema / inspect_views) ONCE.\n"
+                "3. If uncertain about Odoo 19 syntax, call read_knowledge_base ONCE.\n"
+                "4. Write files with write_file. If SYNTAX_ERROR or XML_ERROR is returned, fix and retry immediately — show the exact error in emit_thinking.\n"
+                "5. Call package_module to validate.\n"
+                "6. Call verify_module_installation to confirm module state == 'installed' and ORM models exist.\n"
+                "7. End your response with a 'Where to find it inside Odoo 19:' navigation guide.\n"
+                "8. Call emit_final_report with outcome, concrete change list, and verification result.\n"
                 "9. Always call exactly one tool at a time. Never use placeholders in generated code.\n"
-                "10. Use save_memory whenever you discover a critical schema detail, fix a bug, or receive a key preference from the user so you remember it in future runs."
+                "10. Use save_memory for critical schema details, bug fixes, and user preferences."
                 f"{memories_text}"
             )
         )
@@ -720,7 +804,7 @@ class ERPImplementationAgent:
         return messages
 
     async def stream(self, prompt: str | None, thread_id: str, interactions: list | None = None, reject=False):
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
         if prompt is not None:
             existing = await self.executor.aget_state(config)
             messages = [] if existing.values.get("messages") else self._history(interactions or [])
@@ -758,13 +842,22 @@ class ERPImplementationAgent:
                     self.activity_events.append(("tool.started", {
                         "tool": event.get("name", "unknown"), "arguments": event.get("data", {}).get("input", {}),
                     }))
+                    yield ""
                 elif event["event"] == "on_tool_end":
                     output = str(event.get("data", {}).get("output", ""))
+                    # Detect ask_question sentinel — pause execution for user answer
+                    if output.strip() == QUESTION_SENTINEL:
+                        return
                     self.activity_events.append(("tool.completed", {
                         "tool": event.get("name", "unknown"), "result": output[:10_000], "truncated": len(output) > 10_000,
                     }))
+                    yield ""
             state = await self.executor.aget_state(config)
             if not state.next:
+                if not any(e[0] == "final_report" for e in self.activity_events) and getattr(self, "_reminders", 0) < 2:
+                    self._reminders = getattr(self, "_reminders", 0) + 1
+                    input_data = {"messages": [HumanMessage(content="You must call emit_final_report to finish the task.")]}
+                    continue
                 return
             if "tools" not in state.next:
                 input_data = None
@@ -783,6 +876,31 @@ class ERPImplementationAgent:
             return None
         return call
 
+    async def pending_question(self, thread_id: str) -> dict | None:
+        """Return the pending ask_question tool call if the graph is paused waiting for a user answer."""
+        state = await self.executor.aget_state({"configurable": {"thread_id": thread_id}})
+        if "tools" not in state.next:
+            return None
+        call = self._single_pending_call(state)
+        if call["name"] != "ask_question":
+            return None
+        return call
+
+    async def answer_question(self, thread_id: str, answer: str) -> None:
+        """Resume the graph after ask_question by injecting the user's answer as a ToolMessage."""
+        config = {"configurable": {"thread_id": thread_id}}
+        state = await self.executor.aget_state(config)
+        last = state.values.get("messages", [])[-1]
+        calls = getattr(last, "tool_calls", [])
+        if len(calls) != 1 or calls[0]["name"] != "ask_question":
+            raise ValueError("No pending ask_question call to answer")
+        call = calls[0]
+        await self.executor.aupdate_state(
+            config,
+            {"messages": [ToolMessage(tool_call_id=call["id"], name=call["name"], content=answer)]},
+            as_node="tools",
+        )
+
     @staticmethod
     def _single_pending_call(state) -> dict:
         last = state.values.get("messages", [])[-1]
@@ -795,9 +913,23 @@ class ERPImplementationAgent:
         name, args = call["name"], call["args"]
         if name == "write_file":
             return self.workspace.write_preview(args["path"], args["content"])
+        if name == "patch_file":
+            return {
+                "operation": f"patch {args.get('path')}",
+                "path": args.get("path"),
+                "old_str": args.get("old_str"),
+                "new_str": args.get("new_str"),
+            }
         if name == "create_directory":
             self.workspace.resolve(args["path"])
             return {"path": args["path"], "operation": "create directory"}
+        if name == "verify_module_installation":
+            return {
+                "operation": f"verify module installation: {args.get('module_name')}",
+                "module_name": args.get("module_name"),
+                "expected_models": args.get("expected_models", []),
+                "expected_fields": args.get("expected_fields", []),
+            }
         if name == "update_company_contact":
             return {
                 "operation": "update company contact",
@@ -829,6 +961,220 @@ ERPImplementationAgent.TOOL_POLICIES = {
 }
 
 
+# ─── A2A Supervisor / Planner ──────────────────────────────────────────────────
+# Decomposes complex multi-step prompts into an ordered task graph.  Each task
+# becomes its own bounded unit of work with its own heartbeat and retry budget
+# tracked in AgentRun.task_graph / AgentRun.subtask_heartbeat_at.
+#
+# Day-one approach: pattern-based decomposition for module builds.
+# Future: LLM-driven dynamic planning with parallel worker sub-graphs.
+
+_MODULE_BUILD_KEYWORDS = frozenset([
+    "module", "build", "create module", "implement", "custom module", "odoo module",
+    "manifest", "models.py", "views.xml", "security", "ir.model.access",
+    "computed field", "extend", "mrp", "manufacturing", "cost tracker",
+    "tracker", "wizard", "report", "kanban", "pivot", "dashboard",
+])
+
+_STANDARD_MODULE_TASK_GRAPH = [
+    {
+        "task_id": "task_01_inspect_ground",
+        "title": "Inspect & ground schema",
+        "risk_class": 1,
+        "depends_on": [],
+        "status": "pending",
+        "retry_count": 0,
+        "context_bundle": {},
+        "result": None,
+        "heartbeat_at": None,
+    },
+    {
+        "task_id": "task_02_extend_models",
+        "title": "Extend models / computed fields",
+        "risk_class": 2,
+        "depends_on": ["task_01_inspect_ground"],
+        "status": "pending",
+        "retry_count": 0,
+        "context_bundle": {},
+        "result": None,
+        "heartbeat_at": None,
+    },
+    {
+        "task_id": "task_03_config_model",
+        "title": "Create config model",
+        "risk_class": 2,
+        "depends_on": ["task_01_inspect_ground"],
+        "status": "pending",
+        "retry_count": 0,
+        "context_bundle": {},
+        "result": None,
+        "heartbeat_at": None,
+    },
+    {
+        "task_id": "task_04_views_menus",
+        "title": "Add views & menus",
+        "risk_class": 2,
+        "depends_on": ["task_02_extend_models", "task_03_config_model"],
+        "status": "pending",
+        "retry_count": 0,
+        "context_bundle": {},
+        "result": None,
+        "heartbeat_at": None,
+    },
+    {
+        "task_id": "task_05_security_access",
+        "title": "Add security access entries",
+        "risk_class": 2,
+        "depends_on": ["task_02_extend_models", "task_03_config_model", "task_04_views_menus"],
+        "status": "pending",
+        "retry_count": 0,
+        "context_bundle": {},
+        "result": None,
+        "heartbeat_at": None,
+    },
+    {
+        "task_id": "task_06_verify_install",
+        "title": "Verify module installation",
+        "risk_class": 1,
+        "depends_on": ["task_05_security_access"],
+        "status": "pending",
+        "retry_count": 0,
+        "context_bundle": {},
+        "result": None,
+        "heartbeat_at": None,
+    },
+]
+
+_SIMPLE_TASK_GRAPH = [
+    {
+        "task_id": "task_01_execute",
+        "title": "Execute task",
+        "risk_class": 1,
+        "depends_on": [],
+        "status": "pending",
+        "retry_count": 0,
+        "context_bundle": {},
+        "result": None,
+        "heartbeat_at": None,
+    },
+]
+
+MAX_TASK_RETRIES = 2
+
+
+class SupervisorPlanner:
+    """Determines whether a prompt warrants A2A task decomposition and returns
+    an ordered task graph.  The Supervisor persists this graph on the AgentRun
+    so the worker watchdog can track per-task heartbeats and retry budgets.
+
+    Day-one: pattern-matching decomposition for standard Odoo module builds.
+    The graph is intentionally hardcoded — dynamic LLM planning can be layered
+    on later without changing the worker/frontend contract.
+    """
+
+    @staticmethod
+    def is_module_build(prompt: str) -> bool:
+        """Return True if the prompt describes a complex multi-step module build."""
+        lower = prompt.lower()
+        hits = sum(1 for kw in _MODULE_BUILD_KEYWORDS if kw in lower)
+        return hits >= 2  # require at least 2 module-build signals
+
+    @staticmethod
+    async def decompose(prompt: str, llm: ChatOpenAI | None = None) -> list[dict]:
+        """Return the appropriate task graph for the given prompt.
+        If a planner LLM is provided, generates a dynamic graph.
+        Otherwise, falls back to the standard template.
+        """
+        import copy
+        import schemas
+        from pydantic import BaseModel
+
+        if not SupervisorPlanner.is_module_build(prompt):
+            return copy.deepcopy(_SIMPLE_TASK_GRAPH)
+
+        if llm:
+            try:
+                system_prompt = (
+                    "You are the Supervisor Planner for an Odoo 19 module building agent.\n"
+                    "Your job is to break down the user's prompt into an ordered sequence of tasks.\n"
+                    "Return a JSON array of tasks. Ensure you include dependencies (`depends_on`) so tasks run in the correct order.\n"
+                    "Set `max_retries` based on the difficulty of the task (usually 2, maybe 3 for complex tasks).\n"
+                    "A standard module build covers: inspection, model changes, views, security, and verification."
+                )
+                
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=f"Plan tasks for this request: {prompt}")
+                ]
+                
+                class TaskList(BaseModel):
+                    tasks: list[schemas.TaskGraphItem]
+
+                structured_llm = llm.with_structured_output(TaskList)
+                result = await structured_llm.ainvoke(messages)
+                
+                return [task.model_dump() for task in result.tasks]
+            except Exception as e:
+                print(f"Dynamic planning failed, falling back to static graph: {e}")
+
+        return copy.deepcopy(_STANDARD_MODULE_TASK_GRAPH)
+
+    @staticmethod
+    def get_next_task(task_graph: list[dict]) -> dict | None:
+        """Return the first task that is ready to run (all dependencies done)."""
+        done_ids = {t["task_id"] for t in task_graph if t["status"] == "done"}
+        for task in task_graph:
+            if task["status"] != "pending":
+                continue
+            if all(dep in done_ids for dep in task["depends_on"]):
+                return task
+        return None
+
+    @staticmethod
+    def is_complete(task_graph: list[dict]) -> bool:
+        """Return True when every task in the graph has status 'done'."""
+        return all(t["status"] == "done" for t in task_graph)
+
+    @staticmethod
+    def has_failure(task_graph: list[dict]) -> bool:
+        """Return True when any task has status 'failed' and exhausted its dynamic retries."""
+        return any(
+            t["status"] == "failed" and t["retry_count"] >= t.get("max_retries", 2)
+            for t in task_graph
+        )
+
+    @staticmethod
+    async def extract_context(task_id: str, messages: list, llm: ChatOpenAI) -> dict:
+        """Generate a concise handoff summary of what was accomplished in this task."""
+        try:
+            # We only care about what the agent actually did/said
+            agent_msgs = [m.content for m in messages if isinstance(m, AIMessage) and m.content]
+            if not agent_msgs:
+                return {}
+                
+            prompt = (
+                f"You are summarizing the completion of task '{task_id}'.\n"
+                "Based on the agent's messages, write a very concise summary (1-3 sentences) of what was accomplished "
+                "or discovered. This will be passed to the next task as context. Focus only on facts, models created, "
+                "or files written. Do not include conversational filler."
+            )
+            
+            res = await llm.ainvoke([
+                SystemMessage(content=prompt),
+                HumanMessage(content="\n---\n".join(agent_msgs[-5:])) # last few messages
+            ])
+            return {"handoff_summary": str(res.content)}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def format_progress(task_graph: list[dict]) -> str:
+        """Human-readable progress summary for emit_thinking."""
+        done = sum(1 for t in task_graph if t["status"] == "done")
+        total = len(task_graph)
+        return f"Task {done}/{total} complete"
+
+
 async def connect_odoo(url: str, db: str, username: str, password: str) -> OdooClient:
     return await asyncio.wait_for(
         asyncio.to_thread(OdooClient, url, db, username, password),
@@ -838,3 +1184,4 @@ async def connect_odoo(url: str, db: str, username: str, password: str) -> OdooC
 
 async def connect_odoo_json2(url: str, db: str, api_key: str) -> OdooJSON2Client:
     return await asyncio.wait_for(asyncio.to_thread(OdooJSON2Client, url, db, api_key), timeout=10)
+

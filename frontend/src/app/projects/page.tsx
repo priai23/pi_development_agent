@@ -31,10 +31,16 @@ export default function ProjectsPage() {
     void load();
   }, [load]);
 
+  const isDuplicateName = name.trim() !== "" && projects.some(
+    (p) => p.organization_id === organizationId && p.name.trim().toLowerCase() === name.trim().toLowerCase()
+  );
+
   const createProject = async (event: FormEvent) => {
-    event.preventDefault(); setError("");
+    event.preventDefault();
+    if (isDuplicateName) return;
+    setError("");
     try {
-      await apiFetch<Project>("/projects", { method: "POST", body: JSON.stringify({ name, organization_id: organizationId }) });
+      await apiFetch<Project>("/projects", { method: "POST", body: JSON.stringify({ name: name.trim(), organization_id: organizationId }) });
       setName(""); await load();
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not create project"); }
   };
@@ -63,11 +69,18 @@ export default function ProjectsPage() {
         </form>
       )}
       {organizations.length > 0 && (
-        <form onSubmit={createProject} className="mb-8 grid max-w-2xl grid-cols-[1fr_220px_auto] gap-2 rounded-xl border p-4 dark:border-white/10">
-          <input required value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" className="rounded-lg border px-3 py-2 dark:border-white/10 dark:bg-black" />
-          <select value={organizationId} onChange={(event) => setOrganizationId(Number(event.target.value))} className="rounded-lg border px-3 py-2 dark:border-white/10 dark:bg-black">{organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select>
-          <button className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 text-white"><Plus className="h-4 w-4" /> Create</button>
-        </form>
+        <div className="mb-8 max-w-2xl space-y-2">
+          <form onSubmit={createProject} className="grid grid-cols-[1fr_220px_auto] gap-2 rounded-xl border p-4 dark:border-white/10">
+            <input required value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" className={`rounded-lg border px-3 py-2 dark:border-white/10 dark:bg-black ${isDuplicateName ? "border-amber-500 focus:ring-amber-500" : ""}`} />
+            <select value={organizationId} onChange={(event) => setOrganizationId(Number(event.target.value))} className="rounded-lg border px-3 py-2 dark:border-white/10 dark:bg-black">{organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select>
+            <button disabled={isDuplicateName || !name.trim()} className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 text-white font-medium disabled:opacity-40"><Plus className="h-4 w-4" /> Create</button>
+          </form>
+          {isDuplicateName && (
+            <p className="text-xs font-semibold text-amber-600 dark:text-amber-400 pl-1">
+              ⚠️ A project named &quot;{name.trim()}&quot; already exists in this organization.
+            </p>
+          )}
+        </div>
       )}
       {error && <p className="mb-4 text-sm text-red-600">{error}</p>}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">

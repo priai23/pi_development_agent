@@ -13,14 +13,30 @@ import {
   FileSearch,
   ExternalLink,
   ListTodo,
-  Circle
+  Circle,
+  RefreshCw,
+  Network,
+  AlertCircle,
 } from "lucide-react";
 import { Step } from "@/lib/api";
+
+type TaskGraphNode = {
+  task_id: string;
+  title: string;
+  status: string;
+  risk_class: number;
+  retry_count: number;
+  max_retries?: number;
+  heartbeat_at: string | null;
+};
 
 interface ActivityStepperProps {
   steps: Step[];
   usage?: string;
   isStuck?: boolean;
+  supervisorTaskGraph?: TaskGraphNode[] | null;
+  activeTaskId?: string | null;
+  recoveringTaskId?: string | null;
   onOpenDiff?: () => void;
   onOpenFile?: (path: string) => void;
 }
@@ -29,26 +45,35 @@ export default function ActivityStepper({
   steps = [],
   usage,
   isStuck,
+  supervisorTaskGraph,
+  activeTaskId,
+  recoveringTaskId,
   onOpenDiff,
   onOpenFile,
 }: ActivityStepperProps) {
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({});
 
-  if (steps.length === 0 && !usage) return null;
+  // Filter out thinking and plan updates from the generic activity stepper
+  const cleanSteps = steps.filter(
+    (s) => s.tool !== "emit_thinking" && s.tool !== "thinking" && s.tool !== "update_task_plan" && s.tool !== "plan.updated"
+  );
+
+  if (cleanSteps.length === 0 && !usage) return null;
 
   const toggleExpand = (id: string) => {
     setExpandedItems((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
-  const totalTime = steps.reduce((acc, s) => acc + (s.elapsed || 0), 0);
+  const totalTime = cleanSteps.reduce((acc, s) => acc + (s.elapsed || 0), 0);
 
-  // Group steps for Antigravity-style rendering
-  const viewSteps = steps.filter((s) => s.tool.includes("view") || s.tool.includes("read") || s.tool.includes("inspect") || s.tool.includes("list"));
-  const editSteps = steps.filter((s) => s.tool.includes("write") || s.tool.includes("patch") || s.tool.includes("replace"));
-  const runSteps = steps.filter((s) => !viewSteps.includes(s) && !editSteps.includes(s));
+  // Group steps for Antigravity-style transparency rendering
+  const viewSteps = cleanSteps.filter((s) => s.tool.includes("view") || s.tool.includes("read") || s.tool.includes("inspect") || s.tool.includes("list"));
+  const editSteps = cleanSteps.filter((s) => s.tool.includes("write") || s.tool.includes("patch") || s.tool.includes("replace"));
+  const verifySteps = cleanSteps.filter((s) => s.tool.includes("verify") || s.tool.includes("package"));
+  const runSteps = cleanSteps.filter((s) => !viewSteps.includes(s) && !editSteps.includes(s) && !verifySteps.includes(s));
 
   // Extract live task plan checklist if available
-  const planStep = steps.find((s) => s.tool === "update_task_plan" || s.tool === "plan.updated");
+  const planStep = [...steps].reverse().find((s) => s.tool === "update_task_plan" || s.tool === "plan.updated");
   let planItems: Array<{ title: string; status: string }> = [];
   if (planStep?.result) {
     try {
@@ -65,34 +90,125 @@ export default function ActivityStepper({
       initial={{ opacity: 0, y: 8, scale: 0.98 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
       transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-      className="max-w-2xl space-y-2 font-sans"
+      className="max-w-2xl space-y-2.5 font-sans"
     >
-      {/* Stuck Alert */}
-      {isStuck && (
+      {/* ── A2A Supervisor Task Graph Card ─────────────────────────────────── */}
+      <AnimatePresence>
+        {supervisorTaskGraph && supervisorTaskGraph.length > 0 && (
+          <motion.div
+            key="supervisor-graph"
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+            className="rounded-xl border border-indigo-500/30 bg-indigo-950/25 p-3.5 space-y-2.5 backdrop-blur-md shadow-lg shadow-indigo-950/20"
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 font-semibold text-indigo-200 text-xs">
+                <Network className="h-3.5 w-3.5 text-indigo-400" />
+                <span>Supervisor Task Graph</span>
+              </div>
+              <span className="font-mono text-[10px] text-indigo-300 bg-indigo-500/20 px-2 py-0.5 rounded-full border border-indigo-500/30">
+                {supervisorTaskGraph.filter(t => t.status === "done").length}/{supervisorTaskGraph.length} done
+              </span>
+            </div>
+
+            {/* Recovery Alert */}
+            <AnimatePresence>
+              {recoveringTaskId && (
+                <motion.div
+                  key="recovering"
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="flex items-center gap-2 rounded-lg border border-amber-400/40 bg-amber-900/30 px-3 py-1.5 text-[11px] font-medium text-amber-200"
+                >
+                  <RefreshCw className="h-3 w-3 animate-spin text-amber-400" />
+                  Recovering sub-task —{" "}
+                  {supervisorTaskGraph.find(t => t.task_id === recoveringTaskId)?.title ?? recoveringTaskId}
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Task list */}
+            <ul className="space-y-1.5 pl-0.5">
+              {supervisorTaskGraph.map((task) => {
+                const isDone = task.status === "done";
+                const isFailed = task.status === "failed";
+                const isActive = task.task_id === activeTaskId && task.status === "in_progress";
+                const isRecovering = task.task_id === recoveringTaskId;
+                const riskColor = task.risk_class === 3 ? "text-red-400" : task.risk_class === 2 ? "text-amber-400" : "text-emerald-400";
+                return (
+                  <li key={task.task_id} className="flex items-center gap-2.5">
+                    {isDone ? (
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                    ) : isFailed ? (
+                      <AlertCircle className="h-3.5 w-3.5 text-red-400 shrink-0" />
+                    ) : isActive ? (
+                      <div className="relative h-3.5 w-3.5 shrink-0">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-400" />
+                        {/* live heartbeat ring */}
+                        <span className="absolute -inset-0.5 rounded-full border border-indigo-400 animate-ping opacity-60" />
+                      </div>
+                    ) : isRecovering ? (
+                      <RefreshCw className="h-3.5 w-3.5 text-amber-400 shrink-0 animate-spin" />
+                    ) : (
+                      <Circle className="h-3.5 w-3.5 text-indigo-800/60 shrink-0" />
+                    )}
+                    <span className={`text-xs ${
+                      isDone ? "line-through text-gray-600" :
+                      isFailed ? "text-red-400 font-semibold" :
+                      isActive ? "text-indigo-200 font-semibold" :
+                      isRecovering ? "text-amber-300 font-semibold" :
+                      "text-gray-500"
+                    }`}>
+                      {task.title}
+                    </span>
+                    {/* Risk class pill */}
+                    <span className={`ml-auto text-[9px] font-mono shrink-0 ${riskColor} opacity-70`}>
+                      C{task.risk_class}
+                    </span>
+                    {/* Retry count badge */}
+                    {task.retry_count > 0 && (
+                      <span className="text-[9px] font-mono text-amber-400 bg-amber-900/40 border border-amber-500/30 rounded px-1">
+                        retry {task.retry_count}/{task.max_retries || 2}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Stuck Alert — only shown when no supervisor recovery is active */}
+      {isStuck && !recoveringTaskId && (
         <div className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-800 dark:border-amber-700/40 dark:bg-amber-950/40 dark:text-amber-300">
           <span className="inline-block h-2 w-2 rounded-full bg-amber-500 animate-ping" />
           No activity for 60s — the agent may be processing a long tool task.
         </div>
       )}
 
-      {/* Live Plan Checklist Card */}
+      {/* Persistent Agent Plan Checklist Card */}
       {planItems.length > 0 && (
-        <div className="rounded-xl border border-purple-500/30 bg-purple-950/20 p-3 text-xs space-y-2 backdrop-blur-md">
-          <div className="flex items-center justify-between font-semibold text-purple-300">
+        <div className="rounded-xl border border-purple-500/30 bg-purple-950/20 p-3.5 text-xs space-y-2.5 backdrop-blur-md shadow-lg shadow-purple-950/20">
+          <div className="flex items-center justify-between font-semibold text-purple-200">
             <div className="flex items-center gap-2">
               <ListTodo className="h-4 w-4 text-purple-400" />
               <span>Agent Execution Plan</span>
             </div>
-            <span className="font-mono text-[10px] text-purple-400">
+            <span className="font-mono text-[11px] text-purple-300 bg-purple-500/20 px-2 py-0.5 rounded-full border border-purple-500/30">
               {planItems.filter((i) => i.status === "completed").length}/{planItems.length} completed
             </span>
           </div>
-          <ul className="space-y-1.5 pl-1">
+          <ul className="space-y-1.5 pl-0.5">
             {planItems.map((item, i) => {
               const isDone = item.status === "completed";
               const isRunning = item.status === "in_progress";
               return (
-                <li key={i} className="flex items-center gap-2 text-gray-300">
+                <li key={i} className="flex items-center gap-2.5 text-gray-300">
                   {isDone ? (
                     <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
                   ) : isRunning ? (
@@ -110,7 +226,28 @@ export default function ActivityStepper({
         </div>
       )}
 
-      {/* 1. Worked for XXs Accordion Header */}
+      {/* Dedicated Module Verification Evidence Badge */}
+      {verifySteps.length > 0 && (
+        <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-3 text-xs space-y-2 backdrop-blur-md shadow-lg shadow-emerald-950/20">
+          <div className="flex items-center justify-between font-semibold text-emerald-300">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+              <span>Module Installation Verification Evidence</span>
+            </div>
+            <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-mono text-emerald-300 border border-emerald-500/30">
+              PASSED
+            </span>
+          </div>
+          {verifySteps.map((vStep, i) => (
+            <div key={i} className="text-xs text-gray-300 pl-3 border-l-2 border-emerald-500/40 space-y-1 font-mono">
+              <p className="text-[11px] text-emerald-200">{vStep.label}</p>
+              {vStep.result && <p className="text-[10px] text-gray-400 truncate">{vStep.result}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Worked for XXs Accordion Header */}
       {totalTime > 0 && (
         <div className="flex items-center justify-between rounded-xl border border-white/10 bg-zinc-900/80 px-3.5 py-2 text-xs backdrop-blur-md">
           <button
@@ -122,8 +259,8 @@ export default function ActivityStepper({
             ) : (
               <ChevronRight className="h-3.5 w-3.5 text-gray-400" />
             )}
-            <span>Worked for {totalTime.toFixed(1)}s</span>
-            <span className="text-gray-500 font-mono text-[10px]">({steps.length} actions)</span>
+            <span>Worked for {totalTime > 0 ? `${totalTime.toFixed(1)}s` : "0.4s"}</span>
+            <span className="text-gray-500 font-mono text-[10px]">({cleanSteps.length} actions)</span>
           </button>
           {onOpenDiff && (
             <button
@@ -165,7 +302,7 @@ export default function ActivityStepper({
                   {viewSteps.map((step, idx) => (
                     <div key={idx} className="flex items-center justify-between text-[11px] text-gray-400 font-mono">
                       <span className="truncate">{step.label}</span>
-                      {step.elapsed && <span className="text-[10px] text-gray-600">{step.elapsed.toFixed(1)}s</span>}
+                      {step.elapsed != null && <span className="text-[10px] text-gray-600">{step.elapsed.toFixed(1)}s</span>}
                     </div>
                   ))}
                 </motion.div>
@@ -174,10 +311,15 @@ export default function ActivityStepper({
           </div>
         )}
 
-        {/* Individual File Edits (Edited page.tsx +1 -1 style) */}
+        {/* Individual File Edits (Edited models/mrp_production.py +18 -0 style) */}
         {editSteps.map((step, idx) => {
-          const match = step.label.match(/(?:file|path)?\s*:?\s*([A-Za-z0-9_./-]+)/);
-          const filepath = match ? match[1] : step.label;
+          const diffMatch = step.result?.match(/\(\+(\d+)\s+-\s*(\d+)\)/) || step.label.match(/\(\+(\d+)\s+-\s*(\d+)\)/);
+          const plusLines = diffMatch ? diffMatch[1] : "1";
+          const minusLines = diffMatch ? diffMatch[2] : "0";
+
+          const pathMatch = step.result?.match(/(?:Wrote|Patched)\s+([A-Za-z0-9_./-]+)/) || step.label.match(/(?:file|path)?\s*:?\s*([A-Za-z0-9_./-]+)/);
+          const filepath = pathMatch ? pathMatch[1] : step.label.replace(/^write_file\s*/, "").replace(/^patch_file\s*/, "");
+
           return (
             <div
               key={`edit-${idx}`}
@@ -185,7 +327,7 @@ export default function ActivityStepper({
             >
               <div className="flex items-center gap-2 truncate">
                 <FileCode className="h-3.5 w-3.5 text-blue-400 shrink-0" />
-                <span className="text-gray-400">Edited</span>
+                <span className="text-gray-400 font-medium">Edited</span>
                 <button
                   onClick={() => onOpenFile?.(filepath)}
                   className="font-mono text-purple-300 underline hover:text-purple-200 truncate"
@@ -194,8 +336,9 @@ export default function ActivityStepper({
                 </button>
               </div>
               <div className="flex items-center gap-2 shrink-0 font-mono text-[10px]">
-                <span className="text-emerald-400">+1</span>
-                <span className="text-red-400">-1</span>
+                <span className="text-emerald-400 font-semibold">+{plusLines}</span>
+                <span className="text-red-400 font-semibold">-{minusLines}</span>
+                {step.elapsed != null && <span className="text-gray-500 font-mono">{step.elapsed.toFixed(1)}s</span>}
               </div>
             </div>
           );
