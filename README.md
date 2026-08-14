@@ -2,16 +2,73 @@
 
 An internal, human-approved Odoo 19 implementation agent. The application combines a FastAPI API, PostgreSQL persistence, a LangGraph agent, and a Next.js 16 frontend.
 
-## Security model
+## Architecture
 
-- Local Argon2-backed accounts with administrator and member roles
-- Organization-scoped projects and ERP connections
-- HttpOnly session cookies, CSRF protection, explicit CORS/trusted-host configuration
-- Fernet-encrypted ERP and OpenRouter credentials that are never returned by the API
-- PostgreSQL-backed agent checkpoints and durable, user-bound action approvals
-- Read-only tools run directly; every filesystem or supported ERP write requires explicit approval
-- Server-owned workspace paths with traversal, prefix-collision, symlink, and size checks
-- Audited requests, decisions, and execution results
+The system is designed with a strong separation of concerns, ensuring that the AI agent's actions are durable, isolated, and safely gated by human approval.
+
+```mermaid
+graph TD
+    User([User]) -->|Interacts| UI[Next.js Frontend]
+    UI -->|REST API| API[FastAPI Backend]
+    
+    subgraph Core System
+        API -->|State & Runs| DB[(PostgreSQL)]
+        API -->|Events| Outbox[Outbox Queue]
+        Worker[Background Worker] -.->|Claims Tasks| Outbox
+        Worker -->|Executes| Agent[LangGraph Agent]
+        Agent -->|State Checkpoints| DB
+    end
+    
+    subgraph External Boundaries
+        Agent -->|JSON-RPC / XML-RPC| Odoo[Odoo 19 Instances]
+        Agent -->|Read/Write| FS[Project Workspaces]
+    end
+```
+
+## Agent Workflow & Human Gating
+
+The agent uses a Supervisor-Worker pattern. Complex prompts are decomposed into a graph of subtasks. Each subtask is executed by the agent, and every meaningful action is routed through a strict permission protocol.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API
+    participant Worker
+    participant Agent
+    participant Odoo
+
+    User->>API: Prompt: "Build Manufacturing Tracker"
+    API->>Worker: Enqueue Run
+    Worker->>Agent: Decompose into Task Graph
+    
+    rect rgb(23, 32, 42)
+        Note over Worker,Agent: Task 1: Inspect Schema (Class 1)
+        Worker->>Agent: Execute Task
+        Agent->>Odoo: JSON-RPC (Read Only)
+        Odoo-->>Agent: Returns Model Schema
+    end
+    
+    rect rgb(38, 28, 28)
+        Note over Worker,Odoo: Task 2: Create Views (Class 2 - Risky)
+        Worker->>Agent: Execute Task
+        Agent->>API: Request File Write
+        API-->>User: Requires Human Approval
+        User->>API: Approve
+        API->>Worker: Resume Action
+        Worker->>Agent: Write File
+    end
+```
+
+## Security Model
+
+- **Authentication:** Local Argon2-backed accounts with administrator and member roles.
+- **Isolation:** Organization-scoped projects and ERP connections.
+- **Web Security:** HttpOnly session cookies, CSRF protection, explicit CORS/trusted-host configuration.
+- **Encryption:** Fernet-encrypted ERP and OpenRouter credentials that are never returned by the API.
+- **Persistence:** PostgreSQL-backed agent checkpoints and durable, user-bound action approvals.
+- **Risk Classes:** Read-only tools run directly; every filesystem or supported ERP write requires explicit approval.
+- **Workspace Gating:** Server-owned workspace paths with traversal, prefix-collision, symlink, and size checks.
+- **Auditing:** Fully audited requests, decisions, and execution results.
 
 The model never receives raw ORM methods, domains, SQL, shell commands, filesystem paths, or Git commands. It can inspect allowlisted metadata, create approved master data and draft transactions, and prepare module source. Installation and upgrades occur only through validated artifacts and the separate deployment runner.
 
@@ -22,7 +79,7 @@ The model never receives raw ORM methods, domains, SQL, shell commands, filesyst
 - PostgreSQL
 - An Odoo 19 instance whose hostname is explicitly allowed
 
-## Backend setup
+## Backend Setup
 
 ```bash
 cd backend
@@ -36,7 +93,7 @@ Generate `ENCRYPTION_KEY` once with `python -c "from cryptography.fernet import 
 
 Set `ERP_ALLOWED_HOSTS` to exact approved hostnames or explicit suffixes such as `.internal.example`. Production deployments must use HTTPS, set `SECURE_COOKIES=true`, and set exact frontend and trusted-host values.
 
-Migrations after the hardened baseline are incremental and preserve application data:
+Migrate the database and create the initial administrator:
 
 ```bash
 alembic upgrade head
@@ -53,7 +110,7 @@ venv/bin/python worker.py
 
 Agent use is disabled until an administrator configures an OpenRouter key, selects a catalogue-validated model, and sets an organization monthly budget.
 
-## Frontend setup
+## Frontend Setup
 
 ```bash
 cd frontend
@@ -63,7 +120,7 @@ npm run dev
 
 Set `NEXT_PUBLIC_API_URL` when the API is not at `http://localhost:8001`.
 
-## Quality gates
+## Quality Gates
 
 ```bash
 cd backend && pytest && python -m compileall -q .
@@ -72,7 +129,7 @@ cd frontend && npm run lint && npm test && npx tsc --noEmit && npm run build
 
 After the first administrator signs in, create an organization, add projects, configure the OpenRouter model/key under Settings, and connect approved Odoo instances. Existing prototype credentials must be re-entered.
 
-## Deployment targets
+## Deployment Targets
 
 ### On-premise Odoo 19
 
@@ -90,7 +147,7 @@ Configure an administrator-approved `ssh://` or HTTPS repository URL, staging br
 
 Odoo Online custom Python deployment is intentionally unsupported.
 
-## Recovery and operations
+## Recovery and Operations
 
 - The worker runs a recovery sweep on startup. Expired approvals are rejected into their waiting checkpoint; stale runs become retryable interruptions; unclaimed outbox work is returned to the queue.
 - Run history includes typed tool/message/approval/usage events and support IDs. Administrators can search audit events, export safe CSV, inspect queue health, and revoke sessions.
