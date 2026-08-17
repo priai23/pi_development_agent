@@ -23,11 +23,13 @@ import {
   Globe,
 } from "lucide-react";
 
+import { WorkspacePhase } from "@/lib/run-state";
+
 interface AgentStatusProps {
-  currentAction: string | null;
-  isThinking: boolean;
-  tokenInputs?: number; // latest input token count for context bar
-  isStuck?: boolean;   // heartbeat timeout — no events for 30s
+  currentAction?: string | null;
+  isThinking?: boolean;
+  phase?: WorkspacePhase;
+  tokenInputs?: number;
 }
 
 const actionConfig: Record<string, { label: string; icon: LucideIcon }> = {
@@ -61,14 +63,17 @@ const actionConfig: Record<string, { label: string; icon: LucideIcon }> = {
   manage_task: { label: "Managing background tasks", icon: Cpu },
 };
 
-// gpt-4o-mini context window
-const CONTEXT_LIMIT = 128_000;
-
-export default function AgentStatus({ currentAction, isThinking, tokenInputs = 0, isStuck = false }: AgentStatusProps) {
+export default function AgentStatus({ currentAction, isThinking, phase, tokenInputs = 0 }: AgentStatusProps) {
   const [elapsed, setElapsed] = useState(0);
 
+  const isActive = Boolean(
+    currentAction ||
+    isThinking ||
+    (phase && ["queued", "connecting", "retrying", "recovering", "cancelling"].includes(phase))
+  );
+
   useEffect(() => {
-    if (!currentAction && !isThinking) return;
+    if (!isActive) return;
     const start = Date.now();
     const interval = setInterval(() => {
       setElapsed(Math.floor((Date.now() - start) / 100) / 10);
@@ -77,14 +82,29 @@ export default function AgentStatus({ currentAction, isThinking, tokenInputs = 0
       clearInterval(interval);
       setElapsed(0);
     };
-  }, [currentAction, isThinking]);
+  }, [isActive]);
 
-  if (!currentAction && !isThinking) return null;
+  if (!isActive) return null;
 
   let label = "Thinking & planning";
   let Icon: LucideIcon = Sparkles;
 
-  if (currentAction) {
+  if (phase === "queued") {
+    label = "Waiting for worker";
+    Icon = Loader2;
+  } else if (phase === "connecting") {
+    label = "Connecting to stream";
+    Icon = Loader2;
+  } else if (phase === "retrying") {
+    label = "Reconnecting to stream";
+    Icon = Loader2;
+  } else if (phase === "recovering") {
+    label = "Recovering stale task";
+    Icon = Loader2;
+  } else if (phase === "cancelling") {
+    label = "Cancelling run";
+    Icon = Loader2;
+  } else if (currentAction) {
     const config = actionConfig[currentAction];
     if (config) {
       label = config.label;
@@ -93,18 +113,6 @@ export default function AgentStatus({ currentAction, isThinking, tokenInputs = 0
       label = `Running ${currentAction.replace(/_/g, " ")}`;
       Icon = Cpu;
     }
-  }
-
-  const tokenPct = tokenInputs > 0 ? Math.min((tokenInputs / CONTEXT_LIMIT) * 100, 100) : 0;
-  const tokenColor = tokenPct > 90 ? "bg-red-500" : tokenPct > 70 ? "bg-amber-400" : "bg-blue-500";
-
-  if (isStuck) {
-    return (
-      <div className="inline-flex items-center gap-2 rounded-full border border-amber-400/50 bg-amber-50 px-3.5 py-1.5 text-xs font-medium text-amber-700 dark:border-amber-600/30 dark:bg-amber-950/40 dark:text-amber-300">
-        <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
-        No activity for 60s — agent may be stuck
-      </div>
-    );
   }
 
   return (
@@ -188,21 +196,9 @@ export default function AgentStatus({ currentAction, isThinking, tokenInputs = 0
       )}
     </motion.div>
 
-    {/* Token context bar */}
+    {/* Exact usage only; context limits vary by configured model. */}
     {tokenInputs > 0 && (
-      <div className="flex items-center gap-1.5">
-        <div className="h-1.5 w-24 overflow-hidden rounded-full bg-gray-200 dark:bg-white/10">
-          <motion.div
-            className={`h-full rounded-full ${tokenColor}`}
-            initial={{ width: 0 }}
-            animate={{ width: `${tokenPct}%` }}
-            transition={{ duration: 0.4 }}
-          />
-        </div>
-        <span className="font-mono text-[10px] text-gray-500 dark:text-gray-400">
-          {(tokenInputs / 1000).toFixed(0)}k / 128k ctx
-        </span>
-      </div>
+      <span className="font-mono text-[10px] text-gray-500 dark:text-gray-400">{tokenInputs.toLocaleString()} input tokens</span>
     )}
     </div>
   );

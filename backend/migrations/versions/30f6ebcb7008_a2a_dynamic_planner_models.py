@@ -15,8 +15,11 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column('agent_runs', sa.Column('planner_model', sa.String(length=64), nullable=True))
-    op.add_column('agent_runs', sa.Column('fallback_model', sa.String(length=64), nullable=True))
+    columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("agent_runs")}
+    if "planner_model" not in columns:
+        op.add_column('agent_runs', sa.Column('planner_model', sa.String(length=64), nullable=True))
+    if "fallback_model" not in columns:
+        op.add_column('agent_runs', sa.Column('fallback_model', sa.String(length=64), nullable=True))
     # ### end Alembic commands ###
 
 

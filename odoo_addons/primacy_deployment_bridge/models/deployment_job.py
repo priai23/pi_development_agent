@@ -6,18 +6,23 @@ class DeploymentJob(models.Model):
     _description = "Primacy Deployment Job"
     _order = "create_date desc"
 
+    job_uuid = fields.Char(required=True, index=True, copy=False)
+    operation = fields.Selection([('install', 'Install'), ('upgrade', 'Upgrade')], required=True)
     module_name = fields.Char(required=True)
+    module_version = fields.Char(required=True)
     artifact_url = fields.Char(required=True)
-    signature_base64 = fields.Char(required=True)
-    digest = fields.Char(required=True)
+    artifact_digest = fields.Char(required=True)
     nonce = fields.Char(required=True)
-    expiry = fields.Float(required=True)
-    
+    expires_at = fields.Datetime(required=True)
+    signature = fields.Char(required=True)
+    runner_id = fields.Char()
+
     status = fields.Selection([
-        ('pending', 'Pending'),
+        ('queued', 'Queued'),
         ('running', 'Running'),
-        ('success', 'Success'),
-        ('failed', 'Failed')
-    ], default='pending', required=True)
+        ('succeeded', 'Succeeded'),
+        ('failed', 'Failed'),
+        ('rolled_back', 'Rolled back'),
+    ], default='queued', required=True)
     
     logs = fields.Text()

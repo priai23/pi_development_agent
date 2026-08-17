@@ -28,28 +28,29 @@ type TaskGraphNode = {
   retry_count: number;
   max_retries?: number;
   heartbeat_at: string | null;
+  result?: { outcome: string; done: string[]; verification: string; errors: string } | null;
 };
 
 interface ActivityStepperProps {
   steps: Step[];
   usage?: string;
-  isStuck?: boolean;
   supervisorTaskGraph?: TaskGraphNode[] | null;
   activeTaskId?: string | null;
   recoveringTaskId?: string | null;
   onOpenDiff?: () => void;
   onOpenFile?: (path: string) => void;
+  planItems?: Array<{ title: string; status: string }>;
 }
 
 export default function ActivityStepper({
   steps = [],
   usage,
-  isStuck,
   supervisorTaskGraph,
   activeTaskId,
   recoveringTaskId,
   onOpenDiff,
   onOpenFile,
+  planItems: durablePlanItems = [],
 }: ActivityStepperProps) {
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({});
 
@@ -58,7 +59,7 @@ export default function ActivityStepper({
     (s) => s.tool !== "emit_thinking" && s.tool !== "thinking" && s.tool !== "update_task_plan" && s.tool !== "plan.updated"
   );
 
-  if (cleanSteps.length === 0 && !usage) return null;
+  if (cleanSteps.length === 0 && !usage && !supervisorTaskGraph?.length && !durablePlanItems.length) return null;
 
   const toggleExpand = (id: string) => {
     setExpandedItems((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -67,14 +68,17 @@ export default function ActivityStepper({
   const totalTime = cleanSteps.reduce((acc, s) => acc + (s.elapsed || 0), 0);
 
   // Group steps for Antigravity-style transparency rendering
-  const viewSteps = cleanSteps.filter((s) => s.tool.includes("view") || s.tool.includes("read") || s.tool.includes("inspect") || s.tool.includes("list"));
-  const editSteps = cleanSteps.filter((s) => s.tool.includes("write") || s.tool.includes("patch") || s.tool.includes("replace"));
-  const verifySteps = cleanSteps.filter((s) => s.tool.includes("verify") || s.tool.includes("package"));
+  const viewSteps = cleanSteps.filter((s) => s.category === "inspect" || (!s.category && (s.tool.includes("view") || s.tool.includes("read") || s.tool.includes("inspect") || s.tool.includes("list"))));
+  const editSteps = cleanSteps.filter((s) => s.category === "edit" || (!s.category && (s.tool.includes("write") || s.tool.includes("patch") || s.tool.includes("replace"))));
+  const verifySteps = cleanSteps.filter((s) => s.category === "verify" || (!s.category && s.tool.includes("verify")));
   const runSteps = cleanSteps.filter((s) => !viewSteps.includes(s) && !editSteps.includes(s) && !verifySteps.includes(s));
+  const verificationFailed = verifySteps.some((step) => step.status === "failed" || step.outcome === "failed");
+  const verificationRunning = verifySteps.some((step) => step.status === "running");
+  const verificationPassed = verifySteps.length > 0 && verifySteps.every((step) => step.status === "done" && step.outcome === "succeeded");
 
   // Extract live task plan checklist if available
   const planStep = [...steps].reverse().find((s) => s.tool === "update_task_plan" || s.tool === "plan.updated");
-  let planItems: Array<{ title: string; status: string }> = [];
+  let planItems: Array<{ title: string; status: string }> = durablePlanItems;
   if (planStep?.result) {
     try {
       const parsed = JSON.parse(planStep.result);
@@ -136,15 +140,19 @@ export default function ActivityStepper({
               {supervisorTaskGraph.map((task) => {
                 const isDone = task.status === "done";
                 const isFailed = task.status === "failed";
+                const isCancelled = task.status === "cancelled";
                 const isActive = task.task_id === activeTaskId && task.status === "in_progress";
                 const isRecovering = task.task_id === recoveringTaskId;
                 const riskColor = task.risk_class === 3 ? "text-red-400" : task.risk_class === 2 ? "text-amber-400" : "text-emerald-400";
                 return (
-                  <li key={task.task_id} className="flex items-center gap-2.5">
+                  <li key={task.task_id} className="space-y-1">
+                    <div className="flex items-center gap-2.5">
                     {isDone ? (
                       <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
                     ) : isFailed ? (
                       <AlertCircle className="h-3.5 w-3.5 text-red-400 shrink-0" />
+                    ) : isCancelled ? (
+                      <XCircle className="h-3.5 w-3.5 text-gray-500 shrink-0" />
                     ) : isActive ? (
                       <div className="relative h-3.5 w-3.5 shrink-0">
                         <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-400" />
@@ -159,6 +167,7 @@ export default function ActivityStepper({
                     <span className={`text-xs ${
                       isDone ? "line-through text-gray-600" :
                       isFailed ? "text-red-400 font-semibold" :
+                      isCancelled ? "text-gray-500 line-through" :
                       isActive ? "text-indigo-200 font-semibold" :
                       isRecovering ? "text-amber-300 font-semibold" :
                       "text-gray-500"
@@ -175,6 +184,14 @@ export default function ActivityStepper({
                         retry {task.retry_count}/{task.max_retries || 2}
                       </span>
                     )}
+                    </div>
+                    {task.result && (
+                      <div className={`ml-6 rounded border px-2 py-1.5 text-[10px] ${task.result.outcome === "SUCCESS" ? "border-emerald-500/20 bg-emerald-950/20 text-emerald-200" : "border-red-500/20 bg-red-950/20 text-red-200"}`}>
+                        <div className="font-semibold">Task report · {task.result.outcome}</div>
+                        {task.result.verification && <div className="mt-1 text-gray-400">{task.result.verification}</div>}
+                        {task.result.errors && <div className="mt-1 whitespace-pre-wrap text-red-300">{task.result.errors}</div>}
+                      </div>
+                    )}
                   </li>
                 );
               })}
@@ -182,14 +199,6 @@ export default function ActivityStepper({
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* Stuck Alert — only shown when no supervisor recovery is active */}
-      {isStuck && !recoveringTaskId && (
-        <div className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-800 dark:border-amber-700/40 dark:bg-amber-950/40 dark:text-amber-300">
-          <span className="inline-block h-2 w-2 rounded-full bg-amber-500 animate-ping" />
-          No activity for 60s — the agent may be processing a long tool task.
-        </div>
-      )}
 
       {/* Persistent Agent Plan Checklist Card */}
       {planItems.length > 0 && (
@@ -228,19 +237,29 @@ export default function ActivityStepper({
 
       {/* Dedicated Module Verification Evidence Badge */}
       {verifySteps.length > 0 && (
-        <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-3 text-xs space-y-2 backdrop-blur-md shadow-lg shadow-emerald-950/20">
-          <div className="flex items-center justify-between font-semibold text-emerald-300">
+        <div className={`rounded-xl border p-3 text-xs space-y-2 backdrop-blur-md ${
+          verificationFailed ? "border-red-500/30 bg-red-950/20" :
+          verificationRunning ? "border-blue-500/30 bg-blue-950/20" :
+          verificationPassed ? "border-emerald-500/30 bg-emerald-950/20" :
+          "border-gray-500/30 bg-zinc-950/40"
+        }`}>
+          <div className={`flex items-center justify-between font-semibold ${verificationFailed ? "text-red-300" : verificationRunning ? "text-blue-300" : verificationPassed ? "text-emerald-300" : "text-gray-300"}`}>
             <div className="flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4 text-emerald-400" />
-              <span>Module Installation Verification Evidence</span>
+              {verificationFailed ? <XCircle className="h-4 w-4" /> : verificationRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : verificationPassed ? <CheckCircle2 className="h-4 w-4" /> : <Circle className="h-4 w-4" />}
+              <span>Verification Evidence</span>
             </div>
-            <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-mono text-emerald-300 border border-emerald-500/30">
-              PASSED
+            <span className={`rounded-full px-2 py-0.5 text-[10px] font-mono border ${
+              verificationFailed ? "border-red-500/30 bg-red-500/20 text-red-300" :
+              verificationRunning ? "border-blue-500/30 bg-blue-500/20 text-blue-300" :
+              verificationPassed ? "border-emerald-500/30 bg-emerald-500/20 text-emerald-300" :
+              "border-gray-500/30 bg-gray-500/20 text-gray-300"
+            }`}>
+              {verificationFailed ? "FAILED" : verificationRunning ? "RUNNING" : verificationPassed ? "PASSED" : "RESULT"}
             </span>
           </div>
           {verifySteps.map((vStep, i) => (
-            <div key={i} className="text-xs text-gray-300 pl-3 border-l-2 border-emerald-500/40 space-y-1 font-mono">
-              <p className="text-[11px] text-emerald-200">{vStep.label}</p>
+            <div key={i} className={`text-xs text-gray-300 pl-3 border-l-2 space-y-1 font-mono ${vStep.outcome === "failed" || vStep.status === "failed" ? "border-red-500/40" : vStep.status === "running" ? "border-blue-500/40" : vStep.outcome === "succeeded" ? "border-emerald-500/40" : "border-gray-500/40"}`}>
+              <p className="text-[11px] text-gray-200">{vStep.label}</p>
               {vStep.result && <p className="text-[10px] text-gray-400 truncate">{vStep.result}</p>}
             </div>
           ))}

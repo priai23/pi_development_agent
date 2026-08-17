@@ -7,6 +7,11 @@ from sqlalchemy.orm import relationship
 from database import Base
 
 
+# ---------------------------------------------------------------------------
+# Pipeline foundation models (Phase 1)
+# ---------------------------------------------------------------------------
+
+
 def utcnow():
     return datetime.now(timezone.utc)
 
@@ -193,7 +198,8 @@ class AgentRun(Base):
             "uq_agent_run_active_project",
             "project_id",
             unique=True,
-            postgresql_where=text("status IN ('running','awaiting_approval','cancelling')"),
+            postgresql_where=text("status IN ('running','awaiting_question','awaiting_approval','cancelling')"),
+            sqlite_where=text("status IN ('running','awaiting_question','awaiting_approval','cancelling')"),
         ),
     )
 
@@ -224,6 +230,32 @@ class AgentRun(Base):
     task_retries = Column(JSON, nullable=True)            # {task_id: retry_count}
     planner_model = Column(String(64), nullable=True)     # model to use for planning
     fallback_model = Column(String(64), nullable=True)    # fallback model
+    workspace_base_revision = Column(String(40), nullable=True)
+    # Pipeline grounding (Phase 1)
+    source_snapshot_id = Column(String(36), ForeignKey("source_snapshots.id", ondelete="SET NULL"), nullable=True)
+    specification_id = Column(Integer, ForeignKey("run_specifications.id", ondelete="SET NULL"), nullable=True)
+    stage = Column(String(32), nullable=False, default="queued")  # queued|grounding|indexing|planning|implementing|validating|staging|done
+    last_progress_at = Column(DateTime(timezone=True), nullable=True)
+    current_operation = Column(String(128), nullable=True)        # human-readable current op description
+    operation_deadline_at = Column(DateTime(timezone=True), nullable=True)
+    question = relationship("AgentQuestion", back_populates="run", uselist=False, cascade="all, delete-orphan")
+
+
+class AgentQuestion(Base):
+    __tablename__ = "agent_questions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    question = Column(Text, nullable=False)
+    options = Column(JSON, nullable=False, default=list)
+    answer = Column(Text, nullable=True)
+    status = Column(String(24), nullable=False, default="pending", index=True)
+    requested_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    answered_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    run = relationship("AgentRun", back_populates="question")
 
 
 class ToolEvent(Base):
@@ -331,6 +363,10 @@ class Artifact(Base):
     status = Column(String(24), nullable=False, default="draft")
     created_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    # Build traceability (Phase 1)
+    spec_digest = Column(String(64), nullable=True)              # SHA-256 of RunSpecification at build time
+    source_snapshot_digest = Column(String(64), nullable=True)   # fingerprint of the SourceSnapshot used
+    build_fingerprint = Column(JSON, nullable=True)              # {odoo_version, edition, depends, files}
 
 
 class ValidationRun(Base):
@@ -381,13 +417,124 @@ class AgentMemory(Base):
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
-    category = Column(String(32), nullable=False, index=True)  # e.g., 'schema_insight', 'odoo_gotcha', 'user_preference', 'module_pattern'
+    category = Column(String(32), nullable=False, index=True)  # e.g., 'user_preference', 'verified_fact'; legacy: 'schema_insight', 'odoo_gotcha', 'module_pattern'
     key = Column(String(128), nullable=False, index=True)
     content = Column(Text, nullable=False)
     confidence = Column(Float, nullable=False, default=1.0)
     usage_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+    # Evidence backing (Phase 1 / Phase 14)
+    evidence_type = Column(String(32), nullable=True)        # 'acceptance_check' | 'source_symbol' | 'user_event'
+    evidence_ref_id = Column(String(64), nullable=True)      # ID of the backing AcceptanceCheck or SourceSymbol
+    snapshot_scope_id = Column(String(36), nullable=True)    # SourceSnapshot.id this fact is scoped to
+    verified_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)  # None = never expires
 
     project = relationship("Project", back_populates="memories")
 
+
+# ---------------------------------------------------------------------------
+# New pipeline tables
+# ---------------------------------------------------------------------------
+
+
+class SourceSnapshot(Base):
+    """Immutable point-in-time fingerprint of the connected Odoo environment."""
+    __tablename__ = "source_snapshots"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    instance_id = Column(Integer, ForeignKey("instances.id", ondelete="CASCADE"), nullable=False, index=True)
+    odoo_version = Column(String(16), nullable=False)        # e.g. '19.0'
+    odoo_edition = Column(String(16), nullable=False)        # 'community' | 'enterprise'
+    db_uuid = Column(String(64), nullable=True)              # Odoo ir.config_parameter database.uuid
+    server_serial = Column(String(64), nullable=True)        # Odoo server serial / git hash
+    installed_modules = Column(JSON, nullable=False, default=dict)   # {module_name: version}
+    addon_digests = Column(JSON, nullable=False, default=dict)       # {module_name: sha256}
+    fingerprint = Column(String(64), nullable=False, index=True)     # SHA-256 of the above for fast equality
+    runner_identity = Column(String(128), nullable=True)     # public key thumbprint of runner that built this
+    status = Column(String(24), nullable=False, default="pending_index")  # pending_index|indexing|indexed|failed
+    symbol_count = Column(Integer, nullable=False, default=0)
+    index_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    indexed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class SourceSymbol(Base):
+    """A parsed symbol from an indexed SourceSnapshot — read-only, never modified after insert."""
+    __tablename__ = "source_symbols"
+    __table_args__ = (
+        Index("ix_source_symbols_snapshot_kind", "snapshot_id", "kind"),
+        Index("ix_source_symbols_module_model", "module", "model"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    snapshot_id = Column(String(36), ForeignKey("source_snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
+    module = Column(String(128), nullable=False, index=True)
+    model = Column(String(128), nullable=True, index=True)       # None for non-model symbols
+    kind = Column(String(32), nullable=False, index=True)        # model|field|method|view|action|rule|acl|cron|js_component|manifest
+    name = Column(String(256), nullable=False, index=True)
+    path = Column(String(512), nullable=True)                    # relative path within addon
+    line_start = Column(Integer, nullable=True)
+    line_end = Column(Integer, nullable=True)
+    digest = Column(String(64), nullable=True)                   # SHA-256 of the symbol source excerpt
+    payload = Column(JSON, nullable=False, default=dict)         # kind-specific structured data
+
+
+class RunSpecification(Base):
+    """Immutable structured specification derived from the user prompt before any code generation."""
+    __tablename__ = "run_specifications"
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    snapshot_id = Column(String(36), ForeignKey("source_snapshots.id", ondelete="SET NULL"), nullable=True)
+    requirements = Column(JSON, nullable=False, default=list)    # list[{id, title, targets, check_ids}]
+    changes = Column(JSON, nullable=False, default=list)         # list[{kind, model, field/view/rule, description}]
+    acceptance_check_ids = Column(JSON, nullable=False, default=list)  # [AcceptanceCheck.id, ...]
+    digest = Column(String(64), nullable=False)                  # SHA-256 of canonical JSON
+    status = Column(String(24), nullable=False, default="draft")  # draft|approved|superseded
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class AcceptanceCheck(Base):
+    """A single verification gate that must pass before task success is declared."""
+    __tablename__ = "acceptance_checks"
+    __table_args__ = (
+        Index("ix_acceptance_checks_run_kind", "run_id", "kind"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_id = Column(String(64), nullable=True)                  # which task owns this check
+    kind = Column(String(32), nullable=False)                    # source_reuse|module_install|module_upgrade|
+                                                                 # artifact_digest|model_field|xml_id|view_load|
+                                                                 # acl|record_rule|python_test|business_scenario
+    spec_target = Column(JSON, nullable=False, default=dict)     # kind-specific expectation (model, field, xml_id, etc.)
+    required = Column(Boolean, nullable=False, default=True)
+    status = Column(String(16), nullable=False, default="pending")  # pending|running|passed|failed|skipped
+    evidence = Column(JSON, nullable=False, default=list)         # [{kind, ref, digest, summary}]
+    result_detail = Column(Text, nullable=True)                  # failure reason or pass note
+    evaluated_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class ToolExecution(Base):
+    """Exactly-once receipt for every side-effecting tool call."""
+    __tablename__ = "tool_executions"
+
+    operation_id = Column(String(64), primary_key=True)          # SHA-256(run_id + task_id + tool_call_id)
+    run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_id = Column(String(64), nullable=True)
+    tool_call_id = Column(String(128), nullable=False)
+    tool_name = Column(String(128), nullable=False)
+    args_digest = Column(String(64), nullable=False)             # SHA-256 of canonicalised args JSON
+    status = Column(String(16), nullable=False, default="preparing")  # preparing|executing|succeeded|failed
+    structured_result = Column(JSON, nullable=True)              # stored ToolResult for idempotent replay
+    retryable = Column(Boolean, nullable=False, default=False)
+    error_code = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)

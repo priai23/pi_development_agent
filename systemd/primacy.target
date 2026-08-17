@@ -1,0 +1,6 @@
+[Unit]
+Description=Primacy ERP Implementation Agent Stack
+Wants=primacy-api.service primacy-worker.service
+
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,7 @@ dependencies = [
   "cryptography>=50,<51",
   "email-validator>=2.3,<3",
   "fastapi>=0.141,<1",
+  "graphifyy>=0.9,<1",
   "httpx>=0.28,<1",
   "langchain-openai>=1.4,<2",
   "langgraph>=1.2,<2",
@@ -26,7 +27,7 @@ dependencies = [
 test = ["pytest>=9,<10"]
 
 [tool.setuptools]
-py-modules = ["agent", "auth", "config", "database", "main", "manage", "models", "schemas", "security", "validation", "worker", "workspace"]
+py-modules = ["agent", "auth", "config", "database", "deployment", "main", "manage", "models", "schemas", "security", "validation", "worker", "workspace"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

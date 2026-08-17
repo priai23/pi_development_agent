@@ -1,18 +1,29 @@
 import asyncio
 import json
+import threading
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.attributes import flag_modified
 
 import models
-from agent import ERPImplementationAgent, SupervisorPlanner, MAX_TASK_RETRIES, connect_odoo, connect_odoo_json2
+from agent import (
+    ERPImplementationAgent,
+    SupervisorPlanner,
+    MAX_TASK_RETRIES,
+    connect_odoo,
+    connect_odoo_json2,
+)
 from config import settings
 from database import SessionLocal
 from deployment import execute_deployment
 from security import decrypt_secret
+from source_indexer import index_addon_roots
+from workspace import Workspace
 
 # ─── Watchdog tunables ─────────────────────────────────────────────────────────
 SUBTASK_STALE_SECONDS = 90   # per sub-task heartbeat threshold
@@ -21,6 +32,35 @@ RUN_STALE_SECONDS = 300      # whole-run safety net (supervisor itself silent)
 
 class ProjectBusy(RuntimeError):
     pass
+
+
+def update_worker_lease() -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with SessionLocal() as db:
+        setting = db.get(models.Setting, "worker_last_seen_at")
+        if not setting:
+            db.add(models.Setting(key="worker_last_seen_at", value=now))
+        else:
+            setting.value = now
+        db.commit()
+
+
+def start_worker_lease_thread(shutdown_event: threading.Event | None = None) -> threading.Thread:
+    def _run():
+        while shutdown_event is None or not shutdown_event.is_set():
+            try:
+                update_worker_lease()
+            except Exception:
+                pass
+            if shutdown_event:
+                if shutdown_event.wait(5):
+                    break
+            else:
+                time.sleep(5)
+
+    thread = threading.Thread(target=_run, daemon=True, name="worker_lease_heartbeat")
+    thread.start()
+    return thread
 
 
 def emit(db, run_id: str, event_type: str, payload: dict) -> None:
@@ -35,32 +75,71 @@ def enqueue(db, event_type: str, aggregate_id: str, payload: dict | None = None)
     db.add(models.OutboxEvent(event_type=event_type, aggregate_id=aggregate_id, payload=payload or {}))
 
 
-def _update_subtask_heartbeat(db, run: models.AgentRun, task_id: str) -> None:
+def _replace_task(run: models.AgentRun, task_id: str, **changes) -> list[dict]:
+    """Return and persist an immutable task-graph update."""
+    graph = [
+        {**task, **changes} if task.get("task_id") == task_id else {**task}
+        for task in (run.task_graph or [])
+    ]
+    run.task_graph = graph
+    flag_modified(run, "task_graph")
+    return graph
+
+
+def _transition_emitted(db, run_id: str, event_type: str, task_id: str) -> bool:
+    events = db.query(models.ToolEvent.payload).filter(
+        models.ToolEvent.run_id == run_id,
+        models.ToolEvent.event_type == event_type,
+    ).all()
+    return any((payload or {}).get("task_id") == task_id for (payload,) in events)
+
+
+def _emit_task_transition(db, run: models.AgentRun, event_type: str, task_id: str, payload: dict) -> None:
+    if not _transition_emitted(db, run.id, event_type, task_id):
+        emit(db, run.id, event_type, {"task_id": task_id, **payload})
+
+
+def _cancel_active_task(db, run: models.AgentRun) -> list[dict]:
+    task_id = run.active_task_id
+    graph = run.task_graph or []
+    if task_id:
+        graph = _replace_task(run, task_id, status="cancelled")
+        _emit_task_transition(db, run, "task.cancelled", task_id, {"task_graph": graph})
+    run.active_task_id = None
+    run.subtask_heartbeat_at = None
+    return graph
+
+
+def _scope_tool_event(db, run: models.AgentRun, event_type: str, payload: dict) -> dict:
+    if not event_type.startswith("tool.") or not run.active_task_id:
+        return payload
+    scoped = {**payload, "task_id": run.active_task_id}
+    if event_type == "tool.started":
+        prior = db.query(models.ToolEvent.payload).filter(
+            models.ToolEvent.run_id == run.id,
+            models.ToolEvent.event_type == "tool.started",
+        ).all()
+        iterations = sum((value or {}).get("task_id") == run.active_task_id for (value,) in prior)
+        if iterations >= 40:
+            raise RuntimeError("TaskExecutionLimitExceeded: current task exceeded 40 tool iterations")
+    return scoped
+
+
+def _update_subtask_heartbeat(db, run: models.AgentRun, task_id: str) -> list[dict]:
     """Bump both run-level and per-task heartbeat, and mirror into task_graph JSON."""
     now = datetime.now(timezone.utc)
     run.heartbeat_at = now
     run.subtask_heartbeat_at = now
     if run.active_task_id != task_id:
         run.active_task_id = task_id
-    if run.task_graph:
-        graph = run.task_graph
-        for task in graph:
-            if task["task_id"] == task_id:
-                task["heartbeat_at"] = now.isoformat()
-                break
-        run.task_graph = graph
+    return _replace_task(run, task_id, heartbeat_at=now.isoformat()) if run.task_graph else []
 
 
-def _apply_task_status(db, run: models.AgentRun, task_id: str, status: str) -> None:
+def _apply_task_status(db, run: models.AgentRun, task_id: str, status: str, **changes) -> list[dict]:
     """Update a task node's status in the persisted task_graph JSON."""
     if not run.task_graph:
-        return
-    graph = list(run.task_graph)
-    for task in graph:
-        if task["task_id"] == task_id:
-            task["status"] = status
-            break
-    run.task_graph = graph
+        return []
+    return _replace_task(run, task_id, status=status, **changes)
 
 
 # ─── Watchdog / recovery ───────────────────────────────────────────────────────
@@ -82,6 +161,18 @@ def recover_stale_work() -> None:
     run_cutoff = now - timedelta(seconds=RUN_STALE_SECONDS)
 
     with SessionLocal() as db:
+        expired_questions = db.query(models.AgentQuestion).filter(
+            models.AgentQuestion.status == "pending",
+            models.AgentQuestion.expires_at <= now,
+        ).all()
+        for question in expired_questions:
+            question.status = "expired"
+            run = db.get(models.AgentRun, question.run_id)
+            if run and run.status == "awaiting_question":
+                run.status = "expired"
+                run.finished_at = now
+                emit(db, run.id, "run.expired", {"question_id": question.id})
+
         # 1. Expire pending actions
         expired = db.query(models.PendingAction).filter(
             models.PendingAction.status == "pending",
@@ -137,6 +228,10 @@ def recover_stale_work() -> None:
                     "max_attempts": MAX_TASK_RETRIES,
                     "reason": f"Sub-task stalled (no heartbeat for {SUBTASK_STALE_SECONDS}s)",
                 })
+                emit(db, run.id, "run.queued", {
+                    "task_id": task_id,
+                    "support_id": run.support_id,
+                })
                 enqueue(db, "run.resume", run.id)
             else:
                 run.status = "failed"
@@ -150,9 +245,12 @@ def recover_stale_work() -> None:
                     "message": run.error_message,
                 })
                 emit(db, run.id, "run.failed", {
+                    "category": "SubTaskMaxRetriesExceeded",
                     "message": run.error_message,
                     "retryable": False,
                     "support_id": run.support_id,
+                    "task_id": task_id,
+                    "tool": None,
                 })
 
         # 4. Whole-run stale fallback
@@ -162,6 +260,7 @@ def recover_stale_work() -> None:
         ).all()
         for run in stale_runs:
             run.status = "queued"
+            emit(db, run.id, "run.queued", {"support_id": run.support_id})
             enqueue(db, "run.resume", run.id)
 
         # 5. Unclaim stale outbox events
@@ -213,11 +312,14 @@ async def build_agent(db, run: models.AgentRun, checkpointer):
     key = db.get(models.Setting, "openrouter_api_key")
     timeout = db.get(models.Setting, "llm_timeout_seconds")
     max_tokens = db.get(models.Setting, "llm_max_output_tokens")
+    fallback_model = run.fallback_model or (db.get(models.Setting, "llm_fallback_model_name").value if db.get(models.Setting, "llm_fallback_model_name") else "anthropic/claude-3.5-sonnet")
+    auto_writes_setting = db.get(models.Setting, "autonomous_workspace_writes")
+    auto_writes = bool(auto_writes_setting and auto_writes_setting.value and auto_writes_setting.value.lower() in ("true", "1", "yes"))
     return ERPImplementationAgent(
         client,
         project.workspace_slug,
         checkpointer,
-        model.value if model else "gpt-4o-mini",
+        run.planner_model or (model.value if model else "gpt-4o-mini"),
         decrypt_secret(key.value) if key else None,
         "https://openrouter.ai/api/v1" if key else None,
         int(timeout.value) if timeout else 120,
@@ -225,24 +327,64 @@ async def build_agent(db, run: models.AgentRun, checkpointer):
         project.id,
         run.requested_by_id,
         instance.id,
+        fallback_model,
+        autonomous_workspace_writes=auto_writes,
     )
 
 
+def process_source_index(run_id: str, snapshot_id: str) -> None:
+    """Index available addon roots and persist SourceSymbol rows for the snapshot."""
+    with SessionLocal() as db:
+        snapshot = db.get(models.SourceSnapshot, snapshot_id)
+        if not snapshot:
+            return
+        run = db.get(models.AgentRun, run_id)
+        if not run:
+            return
+        project = db.get(models.Project, run.project_id)
+        if not project:
+            return
+        try:
+            snapshot.status = "indexing"
+            db.commit()
+            ws = Workspace(project.workspace_slug)
+            roots = [ws.root]
+            symbol_count = index_addon_roots(roots, snapshot_id, db)
+            snapshot.status = "indexed"
+            snapshot.symbol_count = symbol_count
+            snapshot.indexed_at = datetime.now(timezone.utc)
+            db.commit()
+        except Exception as exc:
+            snapshot.status = "failed"
+            snapshot.index_error = str(exc)[:2000]
+            db.commit()
+
+
 async def _initialise_task_graph(db, run: models.AgentRun) -> list[dict]:
-    """Decompose prompt into task graph and persist — idempotent."""
+    """Decompose prompt into task graph and persist — requirement-driven if spec exists."""
     if run.task_graph:
         return run.task_graph
+
+    spec = db.query(models.RunSpecification).filter(models.RunSpecification.run_id == run.id).first()
+    if spec and spec.requirements:
+        graph = SupervisorPlanner.build_from_specification(spec.requirements)
+        run.task_graph = graph
+        run.task_retries = {}
+        db.flush()
+        return graph
 
     llm = None
     if run.planner_model:
         from langchain_openai import ChatOpenAI
         key = db.get(models.Setting, "openrouter_api_key")
+        max_tokens = db.get(models.Setting, "llm_max_output_tokens")
         llm = ChatOpenAI(
             model=run.planner_model,
             api_key=decrypt_secret(key.value) if key else None,
             base_url="https://openrouter.ai/api/v1" if key else None,
             timeout=120,
             max_retries=2,
+            max_tokens=int(max_tokens.value) if max_tokens else 16000,
         )
 
     graph = await SupervisorPlanner.decompose(run.prompt, llm)
@@ -266,15 +408,16 @@ async def process_run(
         if not run or run.status in {"succeeded", "failed", "cancelled"}:
             return
         if run.status == "cancelling":
+            graph = _cancel_active_task(db, run)
             run.status = "cancelled"
             run.finished_at = datetime.now(timezone.utc)
-            emit(db, run.id, "run.cancelled", {})
+            emit(db, run.id, "run.cancelled", {"task_graph": graph})
             db.commit()
             return
         active = db.query(models.AgentRun.id).filter(
             models.AgentRun.project_id == run.project_id,
             models.AgentRun.id != run.id,
-            models.AgentRun.status.in_(["running", "awaiting_approval", "cancelling"]),
+            models.AgentRun.status.in_(["running", "awaiting_question", "awaiting_approval", "cancelling"]),
         ).first()
         if active:
             raise ProjectBusy("Another project run is active")
@@ -292,21 +435,27 @@ async def process_run(
                 if first_task:
                     run.active_task_id = first_task["task_id"]
                     run.subtask_heartbeat_at = datetime.now(timezone.utc)
-                    _apply_task_status(db, run, first_task["task_id"], "in_progress")
+                    task_graph = _apply_task_status(db, run, first_task["task_id"], "in_progress")
                     emit(db, run.id, "supervisor.plan", {
                         "task_graph": task_graph,
                         "active_task_id": first_task["task_id"],
                     })
+                    _emit_task_transition(db, run, "task.started", first_task["task_id"], {
+                        "title": first_task["title"],
+                        "task_graph": task_graph,
+                        "progress": SupervisorPlanner.format_progress(task_graph),
+                    })
             elif is_resume and run.task_graph:
                 task_graph = run.task_graph
-                next_task = SupervisorPlanner.get_next_task(task_graph)
+                next_task = next((task for task in task_graph if task["status"] == "in_progress"), None)
+                next_task = next_task or SupervisorPlanner.get_next_task(task_graph)
                 if next_task:
                     run.active_task_id = next_task["task_id"]
                     run.subtask_heartbeat_at = datetime.now(timezone.utc)
-                    _apply_task_status(db, run, next_task["task_id"], "in_progress")
-                    emit(db, run.id, "task.started", {
-                        "task_id": next_task["task_id"],
+                    task_graph = _apply_task_status(db, run, next_task["task_id"], "in_progress")
+                    _emit_task_transition(db, run, "task.started", next_task["task_id"], {
                         "title": next_task["title"],
+                        "task_graph": task_graph,
                         "progress": SupervisorPlanner.format_progress(task_graph),
                     })
 
@@ -322,14 +471,62 @@ async def process_run(
         ).order_by(models.Interaction.created_at.desc()).limit(20).all()[::-1]
 
         response = ""
-        _final_report_seen = False
+        task_report = None
+        question_payload = None
+        task_prompt = run.prompt
+        if run.active_task_id and run.task_graph:
+            active_task = next((task for task in run.task_graph if task["task_id"] == run.active_task_id), None)
+            if active_task:
+                dependency_context = []
+                for dependency_id in active_task.get("depends_on", []):
+                    dependency = next((task for task in run.task_graph if task["task_id"] == dependency_id), None)
+                    if dependency and dependency.get("context_bundle"):
+                        dependency_context.append(f"{dependency_id}: {json.dumps(dependency['context_bundle'])}")
+                task_prompt = (
+                    f"Original implementation request:\n{run.prompt}\n\n"
+                    f"Execute only supervisor task {active_task['task_id']}: {active_task['title']}.\n"
+                    f"Acceptance criteria: {active_task.get('acceptance_criteria', 'Complete and verify this task without doing later tasks.')}\n"
+                    f"Dependencies: {', '.join(active_task.get('depends_on', [])) or 'none'}\n"
+                    f"Handoff context: {'; '.join(dependency_context) or 'none'}\n"
+                    "Verify the result, then call complete_task exactly once."
+                )
 
         if is_resume:
-            stream = agent.stream(None, run.thread_id)
+            stream = agent.stream(task_prompt, run.thread_id)
         elif action_id:
             action = db.get(models.PendingAction, action_id)
             if not action or action.run_id != run.id:
                 raise ValueError("Approval no longer matches this run")
+            if decision != "approve" and action.tool_name == "install_module_dependency":
+                task_id = run.active_task_id
+                report = {
+                    "task_id": task_id,
+                    "outcome": "FAILED",
+                    "done": [],
+                    "verification": "Dependency installation was not executed.",
+                    "errors": "DependencyRejected: the required Odoo module installation was rejected.",
+                }
+                emit(db, run.id, "task.report", report)
+                if task_id:
+                    graph = _apply_task_status(db, run, task_id, "failed", result=report)
+                    _emit_task_transition(db, run, "task.failed", task_id, {"task_graph": graph, "error_category": "DependencyRejected"})
+                run.active_task_id = None
+                run.status = "failed"
+                run.error_category = "DependencyRejected"
+                run.error_message = report["errors"]
+                run.finished_at = datetime.now(timezone.utc)
+                action.status = "rejected"
+                emit(db, run.id, "final_report", {"scope": "run", **report})
+                emit(db, run.id, "run.failed", {
+                    "category": "DependencyRejected",
+                    "message": run.error_message,
+                    "retryable": False,
+                    "support_id": run.support_id,
+                    "task_id": task_id,
+                    "tool": "install_module_dependency",
+                })
+                db.commit()
+                return
             if decision == "approve":
                 action.status = "claimed"
                 action.claimed_at = datetime.now(timezone.utc)
@@ -359,16 +556,17 @@ async def process_run(
                             content=f"[A2A Context from previous tasks]\n{combined_handoff}"
                         ))
                         
-            stream = agent.stream(run.prompt, run.thread_id, interactions)
+            stream = agent.stream(task_prompt, run.thread_id, interactions)
 
         async for chunk in stream:
             response += chunk
             with SessionLocal() as event_db:
                 current = event_db.get(models.AgentRun, run.id)
                 if current.status == "cancelling":
+                    graph = _cancel_active_task(event_db, current)
                     current.status = "cancelled"
                     current.finished_at = datetime.now(timezone.utc)
-                    emit(event_db, run.id, "run.cancelled", {})
+                    emit(event_db, run.id, "run.cancelled", {"task_graph": graph})
                     event_db.commit()
                     return
 
@@ -378,9 +576,15 @@ async def process_run(
                     current.subtask_heartbeat_at = now
 
                 for event_type, payload in agent.drain_activity():
+                    payload = _scope_tool_event(event_db, current, event_type, payload)
+                    if event_type == "task.report":
+                        if task_report is not None:
+                            raise RuntimeError("DuplicateTaskCompletion: current task reported completion more than once")
+                        task_report = {**payload, "task_id": current.active_task_id}
+                        payload = task_report
                     emit(event_db, run.id, event_type, payload)
-                    if event_type == "final_report":
-                        _final_report_seen = True
+                    if event_type == "question":
+                        question_payload = payload
                     elif event_type in ("thinking", "plan.updated") and current.active_task_id:
                         _update_subtask_heartbeat(event_db, current, current.active_task_id)
 
@@ -390,16 +594,57 @@ async def process_run(
         with SessionLocal() as finish_db:
             current = finish_db.get(models.AgentRun, run.id)
             for event_type, payload in agent.drain_activity():
+                payload = _scope_tool_event(finish_db, current, event_type, payload)
+                if event_type == "task.report":
+                    if task_report is not None:
+                        raise RuntimeError("DuplicateTaskCompletion: current task reported completion more than once")
+                    task_report = {**payload, "task_id": current.active_task_id}
+                    payload = task_report
                 emit(finish_db, run.id, event_type, payload)
-                if event_type == "final_report":
-                    _final_report_seen = True
+                if event_type == "question":
+                    question_payload = payload
 
-            current.input_tokens = agent.usage["input_tokens"]
-            current.output_tokens = agent.usage["output_tokens"]
-            current.cost_usd = agent.usage["cost_usd"]
-            emit(finish_db, run.id, "usage", agent.usage)
+            attempt_usage = dict(agent.usage)
+            current.input_tokens = (current.input_tokens or 0) + attempt_usage["input_tokens"]
+            current.output_tokens = (current.output_tokens or 0) + attempt_usage["output_tokens"]
+            current.cost_usd = (current.cost_usd or 0) + attempt_usage["cost_usd"]
+            cumulative_usage = {
+                "input_tokens": current.input_tokens,
+                "output_tokens": current.output_tokens,
+                "cost_usd": current.cost_usd,
+            }
+            emit(finish_db, run.id, "usage", {"attempt": attempt_usage, "cumulative": cumulative_usage})
             if response.strip():
                 finish_db.add(models.Interaction(project_id=run.project_id, role="agent", content=response))
+
+            if cancel_after:
+                graph = _cancel_active_task(finish_db, current)
+                current.status = "cancelled"
+                current.finished_at = datetime.now(timezone.utc)
+                emit(finish_db, run.id, "run.cancelled", {"task_graph": graph})
+                finish_db.commit()
+                return
+
+            if question_payload:
+                question = models.AgentQuestion(
+                    run_id=run.id,
+                    project_id=run.project_id,
+                    requested_by_id=run.requested_by_id,
+                    question=str(question_payload.get("question", "")),
+                    options=list(question_payload.get("options") or []),
+                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.action_expiry_minutes),
+                )
+                finish_db.add(question)
+                finish_db.flush()
+                current.status = "awaiting_question"
+                emit(finish_db, run.id, "question.required", {
+                    "question_id": question.id,
+                    "question": question.question,
+                    "options": question.options,
+                    "expires_at": question.expires_at.isoformat(),
+                })
+                finish_db.commit()
+                return
 
             call = await agent.pending_call(run.thread_id)
             if call:
@@ -435,58 +680,125 @@ async def process_run(
                     emit(finish_db, run.id, "approval.required", {
                         "action_id": action.id, "tool": action.tool_name,
                         "risk_class": action.risk_class, "preview": preview,
+                        "arguments": action.arguments,
+                        "expires_at": action.expires_at.isoformat(),
                     })
             else:
-                # Gate "succeeded" strictly on emit_final_report
-                if _final_report_seen:
-                    current.status = "cancelled" if cancel_after else "succeeded"
-                else:
+                if not task_report or not current.active_task_id:
                     current.status = "failed"
-                    current.error_category = "MissingFinalReport"
-                    current.error_message = "Agent finished without calling emit_final_report."
+                    current.error_category = "MissingTaskReport"
+                    current.error_message = "Agent finished without calling complete_task."
+                    current.finished_at = datetime.now(timezone.utc)
                     emit(finish_db, run.id, "run.failed", {
+                        "category": "MissingTaskReport",
                         "message": current.error_message,
                         "retryable": True,
                         "support_id": current.support_id,
+                        "task_id": current.active_task_id,
+                        "tool": None,
                     })
+                else:
+                    task_id = current.active_task_id
+                    outcome = str(task_report.get("outcome", "FAILED")).upper()
+                    task_succeeded = outcome == "SUCCESS"
 
-                current.finished_at = datetime.now(timezone.utc)
-                if current.status in ["succeeded", "failed", "cancelled"] and current.task_graph:
-                    graph = current.task_graph
-                    
-                    # Extract context for the finished task if succeeded
-                    messages = []
-                    context = {}
-                    if current.status == "succeeded":
-                        if checkpointer:
-                            state = checkpointer.get({"configurable": {"thread_id": run.thread_id}})
-                            if state and hasattr(state, "values") and "messages" in state.values:
-                                messages = state.values["messages"]
+                    # Backend acceptance check gate: verify if any required acceptance check failed
+                    unsatisfied_checks = finish_db.query(models.AcceptanceCheck).filter(
+                        models.AcceptanceCheck.run_id == current.id,
+                        models.AcceptanceCheck.task_id == task_id,
+                        models.AcceptanceCheck.required == True,
+                        models.AcceptanceCheck.status == "failed",
+                    ).all()
+                    if unsatisfied_checks:
+                        task_succeeded = False
+                        failed_names = [f"{c.kind}:{c.spec_target}" for c in unsatisfied_checks]
+                        task_report["errors"] = (
+                            f"AcceptanceCheckFailed: {len(unsatisfied_checks)} required checks failed: {', '.join(failed_names)}"
+                        )
 
-                        if messages and hasattr(agent, "llm"):
-                            context = await SupervisorPlanner.extract_context(current.active_task_id or "", messages, agent.llm)
-                    
-                    for task in graph:
-                        if task["status"] == "in_progress":
-                            task["status"] = "done" if current.status == "succeeded" else "failed"
-                            if current.status == "succeeded":
-                                task["context_bundle"] = context
-                            
-                    current.task_graph = graph
+                    handoff = {
+                        "handoff_summary": "\n".join(task_report.get("done") or []),
+                        "verification": task_report.get("verification", ""),
+                        "errors": task_report.get("errors", ""),
+                    }
+                    graph = _apply_task_status(
+                        finish_db,
+                        current,
+                        task_id,
+                        "done" if task_succeeded else "failed",
+                        result=task_report,
+                        context_bundle=handoff,
+                    )
                     current.active_task_id = None
-                    emit(finish_db, run.id, "supervisor.complete", {
-                        "task_graph": current.task_graph,
-                        "progress": SupervisorPlanner.format_progress(current.task_graph),
-                    })
+                    current.subtask_heartbeat_at = None
+
+                    if task_succeeded:
+                        _emit_task_transition(finish_db, current, "task.completed", task_id, {
+                            "task_graph": graph,
+                            "progress": SupervisorPlanner.format_progress(graph),
+                        })
+                        next_task = SupervisorPlanner.get_next_task(graph)
+                        if next_task:
+                            current.active_task_id = next_task["task_id"]
+                            current.status = "queued"
+                            emit(finish_db, run.id, "run.queued", {
+                                "task_id": next_task["task_id"],
+                                "support_id": run.support_id,
+                            })
+                            enqueue(finish_db, "run.resume", run.id)
+                        elif SupervisorPlanner.is_complete(graph):
+                            current.status = "succeeded"
+                            current.finished_at = datetime.now(timezone.utc)
+                            emit(finish_db, run.id, "supervisor.complete", {
+                                "task_graph": graph,
+                                "progress": SupervisorPlanner.format_progress(graph),
+                            })
+                            run_report = {
+                                "scope": "run",
+                                "outcome": "SUCCESS",
+                                "done": [task.get("title", task["task_id"]) for task in graph],
+                                "verification": "All supervisor tasks completed. See task reports for verification evidence.",
+                                "errors": "",
+                            }
+                            emit(finish_db, run.id, "final_report", run_report)
+                            emit(finish_db, run.id, "run.completed", {"status": "succeeded"})
+                        else:
+                            current.status = "failed"
+                            current.error_category = "TaskDependencyDeadlock"
+                            current.error_message = "No dependency-satisfied supervisor task is available."
+                            current.finished_at = datetime.now(timezone.utc)
+                            emit(finish_db, run.id, "run.failed", {
+                                "category": "TaskDependencyDeadlock",
+                                "message": current.error_message,
+                                "retryable": False,
+                                "support_id": current.support_id,
+                                "task_id": None,
+                                "tool": None,
+                            })
+                    else:
+                        error_text = str(task_report.get("errors") or "Task reported failure")
+                        error_category = "DependencyInstallFailed" if "DependencyInstallFailed" in error_text else "TaskFailed"
+                        _emit_task_transition(finish_db, current, "task.failed", task_id, {
+                            "task_graph": graph, "error_category": error_category,
+                        })
+                        current.status = "failed"
+                        current.error_category = error_category
+                        current.error_message = error_text[:500]
+                        current.finished_at = datetime.now(timezone.utc)
+                        emit(finish_db, run.id, "final_report", {"scope": "run", **task_report})
+                        emit(finish_db, run.id, "run.failed", {
+                            "category": error_category,
+                            "message": current.error_message,
+                            "retryable": False,
+                            "support_id": current.support_id,
+                            "task_id": task_id,
+                            "tool": None,
+                        })
 
                 if action_id:
                     action_rec = finish_db.get(models.PendingAction, action_id)
                     if action_rec and action_rec.status != "expired":
                         action_rec.status = "succeeded" if decision == "approve" else "rejected"
-
-                emit(finish_db, run.id,
-                     "run.cancelled" if cancel_after else "run.completed",
-                     {"status": current.status})
 
             finish_db.commit()
 
@@ -502,6 +814,10 @@ async def handle_event(event, checkpointer):
             await process_run(run_id, checkpointer, action_id=payload["action_id"], decision=payload["decision"], cancel_after=payload.get("cancel_after", False))
         elif event_type == "deployment.start":
             await asyncio.to_thread(execute_deployment, run_id)
+        elif event_type == "source.index":
+            snapshot_id = payload.get("snapshot_id")
+            if snapshot_id:
+                await asyncio.to_thread(process_source_index, run_id, snapshot_id)
         with SessionLocal() as db:
             stored = db.get(models.OutboxEvent, event_id)
             stored.completed_at = datetime.now(timezone.utc)
@@ -517,14 +833,28 @@ async def handle_event(event, checkpointer):
                 return
             run = db.get(models.AgentRun, run_id)
             if run:
+                error_category = "TaskExecutionLimitExceeded" if str(exc).startswith("TaskExecutionLimitExceeded") else type(exc).__name__
+                failed_task_id = run.active_task_id
+                if failed_task_id:
+                    graph = _apply_task_status(db, run, failed_task_id, "failed")
+                    _emit_task_transition(db, run, "task.failed", failed_task_id, {
+                        "task_graph": graph,
+                        "error_category": error_category,
+                    })
+                    run.active_task_id = None
                 run.status = "failed"
-                run.error_category = type(exc).__name__
+                run.error_category = error_category
                 run.error_message = str(exc)[:500]
                 run.error_detail = traceback.format_exc()[-20_000:]
                 run.retryable = isinstance(exc, (TimeoutError, ConnectionError, RuntimeError))
                 run.finished_at = datetime.now(timezone.utc)
                 emit(db, run.id, "run.failed", {
-                    "message": run.error_message, "retryable": run.retryable, "support_id": run.support_id,
+                    "category": error_category,
+                    "message": run.error_message,
+                    "retryable": run.retryable,
+                    "support_id": run.support_id,
+                    "task_id": failed_task_id,
+                    "tool": None,
                 })
             stored = db.get(models.OutboxEvent, event_id)
             stored.last_error = str(exc)[:2000]
@@ -533,15 +863,24 @@ async def handle_event(event, checkpointer):
 
 
 async def serve():
+    shutdown_event = threading.Event()
+    start_worker_lease_thread(shutdown_event)
     recover_stale_work()
-    async with AsyncPostgresSaver.from_conn_string(settings.checkpoint_url) as checkpointer:
-        await checkpointer.setup()
-        while True:
-            event = claim_outbox()
-            if event:
-                await handle_event(event, checkpointer)
-            else:
-                await asyncio.sleep(1)
+    last_recovery = time.time()
+    try:
+        async with AsyncPostgresSaver.from_conn_string(settings.checkpoint_url) as checkpointer:
+            await checkpointer.setup()
+            while True:
+                if time.time() - last_recovery >= 10:
+                    recover_stale_work()
+                    last_recovery = time.time()
+                event = claim_outbox()
+                if event:
+                    await handle_event(event, checkpointer)
+                else:
+                    await asyncio.sleep(1)
+    finally:
+        shutdown_event.set()
 
 
 if __name__ == "__main__":

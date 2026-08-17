@@ -28,7 +28,9 @@ export default function CodeDiffViewer({ path, content, isDiff = false }: CodeDi
     return "Text";
   };
 
-  const lines = content.split("\n");
+  const allLines = content.split("\n");
+  const diffTruncated = isDiff && allLines.length > 5000;
+  const lines = diffTruncated ? allLines.slice(0, 5000) : allLines;
 
   return (
     <div className="flex h-full flex-col bg-zinc-950 text-xs font-mono">
@@ -47,6 +49,7 @@ export default function CodeDiffViewer({ path, content, isDiff = false }: CodeDi
           <div className="flex items-center gap-2">
             <button
               onClick={() => setWrap(!wrap)}
+              aria-label="Toggle line wrapping"
               className={`rounded p-1 transition ${wrap ? "bg-blue-600 text-white" : "text-gray-400 hover:bg-white/10 hover:text-white"}`}
               title="Toggle line wrapping"
             >
@@ -71,6 +74,7 @@ export default function CodeDiffViewer({ path, content, isDiff = false }: CodeDi
           </div>
         ) : isDiff ? (
           <div className="divide-y divide-white/5">
+            {diffTruncated && <p className="sticky top-0 z-10 bg-amber-950 p-2 text-amber-200">Showing the first 5,000 of {allLines.length.toLocaleString()} lines. Copy includes the complete diff.</p>}
             {lines.map((line, idx) => {
               const isAdd = line.startsWith("+");
               const isDel = line.startsWith("-");
@@ -99,22 +103,7 @@ export default function CodeDiffViewer({ path, content, isDiff = false }: CodeDi
             })}
           </div>
         ) : (
-          <table className="w-full border-collapse">
-            <tbody>
-              {lines.map((line, idx) => (
-                <tr key={idx} className="hover:bg-white/5 group">
-                  <td className="w-10 select-none text-right pr-4 text-[10px] text-gray-600 group-hover:text-gray-400 align-top py-0.5">
-                    {idx + 1}
-                  </td>
-                  <td className="py-0.5 pl-2">
-                    <pre className={`font-mono text-xs text-gray-200 ${wrap ? "whitespace-pre-wrap break-all" : "whitespace-pre"}`}>
-                      {line || " "}
-                    </pre>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <pre className={`p-2 font-mono text-xs leading-5 text-gray-200 ${wrap ? "whitespace-pre-wrap break-all" : "whitespace-pre"}`}>{content}</pre>
         )}
       </div>
     </div>

@@ -11,6 +11,7 @@ from config import settings
 
 
 class Workspace:
+    EMPTY_TREE_REVISION = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
     REVISION_RE = re.compile(r"^(?:HEAD|[0-9a-f]{7,40})$")
     def __init__(self, slug: str):
         root = settings.workspace_root.expanduser().resolve()
@@ -89,11 +90,18 @@ class Workspace:
         output = self._git("log", f"-{min(limit, 200)}", "--pretty=format:%H%x09%aI%x09%s", check=False)
         return [dict(zip(("hash", "created_at", "message"), line.split("\t", 2))) for line in output.splitlines() if line]
 
-    def diff(self, old: str, new: str = "HEAD") -> str:
+    def head(self) -> str | None:
+        return self._git("rev-parse", "--verify", "HEAD", check=False) or None
+
+    def diff_result(self, old: str, new: str = "HEAD") -> tuple[str, bool]:
         for revision in (old, new):
             if not self.REVISION_RE.fullmatch(revision):
                 raise ValueError("Invalid revision")
-        return self._git("diff", "--no-ext-diff", old, new)[:100_000]
+        value = self._git("diff", "--no-ext-diff", old, new)
+        return value[:100_000], len(value) > 100_000
+
+    def diff(self, old: str, new: str = "HEAD") -> str:
+        return self.diff_result(old, new)[0]
 
     def restore(self, revision: str) -> str:
         if not self.REVISION_RE.fullmatch(revision):

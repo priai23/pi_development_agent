@@ -39,6 +39,19 @@ def test_signature_covers_module_name():
         verify_job(job, public, set())
 
 
+def test_expired_signed_job_is_rejected():
+    private = Ed25519PrivateKey.generate()
+    job = {
+        "job_uuid": "expired", "operation": "upgrade", "module_name": "sample_module",
+        "module_version": "19.0.1.0.0", "artifact_url": "https://artifacts.example/module.zip",
+        "artifact_digest": "0" * 64, "nonce": "expired-nonce",
+        "expires_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+    }
+    job["signature"] = base64.b64encode(private.sign(canonical_job(job))).decode()
+    with pytest.raises(RunnerError, match="expired"):
+        verify_job(job, private.public_key(), set())
+
+
 def test_archive_rejects_traversal(tmp_path):
     archive = tmp_path / "bad.zip"
     with zipfile.ZipFile(archive, "w") as bundle:

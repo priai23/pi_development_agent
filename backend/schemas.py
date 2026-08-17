@@ -154,11 +154,25 @@ class QuestionAnswer(BaseModel):
     answer: str
 
 
+class AgentQuestionOut(ORMModel):
+    id: str
+    run_id: str
+    question: str
+    options: list[str]
+    answer: str | None
+    status: str
+    created_at: datetime
+    expires_at: datetime
+
+
 class PendingActionOut(ORMModel):
     id: str
+    run_id: str | None
     tool_name: str
+    arguments: dict
     preview: dict
     risk_class: str
+    status: str
     expires_at: datetime
 
 
@@ -181,8 +195,6 @@ class LLMSettingsUpdate(BaseModel):
 class RunCreate(BaseModel):
     message: str = Field(min_length=1, max_length=20_000)
     queue_if_busy: bool = False
-    planner_model: str | None = None
-    fallback_model: str | None = None
 
 
 class RunOut(ORMModel):
@@ -205,6 +217,8 @@ class RunOut(ORMModel):
     active_task_id: str | None = None
     planner_model: str | None = None
     fallback_model: str | None = None
+    workspace_base_revision: str | None = None
+    question: AgentQuestionOut | None = None
 
 
 # ─── A2A Task Decomposition Schemas ───────────────────────────────────────────
@@ -215,7 +229,7 @@ class TaskGraphItem(BaseModel):
     title: str                                                 # human-readable label
     risk_class: int = 1                                        # 1=read, 2=reversible-write, 3=destructive
     depends_on: list[str] = []                                 # task_ids this task depends on
-    status: Literal["pending", "in_progress", "blocked", "done", "failed"] = "pending"
+    status: Literal["pending", "in_progress", "blocked", "done", "failed", "cancelled"] = "pending"
     retry_count: int = 0
     max_retries: int = 2                                       # configurable per task
     context_bundle: dict[str, Any] = {}                        # scoped context slice passed to worker
@@ -228,7 +242,7 @@ class HandoffMessage(BaseModel):
     task_id: str
     parent_run_id: str
     depends_on: list[str] = []
-    status: Literal["pending", "in_progress", "blocked", "done", "failed"]
+    status: Literal["pending", "in_progress", "blocked", "done", "failed", "cancelled"]
     context_bundle: dict[str, Any] = {}
     result: dict[str, Any] | None = None
     heartbeat_at: str | None = None
@@ -437,4 +451,3 @@ class MemoryOut(ORMModel):
     usage_count: int
     created_at: datetime
     updated_at: datetime
-

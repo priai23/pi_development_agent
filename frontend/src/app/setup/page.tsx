@@ -80,10 +80,11 @@ export default function SetupPage() {
           className="space-y-4 rounded-2xl border bg-white p-8 shadow-xl dark:border-white/10 dark:bg-gray-950"
         >
           <div>
-            <label className="block text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-1">
+            <label htmlFor="setup-email" className="block text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-1">
               Administrator Email
             </label>
             <input
+              id="setup-email"
               type="email"
               required
               autoComplete="email"
@@ -95,10 +96,11 @@ export default function SetupPage() {
           </div>
 
           <div>
-            <label className="block text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-1">
+            <label htmlFor="setup-password" className="block text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-1">
               Password (min 12 characters)
             </label>
             <input
+              id="setup-password"
               type="password"
               required
               minLength={12}
@@ -111,10 +113,11 @@ export default function SetupPage() {
           </div>
 
           <div>
-            <label className="block text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-1">
+            <label htmlFor="setup-confirm-password" className="block text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-1">
               Confirm Password
             </label>
             <input
+              id="setup-confirm-password"
               type="password"
               required
               minLength={12}

@@ -5,7 +5,10 @@
     "summary": "Deployment job tracker for PI ERP Implementation Agent",
     "author": "Primacy Infotech",
     "depends": ["base"],
-    "data": [],
+    "data": [
+        "security/ir.model.access.csv",
+        "views/deployment_job_views.xml",
+    ],
     "installable": True,
     "application": False,
     "license": "LGPL-3",

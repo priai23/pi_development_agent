@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Bot, Brain, Code2, Database, FileText, Folder, GitBranch, History, Layers, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, Send, Square, Trash2 } from "lucide-react";
+import { AlertTriangle, Bot, Brain, ChevronDown, ChevronUp, Code2, Database, GitBranch, History, Layers, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, RotateCcw, Send, Square } from "lucide-react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
@@ -10,20 +10,26 @@ import AgentStatus from "@/components/AgentStatus";
 import ActivityStepper from "@/components/ActivityStepper";
 import LearnedMemories from "@/components/LearnedMemories";
 import CodeDiffViewer from "@/components/CodeDiffViewer";
-import { apiFetch, AgentRun, AgentQuestion, Artifact, ChatMessage, deleteRun, Deployment, FinalReport, followRun, Instance, PendingAction, Project, Step, ToolEvent, WorkspaceEntry, visibleContent } from "@/lib/api";
-
-type PendingRecord = { id: string; tool_name: string; preview: Record<string, unknown>; risk_class: string; expires_at: string };
+import ApprovalCard from "@/components/ApprovalCard";
+import WorkspaceFileTree from "@/components/WorkspaceFileTree";
+import RunHistoryDialog from "@/components/RunHistoryDialog";
+import { apiFetch, AgentRun, Artifact, ChatMessage, deleteRun, Deployment, followRun, Instance, Project, ToolEvent, WorkspaceEntry } from "@/lib/api";
+import { ACTIVE_RUN_STATUSES, getWorkspacePhase, WorkspacePhase } from "@/lib/run-state";
+import { useRunController } from "@/hooks/useRunController";
 
 export default function ProjectWorkspace() {
   const params = useParams<{ id: string }>();
   const projectId = Number(params.id);
+  const { state: runState, hydrate: hydrateRun, receive: receiveRunEvent, setConnection, setRun, setError: setRunError, clear: clearRun } = useRunController();
   const [project, setProject] = useState<Project | null>(null);
   const [instances, setInstances] = useState<Instance[]>([]);
-  const [chat, setChat] = useState<ChatMessage[]>([]);
-  const [pending, setPending] = useState<PendingAction | null>(null);
   const [message, setMessage] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const [bootLoading, setBootLoading] = useState(true);
+  const [connectingInstance, setConnectingInstance] = useState(false);
+  const [submittingRun, setSubmittingRun] = useState(false);
+  const [pageError, setPageError] = useState("");
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [streamAttempt, setStreamAttempt] = useState(0);
   const [url, setUrl] = useState("");
   const [dbName, setDbName] = useState("");
   const [detectedDatabases, setDetectedDatabases] = useState<string[]>([]);
@@ -33,21 +39,12 @@ export default function ProjectWorkspace() {
   const [password, setPassword] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [authMethod, setAuthMethod] = useState<"json2" | "xmlrpc">("json2");
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
-  const [steps, setSteps] = useState<Step[]>([]);
-  const [usage, setUsage] = useState("");
-  const [tokenInputs, setTokenInputs] = useState(0);
-  const [currentTool, setCurrentTool] = useState<string | null>(null);
-  const [isThinking, setIsThinking] = useState(false);
   const [deciding, setDeciding] = useState(false);
-  const [isStuck, setIsStuck] = useState(false);
-  const [agentQuestion, setAgentQuestion] = useState<AgentQuestion | null>(null);
+  const [diagnosticExpanded, setDiagnosticExpanded] = useState(false);
   const [questionAnswer, setQuestionAnswer] = useState("");
   const [submittingAnswer, setSubmittingAnswer] = useState(false);
-  const [finalReport, setFinalReport] = useState<FinalReport | null>(null);
-  const [thinkingText, setThinkingText] = useState<string | null>(null);
-  const [showLeftSidebar, setShowLeftSidebar] = useState(true);
-  const [showRightPanel, setShowRightPanel] = useState(true);
+  const [showLeftSidebar, setShowLeftSidebar] = useState(false);
+  const [showRightPanel, setShowRightPanel] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(520);
   const [isResizingRight, setIsResizingRight] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<"code" | "diff" | "memory" | "evidence">("code");
@@ -59,24 +56,46 @@ export default function ProjectWorkspace() {
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [runs, setRuns] = useState<AgentRun[]>([]);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
-  // A2A Supervisor task graph state
-  const [supervisorTaskGraph, setSupervisorTaskGraph] = useState<Array<{ task_id: string; title: string; status: string; risk_class: number; retry_count: number; heartbeat_at: string | null }> | null>(null);
-  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
-  const [recoveringTaskId, setRecoveringTaskId] = useState<string | null>(null);
-  const [finalReportSeen, setFinalReportSeen] = useState(false);
-  const [plannerModel, setPlannerModel] = useState("gpt-4o");
-  const [fallbackModel, setFallbackModel] = useState("gpt-4o-mini");
   const bottom = useRef<HTMLDivElement>(null);
   const discoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const discoverySequence = useRef(0);
-  const lastEventAt = useRef<number>(0);
-  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const streamCursorRef = useRef(0);
+  const selectedRunIdRef = useRef<string | null>(null);
+
+  const phase: WorkspacePhase = getWorkspacePhase(runState, submittingRun);
+  const chat = runState.transcript;
+  const pending = runState.pending?.status === "pending" ? runState.pending : null;
+  const activeRunId = runState.activeRunId;
+  const steps = runState.steps;
+  const tokenInputs = runState.inputTokens;
+  const usage = runState.inputTokens || runState.outputTokens || runState.costUsd
+    ? `${runState.inputTokens} input · ${runState.outputTokens} output tokens · $${runState.costUsd.toFixed(4)}` : "";
+  const currentTool = [...steps].reverse().find((step) => step.status === "running")?.tool || null;
+  const runWorking = ["queued", "connecting", "retrying", "thinking", "executing", "recovering", "cancelling"].includes(phase);
+  const isThinking = (phase === "thinking" || phase === "executing") && !currentTool;
+  const canStop = ["queued", "connecting", "retrying", "thinking", "executing", "recovering"].includes(phase) && Boolean(runState.run?.id);
+  const isInteractive = ["idle", "succeeded", "failed", "cancelled", "interrupted"].includes(phase) && !pending;
+  const loading = bootLoading || connectingInstance || submittingRun || runWorking;
+  const error = pageError || runState.error;
+  const agentQuestion = runState.question?.status === "pending" ? runState.question : null;
+  const finalReport = runState.finalReport;
+  const thinkingText = runState.thinkingText;
+  const supervisorTaskGraph = runState.taskGraph;
+  const activeTaskId = runState.activeTaskId;
+  const recoveringTaskId = runState.recoveringTaskId;
+  const runStatus = runState.run?.status;
+
+  useEffect(() => { streamCursorRef.current = runState.cursor; }, [runState.cursor]);
+  useEffect(() => { selectedRunIdRef.current = runState.selectedRunId; }, [runState.selectedRunId]);
 
   // Restore & save panel layout preferences in localStorage
   useEffect(() => {
     const savedSidebar = localStorage.getItem("workspace:showLeftSidebar");
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (savedSidebar !== null) setShowLeftSidebar(savedSidebar === "true");
+    else setShowLeftSidebar(window.innerWidth >= 1280);
+    setShowRightPanel(window.innerWidth >= 1440);
     const savedWidth = localStorage.getItem("workspace:rightPanelWidth");
     if (savedWidth !== null) {
       const parsed = Number(savedWidth);
@@ -95,91 +114,70 @@ export default function ProjectWorkspace() {
   // Mouse drag handler for dynamic right panel width resizing
   useEffect(() => {
     if (!isResizingRight) return;
-    const handleMouseMove = (e: MouseEvent) => {
+    const handlePointerMove = (e: PointerEvent) => {
       const newWidth = window.innerWidth - e.clientX;
       if (newWidth >= 320 && newWidth <= window.innerWidth * 0.75) {
         setRightPanelWidth(newWidth);
         localStorage.setItem("workspace:rightPanelWidth", String(newWidth));
       }
     };
-    const handleMouseUp = () => {
+    const handlePointerUp = () => {
       setIsResizingRight(false);
     };
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
     return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
     };
   }, [isResizingRight]);
 
   const loadWorkspaceDetails = useCallback(async () => {
-    try {
-      const [treeData, diffData, artifactData, deploymentData] = await Promise.all([
-        apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree`).catch(() => []),
-        apiFetch<{ diff: string }>(`/projects/${projectId}/workspace/diff`).catch(() => ({ diff: "" })),
-        apiFetch<Artifact[]>(`/projects/${projectId}/artifacts`).catch(() => []),
-        apiFetch<Deployment[]>(`/projects/${projectId}/deployments`).catch(() => []),
-      ]);
-      setEntries(treeData);
-      setDiffContent(diffData.diff);
-      setArtifacts(artifactData);
-      setDeployments(deploymentData);
-    } catch {
-      // ignore
-    }
+    setWorkspaceError("");
+    const runQuery = selectedRunIdRef.current ? `?run_id=${encodeURIComponent(selectedRunIdRef.current)}` : "";
+    const results = await Promise.allSettled([
+      apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree`),
+      apiFetch<{ diff: string }>(`/projects/${projectId}/workspace/diff${runQuery}`),
+      apiFetch<Artifact[]>(`/projects/${projectId}/artifacts`),
+      apiFetch<Deployment[]>(`/projects/${projectId}/deployments`),
+    ]);
+    const [treeResult, diffResult, artifactResult, deploymentResult] = results;
+    if (treeResult.status === "fulfilled") setEntries(treeResult.value);
+    if (diffResult.status === "fulfilled") setDiffContent(diffResult.value.diff);
+    if (artifactResult.status === "fulfilled") setArtifacts(artifactResult.value);
+    if (deploymentResult.status === "fulfilled") setDeployments(deploymentResult.value);
+    const labels = ["Files", "Diff", "Artifacts", "Deployments"];
+    const failures = results.flatMap((result, index) => result.status === "rejected" ? [`${labels[index]}: ${result.reason instanceof Error ? result.reason.message : "request failed"}`] : []);
+    setWorkspaceError(failures.join(" · "));
   }, [projectId]);
 
-  const openFile = async (path: string) => {
+  const openFile = useCallback(async (path: string) => {
     try {
       const file = await apiFetch<{ content: string }>(`/projects/${projectId}/workspace/files?path=${encodeURIComponent(path)}`);
       setSelectedFile(path);
       setFileContent(file.content);
-    } catch {
-      // ignore
-    }
-  };
+    } catch (caught) { setWorkspaceError(caught instanceof Error ? caught.message : "Could not read file"); }
+  }, [projectId]);
 
   const load = useCallback(async () => {
     try {
-      const [projectData, instanceData, chatData, pendingData] = await Promise.all([
+      const [projectData, instanceData, runsData] = await Promise.all([
         apiFetch<Project>(`/projects/${projectId}`),
         apiFetch<Instance[]>(`/projects/${projectId}/instances`),
-        apiFetch<ChatMessage[]>(`/projects/${projectId}/chat`),
-        apiFetch<PendingRecord | null>(`/projects/${projectId}/actions/pending`),
+        apiFetch<AgentRun[]>(`/projects/${projectId}/runs`),
       ]);
-      setProject(projectData); setInstances(instanceData); setChat(chatData);
-      setPending(pendingData ? { id: pendingData.id, tool: pendingData.tool_name, preview: pendingData.preview, risk_class: pendingData.risk_class } : null);
-      // Restore step history from the last run
-      const runsData = await apiFetch<AgentRun[]>(`/projects/${projectId}/runs`).catch(() => [] as AgentRun[]);
+      setProject(projectData); setInstances(instanceData);
       setRuns(runsData);
       if (runsData.length > 0) {
-        if (runsData[0].status === "running" || runsData[0].status === "cancelling") {
-          setActiveRunId(runsData[0].id);
-        }
-        const events = await apiFetch<ToolEvent[]>(`/runs/${runsData[0].id}/events`).catch(() => [] as ToolEvent[]);
-        const rebuilt: Step[] = [];
-        for (const ev of events) {
-          if (ev.event_type === "tool.started") {
-            rebuilt.push({ tool: String(ev.payload.tool), label: String(ev.payload.tool).replace(/_/g, " "), status: "running", startedAt: new Date(ev.created_at).getTime() });
-          } else if (ev.event_type === "tool.completed") {
-            const idx = [...rebuilt].reverse().findIndex(s => s.tool === String(ev.payload.tool) && s.status === "running");
-            if (idx !== -1) {
-              const realIdx = rebuilt.length - 1 - idx;
-              const raw = String(ev.payload.result || "").slice(0, 80).replace(/\n/g, " ");
-              rebuilt[realIdx] = { ...rebuilt[realIdx], status: "done", result: raw, elapsed: (new Date(ev.created_at).getTime() - rebuilt[realIdx].startedAt) / 1000 };
-            }
-          } else if (ev.event_type === "usage") {
-            setUsage(`${ev.payload.input_tokens || 0} input · ${ev.payload.output_tokens || 0} output tokens · $${Number(ev.payload.cost_usd || 0).toFixed(4)}`);
-            setTokenInputs(Number(ev.payload.input_tokens || 0));
-          }
-        }
-        setSteps(rebuilt);
+        const selected = runsData.find((run) => ACTIVE_RUN_STATUSES.has(run.status)) || runsData[0];
+        const events = await apiFetch<ToolEvent[]>(`/runs/${selected.id}/events`);
+        selectedRunIdRef.current = selected.id;
+        hydrateRun(selected, events);
       }
       void loadWorkspaceDetails();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not load project"); }
-    finally { setLoading(false); }
-  }, [projectId, loadWorkspaceDetails]);
+    } catch (caught) { setPageError(caught instanceof Error ? caught.message : "Could not load project"); }
+    finally { setBootLoading(false); }
+  }, [projectId, loadWorkspaceDetails, hydrateRun]);
 
   useEffect(() => {
     // State changes occur after the API promises resolve.
@@ -189,24 +187,8 @@ export default function ProjectWorkspace() {
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth" }); }, [chat, pending]);
   useEffect(() => () => {
     if (discoveryTimer.current) clearTimeout(discoveryTimer.current);
-    if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+    streamAbortRef.current?.abort();
   }, []);
-
-  // 60s heartbeat: detect agent hang
-  useEffect(() => {
-    if (!loading && !deciding) {
-      if (heartbeatRef.current) clearInterval(heartbeatRef.current);
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setIsStuck(false);
-      return;
-    }
-    lastEventAt.current = Date.now();
-    setIsStuck(false);
-    heartbeatRef.current = setInterval(() => {
-      if (Date.now() - lastEventAt.current > 60_000) setIsStuck(true);
-    }, 5_000);
-    return () => { if (heartbeatRef.current) clearInterval(heartbeatRef.current); };
-  }, [loading, deciding]);
 
   const discoverDatabases = async (candidateUrl: string) => {
     const normalizedUrl = candidateUrl.trim();
@@ -255,17 +237,19 @@ export default function ProjectWorkspace() {
   };
 
   const connect = async (event: FormEvent) => {
-    event.preventDefault(); setLoading(true); setError("");
+    event.preventDefault(); setConnectingInstance(true); setPageError("");
     try {
       await apiFetch<Instance>("/instances", { method: "POST", body: JSON.stringify({ erp_type: "odoo", url, db_name: dbName, username: authMethod === "xmlrpc" ? username : null, password: authMethod === "xmlrpc" ? password : null, api_key: authMethod === "json2" ? apiKey : null, auth_method: authMethod, project_id: projectId }) });
       setPassword(""); setApiKey(""); await load();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Connection failed"); setLoading(false); }
+    } catch (caught) { setPageError(caught instanceof Error ? caught.message : "Connection failed"); }
+    finally { setConnectingInstance(false); }
   };
 
   const autoSelectFirstFile = useCallback(async () => {
     try {
-      const treeData = await apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree`).catch(() => []);
-      const diffData = await apiFetch<{ diff: string }>(`/projects/${projectId}/workspace/diff`).catch(() => ({ diff: "" }));
+      const treeData = await apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree`);
+      const runQuery = selectedRunIdRef.current ? `?run_id=${encodeURIComponent(selectedRunIdRef.current)}` : "";
+      const diffData = await apiFetch<{ diff: string }>(`/projects/${projectId}/workspace/diff${runQuery}`);
       setEntries(treeData);
       setDiffContent(diffData.diff);
       const fileEntries = treeData.filter((e) => e.type === "file");
@@ -275,206 +259,72 @@ export default function ProjectWorkspace() {
         setRightPanelTab("code");
         void openFile(target.path);
       }
-    } catch {
-      // ignore
-    }
-  }, [projectId]);
+    } catch (caught) { setWorkspaceError(caught instanceof Error ? caught.message : "Could not refresh workspace"); }
+  }, [projectId, openFile]);
 
-  // Shared helper — wires SSE events to structured steps, heartbeat, tokens
-  const handleRunEvent = (runEvent: ToolEvent, responseRef: { current: string }, setResponse: (r: string) => void) => {
-    lastEventAt.current = Date.now();
-    setIsStuck(false);
-    setIsThinking(true);
-    if (runEvent.event_type === "message.delta") {
-      responseRef.current += String(runEvent.payload.text || "");
-      setResponse(responseRef.current);
-      setIsThinking(false);
-    }
-    if (runEvent.event_type === "tool.started") {
-      const tool = String(runEvent.payload.tool);
-      if (tool !== "emit_thinking" && tool !== "thinking") {
-        setCurrentTool(tool);
-        setIsThinking(false);
-        setSteps(prev => [...prev, { tool, label: tool.replace(/_/g, " "), status: "running", startedAt: Date.now() }]);
-      }
-    }
-    if (runEvent.event_type === "tool.completed") {
-      const tool = String(runEvent.payload.tool);
-      const raw = String(runEvent.payload.result || "").slice(0, 80).replace(/\n/g, " ");
-      setCurrentTool(null);
-      setIsThinking(true);
-      setSteps(prev => {
-        const idx = [...prev].reverse().findIndex(s => s.tool === tool && s.status === "running");
-        if (idx === -1) return prev;
-        const realIdx = prev.length - 1 - idx;
-        const next = [...prev];
-        const elapsedSec = Math.max(0.1, (Date.now() - next[realIdx].startedAt) / 1000);
-        next[realIdx] = { ...next[realIdx], status: "done", result: raw, elapsed: elapsedSec };
-        return next;
+  useEffect(() => {
+    if (!activeRunId || !runStatus || runStatus.startsWith("awaiting_")) return;
+    streamAbortRef.current?.abort();
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    void followRun(activeRunId, (runEvent) => {
+      receiveRunEvent(runEvent);
+      if (runEvent.event_type === "final_report") void autoSelectFirstFile();
+    }, { after: streamCursorRef.current, signal: controller.signal, onConnectionState: setConnection })
+      .then((run) => {
+        setRun(run);
+        setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+      })
+      .catch((caught) => {
+        if (!controller.signal.aborted) setRunError(caught instanceof Error ? caught.message : "Agent stream failed");
       });
-    }
-    if (runEvent.event_type === "usage") {
-      const inp = Number(runEvent.payload.input_tokens || 0);
-      setTokenInputs(inp);
-      setUsage(`${inp} input · ${runEvent.payload.output_tokens || 0} output tokens · $${Number(runEvent.payload.cost_usd || 0).toFixed(4)}`);
-    }
-    if (runEvent.event_type === "approval.required") {
-      setIsThinking(false);
-      setCurrentTool(null);
-      setPending({ id: String(runEvent.payload.action_id), tool: String(runEvent.payload.tool), risk_class: String(runEvent.payload.risk_class), preview: runEvent.payload.preview as Record<string, unknown> });
-    }
-    if (runEvent.event_type === "thinking") {
-      setThinkingText(String(runEvent.payload.message || ""));
-    }
-    if (runEvent.event_type === "question") {
-      setIsThinking(false);
-      setCurrentTool(null);
-      setAgentQuestion({ question: String(runEvent.payload.question || ""), options: (runEvent.payload.options as string[]) || [] });
-    }
-    if (runEvent.event_type === "final_report") {
-      setFinalReportSeen(true);
-      setFinalReport({
-        outcome: String(runEvent.payload.outcome || "SUCCESS") as "SUCCESS" | "PARTIAL" | "FAILED",
-        done: (runEvent.payload.done as string[]) || [],
-        verification: String(runEvent.payload.verification || ""),
-        errors: String(runEvent.payload.errors || ""),
-        pending_approvals: String(runEvent.payload.pending_approvals || ""),
-      });
-      void autoSelectFirstFile();
-    }
-    // ── A2A Supervisor events ────────────────────────────────────────────────
-    if (runEvent.event_type === "supervisor.plan") {
-      const graph = runEvent.payload.task_graph as typeof supervisorTaskGraph;
-      setSupervisorTaskGraph(graph);
-      setActiveTaskId(String(runEvent.payload.active_task_id || ""));
-    }
-    if (runEvent.event_type === "task.started") {
-      setActiveTaskId(String(runEvent.payload.task_id || ""));
-      setRecoveringTaskId(null);
-      // Update status in local graph copy
-      setSupervisorTaskGraph(prev => prev ? prev.map(t =>
-        t.task_id === runEvent.payload.task_id ? { ...t, status: "in_progress" } : t
-      ) : prev);
-    }
-    if (runEvent.event_type === "task.recovering") {
-      setRecoveringTaskId(String(runEvent.payload.task_id || ""));
-      setIsStuck(false); // clear the generic stuck indicator
-      setSupervisorTaskGraph(prev => prev ? prev.map(t =>
-        t.task_id === runEvent.payload.task_id
-          ? { ...t, status: "pending", retry_count: Number(runEvent.payload.attempt || 0) }
-          : t
-      ) : prev);
-    }
-    if (runEvent.event_type === "task.failed") {
-      setSupervisorTaskGraph(prev => prev ? prev.map(t =>
-        t.task_id === runEvent.payload.task_id ? { ...t, status: "failed" } : t
-      ) : prev);
-    }
-    if (runEvent.event_type === "supervisor.complete") {
-      const graph = runEvent.payload.task_graph as typeof supervisorTaskGraph;
-      setSupervisorTaskGraph(graph);
-      setActiveTaskId(null);
-      setRecoveringTaskId(null);
-    }
-  };
+    return () => controller.abort();
+  }, [activeRunId, autoSelectFirstFile, receiveRunEvent, runStatus, setConnection, setRun, setRunError, streamAttempt]);
 
   const send = async (event: FormEvent) => {
     event.preventDefault();
-    const text = message.trim(); if (!text || pending) return;
-    setMessage(""); setError(""); setLoading(true); setSteps([]); setUsage(""); setTokenInputs(0);
-    setCurrentTool(null); setIsThinking(true);
-    setSupervisorTaskGraph(null); setActiveTaskId(null); setRecoveringTaskId(null); setFinalReportSeen(false);
-    setChat((current) => [...current, { role: "user", content: text }]);
-    const responseRef = { current: "" };
+    const text = message.trim(); if (!text || pending || activeRunId) return;
+    setMessage(""); setPageError(""); setSubmittingRun(true);
     try {
-      const run = await apiFetch<AgentRun>(`/projects/${projectId}/runs`, { 
-        method: "POST", 
-        body: JSON.stringify({ 
-          message: text,
-          planner_model: plannerModel,
-          fallback_model: fallbackModel
-        }) 
+      const run = await apiFetch<AgentRun>(`/projects/${projectId}/runs`, {
+        method: "POST",
+        body: JSON.stringify({ message: text })
       });
-      setActiveRunId(run.id);
-      const finished = await followRun(run.id, (runEvent) => {
-        handleRunEvent(runEvent, responseRef, (r) => setChat((cur) => {
-          const last = cur[cur.length - 1];
-          if (last?.role === "agent") return [...cur.slice(0, -1), { role: "agent", content: r }];
-          return [...cur, { role: "agent", content: r }];
-        }));
-      });
-      if (finished.status === "failed") throw new Error(`${finished.error_message || "Agent run failed"} · Support ${finished.support_id}`);
+      setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      hydrateRun(run, []);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Agent request failed");
-      setChat((current) => {
-        if (current.length > 0 && current[current.length - 1].role === "agent" && !current[current.length - 1].content) {
-          return current.slice(0, -1);
-        }
-        return current;
-      });
-    }
-    finally { setLoading(false); setActiveRunId(null); setIsThinking(false); setCurrentTool(null); void autoSelectFirstFile(); }
+      setPageError(caught instanceof Error ? caught.message : "Agent request failed");
+    } finally { setSubmittingRun(false); }
   };
 
   const decide = async (decision: "approve" | "reject") => {
     if (!pending) return;
-    const action = pending; setPending(null); setDeciding(true); setError("");
-    setChat((current) => [...current, { role: "agent", content: "" }]);
-    setCurrentTool(null); setIsThinking(true); setLoading(true);
-    const responseRef = { current: "" };
+    const action = pending; setDeciding(true); setPageError("");
     try {
       const run = await apiFetch<AgentRun>(`/actions/${action.id}/decision`, { method: "POST", body: JSON.stringify({ decision }) });
-      const finished = await followRun(run.id, (runEvent) => {
-        handleRunEvent(runEvent, responseRef, (r) => setChat((cur) => [...cur.slice(0, -1), { role: "agent", content: r }]));
-        setChat((current) => [...current.slice(0, -1), { role: "agent", content: responseRef.current }]);
-      });
-      if (finished.status === "failed") throw new Error(`${finished.error_message || "Action failed"} · Support ${finished.support_id}`);
+      setRun(run);
+      setRuns((current) => current.map((item) => item.id === run.id ? run : item));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Decision failed");
-      try {
-        const freshPending = await apiFetch<PendingRecord | null>(`/projects/${projectId}/actions/pending`);
-        setPending(freshPending ? { id: freshPending.id, tool: freshPending.tool_name, preview: freshPending.preview, risk_class: freshPending.risk_class } : null);
-      } catch {
-        // ignore
-      }
-    }
-    finally { setDeciding(false); setLoading(false); setIsThinking(false); setCurrentTool(null); void autoSelectFirstFile(); }
+      setPageError(caught instanceof Error ? caught.message : "Decision failed");
+    } finally { setDeciding(false); }
   };
 
   const submitAnswer = async () => {
     if (!questionAnswer.trim() || submittingAnswer) return;
     const answer = questionAnswer.trim();
-    setAgentQuestion(null);
-    setQuestionAnswer("");
-    setSubmittingAnswer(true);
-    setLoading(true);
-    setIsThinking(true);
-    setChat((current) => [...current, { role: "agent", content: "" }]);
-    const responseRef = { current: "" };
+    setSubmittingAnswer(true); setPageError("");
     try {
-      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001"}/projects/${projectId}/actions/answer`, {
+      if (!agentQuestion?.run_id) throw new Error("No active run is waiting for an answer");
+      const run = await apiFetch<AgentRun>(`/runs/${agentQuestion.run_id}/question`, {
         method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", "X-CSRF-Token": document.cookie.match(/csrf_token=([^;]+)/)?.[1] ?? "" },
         body: JSON.stringify({ answer }),
       });
-      if (!response.ok) throw new Error("Failed to submit answer");
-      const reader = response.body?.getReader();
-      const decoder = new TextDecoder();
-      while (reader) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        responseRef.current += decoder.decode(value, { stream: true });
-        setChat((cur) => [...cur.slice(0, -1), { role: "agent", content: responseRef.current }]);
-      }
+      setQuestionAnswer("");
+      setRun(run);
+      setRuns((current) => current.map((item) => item.id === run.id ? run : item));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Failed to submit answer");
-    } finally {
-      setSubmittingAnswer(false);
-      setLoading(false);
-      setIsThinking(false);
-      setCurrentTool(null);
-    }
+      setPageError(caught instanceof Error ? caught.message : "Failed to submit answer");
+    } finally { setSubmittingAnswer(false); }
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -485,51 +335,43 @@ export default function ProjectWorkspace() {
   };
 
   const handleDeleteRun = async (runId: string) => {
+    if (runId === activeRunId) return;
     try {
       await deleteRun(runId);
       setRuns((prev) => prev.filter((r) => r.id !== runId));
+      if (runState.selectedRunId === runId) clearRun();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Failed to delete run");
+      setPageError(caught instanceof Error ? caught.message : "Failed to delete run");
     }
   };
 
-  const handleClearAllHistory = async () => {
-    if (!window.confirm("Are you sure you want to clear all chat history and past runs for this project?")) return;
+  const handleRetryRun = async (runId?: string) => {
+    const targetId = runId || runState.run?.id;
+    if (!targetId) return;
+    setPageError("");
     try {
-      await apiFetch(`/projects/${projectId}/chat`, { method: "DELETE" });
-      setChat([]);
-      setSteps([]);
-      setRuns([]);
-      setFinalReport(null);
-      setThinkingText(null);
-      setPending(null);
+      const newRun = await apiFetch<AgentRun>(`/runs/${targetId}/retry`, { method: "POST" });
+      setRun(newRun);
+      setRuns((prev) => [newRun, ...prev.filter((r) => r.id !== newRun.id)]);
+      setStreamAttempt((v) => v + 1);
+    } catch (err) {
+      setPageError(err instanceof Error ? err.message : "Failed to retry run");
+    }
+  };
+
+  const openRun = async (run: AgentRun) => {
+    if (activeRunId && run.id !== activeRunId) return;
+    try {
+      const events = await apiFetch<ToolEvent[]>(`/runs/${run.id}/events`);
+      hydrateRun(run, events);
       setShowHistoryModal(false);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Failed to clear chat history");
-    }
+    } catch (caught) { setPageError(caught instanceof Error ? caught.message : "Failed to open run"); }
   };
 
-  const startNewChat = async () => {
-    if (loading || deciding) return;
-    try {
-      await apiFetch(`/projects/${projectId}/chat`, { method: "DELETE" });
-      setChat([]);
-      setSteps([]);
-      setUsage("");
-      setTokenInputs(0);
-      setPending(null);
-      setError("");
-      setCurrentTool(null);
-      setIsThinking(false);
-      setIsStuck(false);
-      setActiveRunId(null);
-      setAgentQuestion(null);
-      setQuestionAnswer("");
-      setFinalReport(null);
-      setThinkingText(null);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Failed to reset chat");
-    }
+  const startNewChat = () => {
+    if (activeRunId || deciding) return;
+    clearRun();
+    setMessage(""); setQuestionAnswer(""); setPageError("");
   };
 
   const handleStopRun = async () => {
@@ -537,7 +379,7 @@ export default function ProjectWorkspace() {
     try {
       await apiFetch(`/runs/${activeRunId}/cancel`, { method: "POST" });
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Failed to stop run");
+      setPageError(caught instanceof Error ? caught.message : "Failed to stop run");
     }
   };
 
@@ -598,29 +440,16 @@ export default function ProjectWorkspace() {
   );
 
   return (
-    <div className={`flex h-screen overflow-hidden ${isResizingRight ? "select-none" : ""}`}>
+    <div className={`flex h-[100dvh] overflow-hidden ${isResizingRight ? "select-none" : ""}`}>
       {/* Collapsible Left Sub-Sidebar */}
+      {showLeftSidebar && <button className="fixed inset-0 z-20 bg-black/60 xl:hidden" onClick={toggleLeftSidebar} aria-label="Close project navigation overlay" />}
       {showLeftSidebar && (
-        <aside className="w-64 shrink-0 border-r p-5 dark:border-white/10">
+        <aside className="fixed inset-y-0 left-0 z-30 w-64 shrink-0 border-r bg-black p-5 dark:border-white/10 xl:static">
           <h1 className="text-xl font-bold truncate">{project.name}</h1>
           <div className="mt-4 rounded-xl border p-3.5 dark:border-white/10">
             <Database className="mb-1.5 h-4 w-4 text-blue-600" />
             <p className="truncate text-xs font-mono">{instances[0].url}</p>
             <p className="mt-1 text-[10px] uppercase font-semibold text-gray-500">{instances[0].environment} · {instances[0].status}</p>
-          </div>
-          <div className="mt-4 rounded-xl border p-3.5 dark:border-white/10">
-            <label className="block text-[10px] font-semibold uppercase text-gray-500 mb-1">A2A Planner Model</label>
-            <select value={plannerModel} onChange={(e) => setPlannerModel(e.target.value)} className="w-full rounded-lg border px-2 py-1.5 text-xs dark:bg-black dark:border-white/10 focus:ring-1 focus:ring-blue-500 transition">
-              <option value="gpt-4o">gpt-4o</option>
-              <option value="gpt-4o-mini">gpt-4o-mini</option>
-              <option value="o1-mini">o1-mini</option>
-              <option value="o1-preview">o1-preview</option>
-            </select>
-            <label className="block text-[10px] font-semibold uppercase text-gray-500 mt-3 mb-1">Fallback Model</label>
-            <select value={fallbackModel} onChange={(e) => setFallbackModel(e.target.value)} className="w-full rounded-lg border px-2 py-1.5 text-xs dark:bg-black dark:border-white/10 focus:ring-1 focus:ring-blue-500 transition">
-              <option value="gpt-4o-mini">gpt-4o-mini</option>
-              <option value="gpt-4o">gpt-4o</option>
-            </select>
           </div>
           <Link href={`/projects/${projectId}/workspace`} className="mt-4 block rounded-xl border p-2.5 text-xs hover:bg-black/5 dark:border-white/10">
             Workspace & lifecycle
@@ -640,6 +469,7 @@ export default function ProjectWorkspace() {
               onClick={toggleLeftSidebar}
               className="rounded-md border border-white/10 bg-white/5 p-1.5 text-gray-400 hover:bg-white/10 hover:text-white"
               title="Toggle Project Sub-Sidebar"
+              aria-label="Toggle project navigation"
             >
               {showLeftSidebar ? <PanelLeftClose className="h-3.5 w-3.5" /> : <PanelLeftOpen className="h-3.5 w-3.5" />}
             </button>
@@ -649,7 +479,7 @@ export default function ProjectWorkspace() {
             <span className="text-xs font-semibold text-white">ERP Implementation Agent</span>
             <button
               onClick={() => void startNewChat()}
-              disabled={loading || deciding}
+              disabled={Boolean(activeRunId) || loading || deciding}
               className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] font-medium text-gray-400 transition hover:bg-white/10 hover:text-white active:scale-95 disabled:opacity-40"
             >
               <Plus className="h-3 w-3" />
@@ -664,28 +494,10 @@ export default function ProjectWorkspace() {
             </button>
           </div>
           <div className="flex items-center gap-4">
-            {/* Context window bar — always visible after first token usage */}
-            {tokenInputs > 0 && (() => {
-              const pct = Math.min((tokenInputs / 128_000) * 100, 100);
-              const barColor = pct > 90 ? "bg-red-500" : pct > 70 ? "bg-amber-400" : "bg-blue-500";
-              return (
-                <div className="flex items-center gap-2">
-                  <div className="h-1 w-28 overflow-hidden rounded-full bg-white/10">
-                    <div
-                      className={`h-full rounded-full transition-all duration-500 ${barColor}`}
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                  <span className="font-mono text-[10px] text-gray-500">
-                    {(tokenInputs / 1000).toFixed(0)}k
-                    <span className="text-gray-600"> / 128k ctx</span>
-                  </span>
-                </div>
-              );
-            })()}
+            {tokenInputs > 0 && <span className="font-mono text-[10px] text-gray-500">{tokenInputs.toLocaleString()} input tokens</span>}
             {activeRunId && (
               <button
-                onClick={() => void apiFetch(`/runs/${activeRunId}/cancel`, { method: "POST" })}
+                onClick={() => void handleStopRun()}
                 className="text-xs text-red-400 hover:text-red-300"
               >
                 Cancel
@@ -708,7 +520,7 @@ export default function ProjectWorkspace() {
 
         {/* Persistent sticky agent status bar — always visible when agent is working */}
         <AnimatePresence>
-          {(loading || deciding) && (
+          {(runWorking || deciding) && (
             <motion.div
               initial={{ opacity: 0, height: 0 }}
               animate={{ opacity: 1, height: "auto" }}
@@ -716,16 +528,23 @@ export default function ProjectWorkspace() {
               transition={{ duration: 0.18 }}
               className="border-b border-blue-100 bg-blue-50/80 px-5 py-2 backdrop-blur-sm dark:border-blue-900/30 dark:bg-blue-950/30"
             >
-              <AgentStatus currentAction={currentTool} isThinking={isThinking} tokenInputs={tokenInputs} isStuck={isStuck} />
+              <AgentStatus currentAction={currentTool} isThinking={isThinking} phase={phase} tokenInputs={tokenInputs} />
             </motion.div>
           )}
         </AnimatePresence>
 
+        {activeRunId && runState.connection !== "connected" && (
+          <div className="border-b border-white/10 bg-zinc-950 px-5 py-2 text-xs text-gray-300" aria-live="polite">
+            {runState.connection === "retrying" && "Connection lost — retrying…"}
+            {runState.connection === "connecting" && "Connecting to agent…"}
+            {runState.connection === "paused" && (agentQuestion ? "Waiting for your answer." : pending ? "Waiting for approval." : "Run paused.")}
+            {runState.connection === "disconnected" && <span>Connection could not be restored. <button className="ml-2 font-semibold text-blue-400 underline" onClick={() => setStreamAttempt((value) => value + 1)}>Retry</button></span>}
+          </div>
+        )}
+
         <div className="flex-1 space-y-4 overflow-y-auto p-6">
           <AnimatePresence initial={false}>
-            {chat
-              .filter((m) => m.role !== "agent" || visibleContent(m.content).trim())
-              .map((item, index, arr) => {
+            {chat.filter((item: ChatMessage) => item.role !== "agent" || item.content.trim()).map((item: ChatMessage, index: number, arr: ChatMessage[]) => {
               const isCurrentStreaming = loading && index === arr.length - 1 && item.role === "agent";
               const prevRole = index > 0 ? arr[index - 1].role : null;
               const isFirstInGroup = item.role !== prevRole;
@@ -748,7 +567,7 @@ export default function ProjectWorkspace() {
                       {/* Message content — flat, no bubble */}
                       <div className="min-w-0 flex-1 pb-1">
                         <MessageContent
-                          content={visibleContent(item.content)}
+                          content={item.content}
                           projectId={projectId}
                           isStreaming={isCurrentStreaming}
                         />
@@ -757,7 +576,7 @@ export default function ProjectWorkspace() {
                   ) : (
                     <div className="max-w-[75%] rounded-2xl bg-blue-600 px-4 py-3 text-sm text-white shadow-xs">
                       <MessageContent
-                        content={visibleContent(item.content)}
+                        content={item.content}
                         projectId={projectId}
                         isStreaming={false}
                       />
@@ -776,34 +595,9 @@ export default function ProjectWorkspace() {
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.96, y: 4 }}
                 transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-                className="max-w-2xl rounded-2xl border border-amber-400/80 bg-amber-50/90 p-5 text-sm shadow-sm backdrop-blur-md dark:border-amber-500/30 dark:bg-amber-950/30"
+                className="max-w-2xl"
               >
-                <div className="flex items-center gap-2 font-semibold text-amber-800 dark:text-amber-300">
-                  <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-                  <span>Class {pending.risk_class} action — approval required</span>
-                </div>
-                <p className="mt-2 font-mono text-xs text-amber-900/80 dark:text-amber-200/80">
-                  {pending.tool}
-                </p>
-                <pre className="mt-3 max-h-72 overflow-auto rounded-xl bg-black/5 p-3 font-mono text-xs text-gray-800 dark:bg-black/40 dark:text-gray-200">
-                  {JSON.stringify(pending.preview, null, 2)}
-                </pre>
-                <div className="mt-4 flex gap-2.5">
-                  <button
-                    disabled={deciding}
-                    onClick={() => void decide("approve")}
-                    className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-xs transition-transform active:scale-95 disabled:opacity-50"
-                  >
-                    {deciding ? "Approving…" : "Approve"}
-                  </button>
-                  <button
-                    disabled={deciding}
-                    onClick={() => void decide("reject")}
-                    className="rounded-xl bg-gray-200 px-4 py-2 text-xs font-semibold text-gray-800 transition-transform hover:bg-gray-300 active:scale-95 disabled:opacity-50 dark:bg-white/10 dark:text-gray-200 dark:hover:bg-white/20"
-                  >
-                    Reject
-                  </button>
-                </div>
+                <ApprovalCard action={pending} busy={deciding} onDecision={(decision) => void decide(decision)} />
               </motion.div>
             )}
           </AnimatePresence>
@@ -825,7 +619,7 @@ export default function ProjectWorkspace() {
                 <p className="mt-2.5 text-sm text-blue-900/90 dark:text-blue-100/90">{agentQuestion.question}</p>
                 {agentQuestion.options.length > 0 && (
                   <div className="mt-3 flex flex-wrap gap-2">
-                    {agentQuestion.options.map((opt, i) => (
+                    {agentQuestion.options.map((opt: string, i: number) => (
                       <button
                         key={i}
                         onClick={() => setQuestionAnswer(opt)}
@@ -846,9 +640,10 @@ export default function ProjectWorkspace() {
                 <button
                   disabled={!questionAnswer.trim() || submittingAnswer}
                   onClick={() => void submitAnswer()}
-                  className="mt-3 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-transform active:scale-95 disabled:opacity-50"
+                  className="mt-3 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition hover:bg-blue-500 active:scale-95 disabled:opacity-40"
                 >
-                  {submittingAnswer ? "Sending…" : "Submit Answer"}
+                  {submittingAnswer && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Submit Answer
                 </button>
               </motion.div>
             )}
@@ -869,6 +664,12 @@ export default function ProjectWorkspace() {
           </AnimatePresence>
 
           {/* Final Report Card (Protocol 4 — pinned, non-collapsible) */}
+          {runStatus === "cancelled" && (
+            <div className="max-w-2xl rounded-2xl border border-gray-600/40 bg-gray-900/40 p-4 text-sm text-gray-300" role="status">
+              <div className="font-semibold">Run cancelled</div>
+              <p className="mt-1 text-xs text-gray-500">Completed task evidence and the partial transcript are preserved.</p>
+            </div>
+          )}
           {finalReport && (
             <div className={`max-w-2xl rounded-2xl border p-5 text-sm backdrop-blur-md ${
               finalReport.outcome === "SUCCESS" ? "border-emerald-500/40 bg-emerald-950/20" :
@@ -886,7 +687,7 @@ export default function ProjectWorkspace() {
                 <span className="font-semibold text-gray-200">Final Report</span>
               </div>
               <ul className="mt-3 space-y-1">
-                {finalReport.done.map((item, i) => (
+                {finalReport.done.map((item: string, i: number) => (
                   <li key={i} className="flex items-start gap-2 text-xs text-gray-300">
                     <span className="mt-0.5 text-emerald-400">✓</span>
                     {item}
@@ -908,10 +709,10 @@ export default function ProjectWorkspace() {
           <ActivityStepper
             steps={steps}
             usage={usage}
-            isStuck={isStuck}
             supervisorTaskGraph={supervisorTaskGraph}
             activeTaskId={activeTaskId}
             recoveringTaskId={recoveringTaskId}
+            planItems={runState.planItems}
             onOpenDiff={() => {
               setShowRightPanel(true);
               setRightPanelTab("diff");
@@ -923,21 +724,59 @@ export default function ProjectWorkspace() {
             }}
           />
 
-          {/* Error Banner */}
+          {/* Diagnostic Error / Failure Card */}
           <AnimatePresence>
-            {error && (
+            {(error || phase === "failed" || phase === "interrupted") && (
               <motion.div
                 initial={{ opacity: 0, scale: 0.98, y: 4 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.98, y: -4 }}
                 transition={{ duration: 0.18 }}
                 className="max-w-2xl rounded-2xl border border-red-200 bg-red-50/90 p-4 text-sm shadow-sm dark:border-red-900/50 dark:bg-red-950/30"
+                role="alert"
               >
-                <div className="flex items-center gap-2 font-semibold text-red-700 dark:text-red-400">
-                  <AlertTriangle className="h-4 w-4" />
-                  <span>Agent Error</span>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 font-semibold text-red-700 dark:text-red-400">
+                    <AlertTriangle className="h-4 w-4 shrink-0" />
+                    <span>{phase === "interrupted" ? "Agent Interrupted" : "Agent Error"}</span>
+                    {runState.run?.error_category && (
+                      <span className="rounded-md border border-red-300 bg-red-100 px-2 py-0.5 font-mono text-[10px] text-red-800 dark:border-red-800/60 dark:bg-red-900/50 dark:text-red-300">
+                        {runState.run.error_category}
+                      </span>
+                    )}
+                  </div>
+                  {runState.run?.id && (
+                    <button
+                      type="button"
+                      onClick={() => void handleRetryRun()}
+                      className="flex items-center gap-1.5 rounded-lg border border-red-300 bg-white/80 px-2.5 py-1 text-xs font-semibold text-red-700 shadow-sm transition hover:bg-white active:scale-95 dark:border-red-700/60 dark:bg-red-900/40 dark:text-red-200 dark:hover:bg-red-900/70"
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      Retry Run
+                    </button>
+                  )}
                 </div>
-                <p className="mt-1.5 font-medium text-red-600 dark:text-red-300">{error}</p>
+                <p className="mt-1.5 font-medium text-red-600 dark:text-red-300">{error || runState.run?.error_message || "Agent run encountered a failure."}</p>
+                {(runState.run?.support_id || runState.run?.planner_model || activeTaskId) && (
+                  <div className="mt-2.5 border-t border-red-200/60 pt-2 text-[11px] text-red-700/80 dark:border-red-800/40 dark:text-red-400">
+                    <button
+                      type="button"
+                      onClick={() => setDiagnosticExpanded((v) => !v)}
+                      className="flex items-center gap-1 font-mono hover:underline"
+                    >
+                      {diagnosticExpanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                      Diagnostics details
+                    </button>
+                    {diagnosticExpanded && (
+                      <div className="mt-1.5 space-y-1 font-mono text-[10px]">
+                        {runState.run?.support_id && <div>Support ID: {runState.run.support_id}</div>}
+                        {activeTaskId && <div>Task ID: {activeTaskId}</div>}
+                        {runState.run?.planner_model && <div>Model: {runState.run.planner_model}</div>}
+                        {runState.run?.workspace_base_revision && <div>Base Revision: {runState.run.workspace_base_revision}</div>}
+                      </div>
+                    )}
+                  </div>
+                )}
               </motion.div>
             )}
           </AnimatePresence>
@@ -951,24 +790,26 @@ export default function ProjectWorkspace() {
               value={message}
               onChange={(e) => setMessage(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={loading || Boolean(pending)}
-              placeholder={pending ? "Resolve the pending action first" : loading ? "Agent is working…" : "Ask the agent… (⌘↵ to send)"}
+              disabled={!isInteractive || loading || Boolean(pending)}
+              placeholder={pending ? "Resolve the pending action first" : runWorking ? "Agent is working…" : "Ask the agent… (⌘↵ to send)"}
               className="w-full resize-none overflow-hidden rounded-2xl border border-white/10 bg-zinc-800 px-5 py-3 pr-12 text-sm text-white placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500/60"
               style={{ fieldSizing: "content", maxHeight: "9rem" } as React.CSSProperties}
             />
-            {loading && activeRunId ? (
+            {canStop ? (
               <button
                 type="button"
                 onClick={() => void handleStopRun()}
                 className="absolute bottom-2 right-2 rounded-xl bg-red-600/20 p-2 text-red-400 transition-transform hover:bg-red-600/40 hover:text-red-300 active:scale-95"
                 title="Stop generation"
+                aria-label="Stop generation"
               >
                 <Square className="h-4 w-4 fill-current" />
               </button>
             ) : (
               <button
                 type="submit"
-                disabled={loading || !message.trim() || Boolean(pending)}
+                aria-label="Send"
+                disabled={!isInteractive || loading || !message.trim() || Boolean(pending)}
                 className="absolute bottom-2 right-2 rounded-xl bg-blue-600 p-2 text-white transition-transform hover:bg-blue-500 active:scale-95 disabled:opacity-30"
               >
                 <Send className="h-4 w-4" />
@@ -984,8 +825,20 @@ export default function ProjectWorkspace() {
         <>
           {/* Draggable Resizer Handle Bar */}
           <div
-            onMouseDown={() => setIsResizingRight(true)}
-            className={`group relative z-20 w-1.5 cursor-col-resize hover:bg-blue-500/60 active:bg-blue-600 transition-colors ${
+            onPointerDown={() => setIsResizingRight(true)}
+            onKeyDown={(event) => {
+              if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+              event.preventDefault();
+              setRightPanelWidth((width) => Math.min(window.innerWidth * 0.75, Math.max(320, width + (event.key === "ArrowLeft" ? 20 : -20))));
+            }}
+            role="separator"
+            aria-label="Resize workspace panel"
+            aria-orientation="vertical"
+            aria-valuemin={320}
+            aria-valuemax={Math.round(typeof window === "undefined" ? 1200 : window.innerWidth * 0.75)}
+            aria-valuenow={Math.round(rightPanelWidth)}
+            tabIndex={0}
+            className={`group relative z-20 hidden w-1.5 cursor-col-resize hover:bg-blue-500/60 active:bg-blue-600 xl:block ${
               isResizingRight ? "bg-blue-600" : "bg-white/5"
             }`}
             title="Drag to resize IDE panel width"
@@ -994,8 +847,8 @@ export default function ProjectWorkspace() {
           </div>
 
           <aside
-            style={{ width: `${rightPanelWidth}px` }}
-            className="flex shrink-0 flex-col border-l border-white/10 bg-zinc-900 transition-none"
+            style={{ "--ide-width": `${rightPanelWidth}px` } as React.CSSProperties}
+            className="fixed inset-0 z-40 flex w-full shrink-0 flex-col border-l border-white/10 bg-zinc-900 xl:static xl:z-auto xl:w-[var(--ide-width)]"
           >
           {/* Tabs Navigation Header */}
           <div className="flex items-center justify-between border-b border-white/10 bg-zinc-950 px-2 py-1.5">
@@ -1037,7 +890,10 @@ export default function ProjectWorkspace() {
                 Artifacts
               </button>
             </div>
+            <button type="button" onClick={() => setShowRightPanel(false)} className="rounded p-1 text-gray-400 hover:bg-white/10 hover:text-white xl:hidden" aria-label="Close workspace panel"><PanelRightClose className="h-4 w-4" /></button>
           </div>
+
+          {workspaceError && <div className="flex items-center justify-between border-b border-red-500/20 bg-red-950/30 px-3 py-2 text-xs text-red-300" role="alert"><span>{workspaceError}</span><button onClick={() => void loadWorkspaceDetails()} className="font-semibold underline">Retry</button></div>}
 
           {/* Tab Contents */}
           <div className="flex-1 overflow-hidden">
@@ -1046,28 +902,7 @@ export default function ProjectWorkspace() {
                 {/* File Tree */}
                 <div className="border-r border-white/10 bg-zinc-950 p-2 overflow-y-auto">
                   <div className="mb-2 text-[10px] font-semibold uppercase text-gray-500">Workspace Files</div>
-                  <ul className="space-y-0.5 text-xs font-mono">
-                    {entries.map((entry) => (
-                      <li key={entry.path}>
-                        <button
-                          disabled={entry.type !== "file"}
-                          onClick={() => void openFile(entry.path)}
-                          className={`flex w-full items-center gap-1.5 truncate rounded px-2 py-1 text-left transition ${
-                            selectedFile === entry.path
-                              ? "bg-purple-600/30 text-purple-300 font-semibold"
-                              : "text-gray-400 hover:bg-white/5 hover:text-gray-200"
-                          } disabled:text-gray-600`}
-                        >
-                          {entry.type === "directory" ? (
-                            <Folder className="h-3 w-3 shrink-0 text-amber-500/80" />
-                          ) : (
-                            <FileText className="h-3 w-3 shrink-0 text-blue-400/80" />
-                          )}
-                          <span className="truncate">{entry.path}</span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
+                  <WorkspaceFileTree projectId={projectId} entries={entries} selected={selectedFile} onOpen={(path) => void openFile(path)} onError={setWorkspaceError} />
                 </div>
                 {/* Code Viewer */}
                 <div className="flex-1 overflow-hidden">
@@ -1134,89 +969,7 @@ export default function ProjectWorkspace() {
         </>
       )}
 
-      {/* Chat History & Past Runs Modal Drawer */}
-      <AnimatePresence>
-        {showHistoryModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4">
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 10 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              className="w-full max-w-2xl rounded-2xl border border-white/10 bg-zinc-950 p-6 shadow-2xl space-y-4 max-h-[85vh] flex flex-col"
-            >
-              <div className="flex items-center justify-between border-b border-white/10 pb-4">
-                <div className="flex items-center gap-2.5">
-                  <History className="h-5 w-5 text-purple-400" />
-                  <h2 className="text-lg font-bold text-white">Chat History & Past Runs</h2>
-                </div>
-                <div className="flex items-center gap-2">
-                  {runs.length > 0 && (
-                    <button
-                      onClick={() => void handleClearAllHistory()}
-                      className="flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-950/30 px-3 py-1.5 text-xs font-semibold text-red-300 hover:bg-red-900/50 transition active:scale-95"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" /> Clear All History
-                    </button>
-                  )}
-                  <button
-                    onClick={() => setShowHistoryModal(false)}
-                    className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-gray-400 hover:bg-white/10 hover:text-white transition"
-                  >
-                    Close
-                  </button>
-                </div>
-              </div>
-
-              <div className="flex-1 overflow-y-auto space-y-3 pr-1">
-                {runs.length === 0 ? (
-                  <div className="p-8 text-center text-xs text-gray-500">No past runs recorded for this project yet.</div>
-                ) : (
-                  runs.map((runItem) => (
-                    <div
-                      key={runItem.id}
-                      className="flex items-start justify-between gap-4 rounded-xl border border-white/5 bg-zinc-900/80 p-4 transition hover:border-white/20"
-                    >
-                      <div className="space-y-1.5 min-w-0 flex-1">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
-                            runItem.status === "succeeded" ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30" :
-                            runItem.status === "failed" ? "bg-red-500/20 text-red-300 border border-red-500/30" :
-                            "bg-gray-500/20 text-gray-400 border border-gray-500/30"
-                          }`}>
-                            {runItem.status}
-                          </span>
-                          <span className="text-[11px] font-mono text-gray-500">
-                            {new Date(runItem.created_at).toLocaleString()}
-                          </span>
-                          {runItem.cost_usd > 0 && (
-                            <span className="text-[10px] font-mono text-purple-300 bg-purple-500/10 px-1.5 py-0.5 rounded">
-                              ${Number(runItem.cost_usd).toFixed(4)}
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-xs text-gray-200 font-medium line-clamp-2 leading-relaxed">
-                          {runItem.prompt || "Agent task execution"}
-                        </p>
-                        {runItem.error_message && (
-                          <p className="text-[11px] text-red-400 font-mono line-clamp-1">{runItem.error_message}</p>
-                        )}
-                      </div>
-
-                      <button
-                        onClick={() => void handleDeleteRun(runItem.id)}
-                        className="rounded-lg p-2 text-gray-500 hover:bg-red-500/20 hover:text-red-400 transition"
-                        title="Delete this run"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    </div>
-                  ))
-                )}
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
+      <RunHistoryDialog open={showHistoryModal} runs={runs} activeRunId={activeRunId} selectedRunId={runState.selectedRunId} onOpenRun={(run) => void openRun(run)} onDeleteRun={(id) => void handleDeleteRun(id)} onClose={() => setShowHistoryModal(false)} />
     </div>
   );
 }

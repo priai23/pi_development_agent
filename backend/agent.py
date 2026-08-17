@@ -3,10 +3,15 @@ import json
 import socket
 import xmlrpc.client
 import httpx
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
 import hashlib
+import os
+import subprocess
+import sys
+import time
 
 from database import SessionLocal
 import models
@@ -19,6 +24,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
 from workspace import Workspace
+from model_conformance import validate_python_code, validate_manifest_content, validate_xml_views
 
 
 class _TimeoutMixin:
@@ -135,6 +141,184 @@ class PiERPClient:
 QUESTION_SENTINEL = "__QUESTION_PENDING__"
 
 
+def tool_outcome(tool_name: str, output: str) -> str:
+    """Classify structured checks without pretending every returned value passed."""
+    try:
+        result = json.loads(output)
+    except (TypeError, json.JSONDecodeError):
+        return "succeeded"
+    if not isinstance(result, dict):
+        return "succeeded"
+    if result.get("passed") is False or result.get("success") is False:
+        return "failed"
+    if isinstance(result.get("exit_code"), int) and result["exit_code"] != 0:
+        return "failed"
+    if str(result.get("status", "")).lower() in {"failed", "error"}:
+        return "failed"
+    return "succeeded"
+
+
+def tool_category(tool_name: str) -> str:
+    if any(part in tool_name for part in ("verify", "test", "lint", "typecheck", "compile", "build", "run_project_check")):
+        return "verify"
+    if any(part in tool_name for part in ("write", "patch", "replace", "create_directory")):
+        return "edit"
+    if any(part in tool_name for part in ("read", "view", "inspect", "list", "grep", "search")):
+        return "inspect"
+    return "run"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Uniform tool result envelope
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ToolResult:
+    """Canonical result envelope returned by every side-effecting tool.
+
+    * ok      – True only when the operation fully succeeded.
+    * error   – Structured failure info; None when ok=True.
+    * data    – Tool-specific output payload.
+    * evidence – Zero or more verifiable references [{kind, ref, digest, summary}].
+    * metrics – Timing and cost metrics.
+
+    A missing or malformed envelope is treated as ToolProtocolError (never success).
+    """
+    ok: bool
+    error: dict | None = None
+    data: dict | None = None
+    evidence: list[dict] = field(default_factory=list)
+    metrics: dict = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def success(cls, data: dict | None = None, evidence: list[dict] | None = None, **metrics) -> "ToolResult":
+        return cls(ok=True, data=data or {}, evidence=evidence or [], metrics=metrics)
+
+    @classmethod
+    def failure(cls, code: str, message: str, retryable: bool = False,
+                support_id: str | None = None, data: dict | None = None) -> "ToolResult":
+        return cls(
+            ok=False,
+            error={"code": code, "message": message, "retryable": retryable, "support_id": support_id},
+            data=data or {},
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> "ToolResult | None":
+        """Parse a JSON string into a ToolResult; return None if the envelope is absent or malformed."""
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict) and "ok" in obj:
+                return cls(
+                    ok=bool(obj["ok"]),
+                    error=obj.get("error"),
+                    data=obj.get("data") or {},
+                    evidence=obj.get("evidence") or [],
+                    metrics=obj.get("metrics") or {},
+                )
+        except (TypeError, json.JSONDecodeError, KeyError):
+            pass
+        return None
+
+
+class ToolProtocolError(RuntimeError):
+    """Raised when a tool returns a response that cannot be interpreted as a ToolResult."""
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Exactly-once side-effect receipts
+# ---------------------------------------------------------------------------
+
+def _operation_id(run_id: str, task_id: str, tool_call_id: str) -> str:
+    """Deterministic SHA-256 key for a specific tool invocation within a run."""
+    raw = f"{run_id}:{task_id}:{tool_call_id}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _args_digest(args: dict) -> str:
+    canonical = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def ensure_tool_execution(
+    operation_id: str,
+    run_id: str,
+    task_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    args: dict,
+    db,
+) -> tuple[bool, ToolResult | None]:
+    """Idempotency guard for side-effecting tools.
+
+    Returns:
+        (should_execute: bool, stored_result: ToolResult | None)
+
+    * (True,  None)           – safe to execute; receipt created in ``preparing`` state.
+    * (False, ToolResult)     – already succeeded; return stored result without re-executing.
+    * raises ValueError       – args digest mismatch (different args for same key) → abort.
+    * raises RuntimeError     – receipt is in ``executing`` with a live heartbeat → do NOT replay.
+    """
+    from models import ToolExecution  # local import to avoid circular at module load
+    now = datetime.now(timezone.utc)
+    digest = _args_digest(args)
+
+    existing = db.get(ToolExecution, operation_id)
+    if existing is not None:
+        if existing.args_digest != digest:
+            raise ValueError(
+                f"operation_id={operation_id} exists with different args digest "
+                f"(stored={existing.args_digest}, current={digest}); refusing replay."
+            )
+        if existing.status == "succeeded" and existing.structured_result is not None:
+            return False, ToolResult(**existing.structured_result)
+        if existing.status == "executing":
+            heartbeat_age = (now - existing.heartbeat_at).total_seconds() if existing.heartbeat_at else 9999
+            if heartbeat_age < 60:
+                raise RuntimeError(
+                    f"operation_id={operation_id} is currently executing (heartbeat {heartbeat_age:.0f}s ago); "
+                    "refusing duplicate execution."
+                )
+            # Stale executing — allow re-claim by resetting
+            existing.status = "preparing"
+            existing.started_at = None
+            existing.heartbeat_at = None
+            db.commit()
+        return True, None
+
+    receipt = ToolExecution(
+        operation_id=operation_id,
+        run_id=run_id,
+        task_id=task_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        args_digest=digest,
+        status="preparing",
+        created_at=now,
+    )
+    db.add(receipt)
+    db.commit()
+    return True, None
+
+
+def complete_tool_execution(operation_id: str, result: ToolResult, db) -> None:
+    """Mark a ToolExecution receipt as succeeded or failed with the stored result."""
+    from models import ToolExecution
+    receipt = db.get(ToolExecution, operation_id)
+    if receipt is None:
+        return
+    receipt.status = "succeeded" if result.ok else "failed"
+    receipt.structured_result = asdict(result)
+    receipt.error_code = (result.error or {}).get("code")
+    receipt.error_message = (result.error or {}).get("message")
+    receipt.retryable = (result.error or {}).get("retryable", False)
+    receipt.finished_at = datetime.now(timezone.utc)
+    db.commit()
+
+
 class ERPImplementationAgent:
     TOOL_REGISTRY_VERSION = "1.0"
     SAFE_TOOLS = {
@@ -151,6 +335,8 @@ class ERPImplementationAgent:
         "check_deployment_status",
         "save_memory",
         "search_memory",
+        "run_project_check",
+        "inspect_module_dependency",
     }
     # Class 1 = read-only (SAFE_TOOLS); Class 2 = reversible writes; Class 3 = destructive/live
     RISK_CLASSES = {
@@ -170,6 +356,7 @@ class ERPImplementationAgent:
         "create_draft_invoice": 3,
         "package_module": 2,
         "execute_deployment": 3,
+        "install_module_dependency": 3,
     }
     TOOL_POLICIES: dict[str, dict[str, str]] = {}
 
@@ -186,9 +373,15 @@ class ERPImplementationAgent:
         project_id: int | None = None,
         requested_by_id: int | None = None,
         instance_id: int | None = None,
+        fallback_model: str = "anthropic/claude-3.5-sonnet",
+        autonomous_workspace_writes: bool = False,
     ):
         self.client = client
         self.workspace = Workspace(workspace_slug)
+        self.autonomous_workspace_writes = autonomous_workspace_writes
+        self.safe_tools = set(ERPImplementationAgent.SAFE_TOOLS)
+        if autonomous_workspace_writes:
+            self.safe_tools.update({"write_file", "patch_file", "create_directory"})
         self.project_id = project_id
         self.requested_by_id = requested_by_id
         self.instance_id = instance_id
@@ -207,7 +400,7 @@ class ERPImplementationAgent:
         if base_url:
             kwargs["base_url"] = base_url
         fallback_kwargs = kwargs.copy()
-        fallback_kwargs["model"] = "anthropic/claude-3.5-sonnet"
+        fallback_kwargs["model"] = fallback_model
         fallback_llm = ChatOpenAI(**fallback_kwargs)
         llm = ChatOpenAI(**kwargs).with_fallbacks([fallback_llm])
         self.llm = llm
@@ -242,13 +435,15 @@ class ERPImplementationAgent:
         def inspect_odoo_schema(model_names: list[str]) -> str:
             """Inspect field names and types for Odoo models. Returns relational fields first, then up to 15 scalar fields - enough for scaffolding. DO NOT pass more than 3 models at once!"""
             if len(model_names) > 3:
-                return "ERROR: You requested too many models at once. Please inspect a maximum of 3 models at a time to avoid exceeding context limits."
+                return json.dumps({"passed": False, "missing_models": [], "error": "Inspect at most 3 models at a time."})
             result = {}
+            missing_models = []
             try:
                 for model_name in model_names:
                     models = self.client.search_read("ir.model", [("model", "=", model_name)], ["id", "name", "model"], 1)
                     if not models:
                         result[model_name] = "Model not found"
+                        missing_models.append(model_name)
                         continue
                     # Relational fields first (always include) — these define the model's relationships
                     relational = self.client.search_read(
@@ -263,10 +458,64 @@ class ERPImplementationAgent:
                         ["name", "ttype"], 15,
                     )
                     result[model_name] = {"model": models[0], "relational_fields": relational, "scalar_fields": scalar}
-                import yaml
-                return yaml.dump(result, sort_keys=False)
+                return json.dumps({
+                    "passed": not missing_models,
+                    "models": result,
+                    "missing_models": missing_models,
+                })
             except Exception as e:
-                return f"ERROR communicating with Odoo: {str(e)}"
+                return json.dumps({"passed": False, "models": result, "missing_models": missing_models, "error": str(e)})
+
+        @tool
+        def inspect_module_dependency(module_name: str, expected_models: list[str] | None = None) -> str:
+            """Inspect an Odoo module dependency and the models it is expected to provide."""
+            expected_models = expected_models or []
+            modules = self.client.search_read(
+                "ir.module.module", [("name", "=", module_name)], ["id", "name", "state"], 1
+            )
+            state = modules[0]["state"] if modules else "not_found"
+            missing_models = [
+                model_name for model_name in expected_models
+                if not self.client.search_read("ir.model", [("model", "=", model_name)], ["id"], 1)
+            ]
+            return json.dumps({
+                "passed": state == "installed" and not missing_models,
+                "module_name": module_name,
+                "state": state,
+                "expected_models": expected_models,
+                "missing_models": missing_models,
+            })
+
+        @tool
+        def install_module_dependency(module_name: str, expected_models: list[str] | None = None) -> str:
+            """Install a required Odoo module on staging after explicit Class 3 approval, then verify its models."""
+            expected_models = expected_models or []
+            try:
+                modules = self.client.search_read(
+                    "ir.module.module", [("name", "=", module_name)], ["id", "name", "state"], 1
+                )
+                if not modules:
+                    return json.dumps({"passed": False, "error_category": "DependencyInstallFailed", "error": f"Module {module_name} was not found"})
+                if modules[0]["state"] != "installed":
+                    self._call_records("ir.module.module", "button_immediate_install", [modules[0]["id"]])
+                verified = self.client.search_read(
+                    "ir.module.module", [("name", "=", module_name)], ["id", "name", "state"], 1
+                )
+                missing_models = [
+                    model_name for model_name in expected_models
+                    if not self.client.search_read("ir.model", [("model", "=", model_name)], ["id"], 1)
+                ]
+                state = verified[0]["state"] if verified else "not_found"
+                passed = state == "installed" and not missing_models
+                return json.dumps({
+                    "passed": passed,
+                    "module_name": module_name,
+                    "state": state,
+                    "missing_models": missing_models,
+                    "error_category": None if passed else "DependencyInstallFailed",
+                })
+            except Exception as exc:
+                return json.dumps({"passed": False, "error_category": "DependencyInstallFailed", "error": str(exc)})
 
         @tool
         def inspect_views(model_name: str) -> str:
@@ -332,6 +581,43 @@ class ERPImplementationAgent:
             return self.workspace.read_file(path)
 
         @tool
+        def run_project_check(check: str, timeout_seconds: int = 120) -> str:
+            """Run one fixed, read-only project check in the workspace. Allowed checks: pytest, npm_test, lint, typecheck, build, compile, git_status, git_log."""
+            commands = {
+                "pytest": [sys.executable, "-m", "pytest"],
+                "npm_test": ["npm", "test"],
+                "lint": ["npm", "run", "lint"],
+                "typecheck": ["npx", "tsc", "--noEmit"],
+                "build": ["npm", "run", "build"],
+                "compile": [sys.executable, "-m", "compileall", "-q", "."],
+                "git_status": ["git", "status", "--short"],
+                "git_log": ["git", "log", "-10", "--oneline"],
+            }
+            if check not in commands:
+                return json.dumps({"ok": False, "error": "Unsupported project check"})
+            timeout = max(1, min(int(timeout_seconds), 600))
+            started = time.monotonic()
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.workspace.root)}
+            try:
+                completed = subprocess.run(
+                    commands[check], cwd=self.workspace.root, env=env,
+                    capture_output=True, text=True, timeout=timeout,
+                    start_new_session=True, check=False,
+                )
+                stdout = completed.stdout[-20_000:]
+                stderr = completed.stderr[-20_000:]
+                return json.dumps({
+                    "check": check, "ok": completed.returncode == 0,
+                    "exit_code": completed.returncode, "stdout": stdout,
+                    "stderr": stderr, "truncated": len(completed.stdout) > 20_000 or len(completed.stderr) > 20_000,
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                })
+            except subprocess.TimeoutExpired as exc:
+                return json.dumps({"check": check, "ok": False, "error": "timeout", "stdout": (exc.stdout or "")[-20_000:], "stderr": (exc.stderr or "")[-20_000:], "duration_seconds": round(time.monotonic() - started, 3)})
+            except OSError as exc:
+                return json.dumps({"check": check, "ok": False, "error": str(exc)})
+
+        @tool
         def create_directory(path: str) -> str:
             """Create a directory inside this project's workspace after approval."""
             target = self.workspace.resolve(path)
@@ -340,19 +626,19 @@ class ERPImplementationAgent:
 
         @tool
         def write_file(path: str, content: str) -> str:
-            """Atomically write a UTF-8 file inside this project's workspace. Validates Python and XML syntax before writing — returns an error string (not an exception) if validation fails so you can fix and retry."""
-            import ast as _ast
-            import xml.etree.ElementTree as _ET
-            if path.endswith(".py"):
-                try:
-                    _ast.parse(content, filename=path)
-                except SyntaxError as exc:
-                    return f"SYNTAX_ERROR in {path}: {exc}. Fix the code and call write_file again."
+            """Atomically write a UTF-8 file inside this project's workspace. Validates Python, XML, and Manifest syntax before writing — returns an error string (not an exception) if validation fails so you can fix and retry."""
+            if path.endswith("__manifest__.py"):
+                conf = validate_manifest_content(content)
+                if not conf.valid:
+                    return f"MANIFEST_ERROR in {path}: {'; '.join(conf.errors)}. Fix and call write_file again."
+            elif path.endswith(".py"):
+                conf = validate_python_code(content, path=path)
+                if not conf.valid:
+                    return f"SYNTAX_ERROR in {path}: {'; '.join(conf.errors)}. Fix the code and call write_file again."
             elif path.endswith(".xml"):
-                try:
-                    _ET.fromstring(content) if not content.strip().startswith("<?xml") else _ET.fromstring(content.split("\n", 1)[-1])
-                except _ET.ParseError as exc:
-                    return f"XML_ERROR in {path}: {exc}. Fix the XML and call write_file again."
+                conf = validate_xml_views(content, path=path)
+                if not conf.valid:
+                    return f"XML_ERROR in {path}: {'; '.join(conf.errors)}. Fix the XML and call write_file again."
             added_lines = len(content.splitlines())
             self.workspace.write_file(path, content)
             return f"Wrote {path} (+{added_lines} -0)"
@@ -395,6 +681,62 @@ class ERPImplementationAgent:
                 db.add(mem)
                 db.commit()
                 return f"Saved new memory '{key}' under category '{category}'"
+
+        @tool
+        def save_user_preference(key: str, content: str) -> str:
+            """[PROTOCOL 5] Save an explicit user preference or coding convention into persistent project memory."""
+            with SessionLocal() as db:
+                existing = db.query(models.AgentMemory).filter(
+                    models.AgentMemory.project_id == self.project_id,
+                    models.AgentMemory.key == key,
+                    models.AgentMemory.category == "user_preference",
+                ).first()
+                if existing:
+                    existing.content = content
+                    existing.updated_at = datetime.now(timezone.utc)
+                    db.commit()
+                    return f"Updated user preference '{key}'"
+                mem = models.AgentMemory(
+                    project_id=self.project_id,
+                    category="user_preference",
+                    key=key,
+                    content=content,
+                    confidence=1.0,
+                )
+                db.add(mem)
+                db.commit()
+                return f"Saved user preference '{key}'"
+
+        @tool
+        def save_verified_fact(key: str, content: str, evidence_type: str, evidence_ref: str) -> str:
+            """[PROTOCOL 5] Save an evidence-backed schema or system truth into verified long-term memory."""
+            with SessionLocal() as db:
+                existing = db.query(models.AgentMemory).filter(
+                    models.AgentMemory.project_id == self.project_id,
+                    models.AgentMemory.key == key,
+                    models.AgentMemory.category == "verified_fact",
+                ).first()
+                if existing:
+                    existing.content = content
+                    existing.evidence_type = evidence_type
+                    existing.evidence_ref_id = evidence_ref
+                    existing.verified_at = datetime.now(timezone.utc)
+                    existing.updated_at = datetime.now(timezone.utc)
+                    db.commit()
+                    return f"Updated verified fact '{key}'"
+                mem = models.AgentMemory(
+                    project_id=self.project_id,
+                    category="verified_fact",
+                    key=key,
+                    content=content,
+                    confidence=1.0,
+                    evidence_type=evidence_type,
+                    evidence_ref_id=evidence_ref,
+                    verified_at=datetime.now(timezone.utc),
+                )
+                db.add(mem)
+                db.commit()
+                return f"Saved verified fact '{key}'"
 
         @tool
         def search_memory(query: str, category: str | None = None) -> str:
@@ -622,11 +964,13 @@ class ERPImplementationAgent:
             inspect_company,
             inspect_users,
             inspect_odoo_schema,
+            inspect_module_dependency,
             inspect_views,
             inspect_access,
             inspect_master_data,
             list_directory,
             read_file,
+            run_project_check,
             create_directory,
             write_file,
             patch_file,
@@ -642,8 +986,11 @@ class ERPImplementationAgent:
             create_draft_invoice,
             package_module,
             execute_deployment,
+            install_module_dependency,
             check_deployment_status,
             save_memory,
+            save_user_preference,
+            save_verified_fact,
             search_memory,
         ]
         @tool
@@ -708,18 +1055,17 @@ class ERPImplementationAgent:
             return QUESTION_SENTINEL
 
         @tool
-        def emit_final_report(outcome: str, done: list[str], verification: str, errors: str = "", pending_approvals: str = "") -> str:
-            """[PROTOCOL 4] Emit the final run report. Call this EXACTLY ONCE at the end of every task — success or failure. outcome must be one of: SUCCESS, PARTIAL, FAILED. done is a list of concrete changes made. verification describes what was checked to confirm it works. errors should contain exact error text (not paraphrased) if PARTIAL or FAILED. Never report SUCCESS without a real verification step."""
-            self.activity_events.append(("final_report", {
+        def complete_task(outcome: str, done: list[str], verification: str, errors: str = "") -> str:
+            """[PROTOCOL 4] Complete only the current supervisor task. Call exactly once. outcome is SUCCESS, PARTIAL, or FAILED; include concrete work, verification evidence, and exact errors."""
+            self.activity_events.append(("task.report", {
                 "outcome": outcome,
                 "done": done,
                 "verification": verification,
                 "errors": errors,
-                "pending_approvals": pending_approvals,
             }))
-            return "final_report_emitted"
+            return "task_completed"
 
-        for proto_tool in [emit_thinking, ask_question, emit_final_report]:
+        for proto_tool in [emit_thinking, ask_question, complete_task]:
             self.tools.append(proto_tool)
             ERPImplementationAgent.SAFE_TOOLS.add(proto_tool.name)
 
@@ -741,7 +1087,7 @@ class ERPImplementationAgent:
 
                 "═══ PROTOCOL 1 — PERMISSION GATING ═══\n"
                 "Before any write/modify/execute action, classify its risk and act accordingly:\n"
-                "- Class 1 (read-only, auto-proceed): inspect_*, read_file, list_directory — call emit_thinking first, then proceed.\n"
+                "- Class 1 (read-only, auto-proceed): inspect_*, read_file, list_directory, run_project_check — call emit_thinking first, then proceed.\n"
                 "- Class 2 (reversible write, requires approval): create_directory, write_file, patch_file, new models/views — the system will auto-pause for user approval.\n"
                 "- Class 3 (destructive/live, requires explicit confirmation): execute_deployment, configure_inventory, update_company_contact, create_draft_invoice — the approval card will warn the user what can break.\n"
                 "Never batch multiple Class 2/3 actions under a single approval. One approval = one described action.\n"
@@ -752,6 +1098,7 @@ class ERPImplementationAgent:
                 "The message must say WHY you are doing the next step (1-3 sentences), not just what tool you'll call. "
                 "Never let more than one logical step pass without a visible event. "
                 "If a tool is slow, emit_thinking first so the user isn't left watching a blank screen.\n\n"
+                "After writing code, use run_project_check with the fixed safe checks (pytest, npm_test, lint, typecheck, build, compile, or git_status) to verify the change before reporting success. If a check fails, inspect the output and make the smallest corrective patch.\n\n"
 
                 "═══ PROTOCOL 3 — ASK WHEN CONFUSED ═══\n"
                 "Call ask_question (which pauses execution) when any of the following are true:\n"
@@ -761,20 +1108,21 @@ class ERPImplementationAgent:
                 "- You have attempted the same fix TWICE and it is still failing — stop and ask, do not retry blindly.\n"
                 "Do NOT ask about things you can verify via inspect_odoo_schema, inspect_views, or read_knowledge_base.\n\n"
 
-                "═══ PROTOCOL 4 — FINAL REPORT ═══\n"
-                "Call emit_final_report EXACTLY ONCE at the end of every task (success or failure). "
+                "═══ PROTOCOL 4 — TASK COMPLETION ═══\n"
+                "Call complete_task EXACTLY ONCE at the end of the current supervisor task (success or failure). "
                 "Never report outcome=SUCCESS without having called verify_module_installation or equivalent verification. "
                 "'The write call did not error' is NOT sufficient evidence of success.\n\n"
 
                 "═══ MODULE BUILD PROCEDURE ═══\n"
                 "1. Call emit_thinking with your reasoning, then update_task_plan with the ordered steps.\n"
                 "2. Inspect the live schema (inspect_odoo_schema / inspect_views) ONCE.\n"
+                "   If requested models are missing, inspect their module dependency. On staging, request install_module_dependency approval and do not build against missing models.\n"
                 "3. If uncertain about Odoo 19 syntax, call read_knowledge_base ONCE.\n"
                 "4. Write files with write_file. If SYNTAX_ERROR or XML_ERROR is returned, fix and retry immediately — show the exact error in emit_thinking.\n"
                 "5. Call package_module to validate.\n"
                 "6. Call verify_module_installation to confirm module state == 'installed' and ORM models exist.\n"
                 "7. End your response with a 'Where to find it inside Odoo 19:' navigation guide.\n"
-                "8. Call emit_final_report with outcome, concrete change list, and verification result.\n"
+                "8. Call complete_task with outcome, concrete change list, and verification result.\n"
                 "9. Always call exactly one tool at a time. Never use placeholders in generated code.\n"
                 "10. Use save_memory for critical schema details, bug fixes, and user preferences."
                 f"{memories_text}"
@@ -805,6 +1153,8 @@ class ERPImplementationAgent:
 
     async def stream(self, prompt: str | None, thread_id: str, interactions: list | None = None, reject=False):
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
+        task_report_seen = False
+        tool_iterations = 0
         if prompt is not None:
             existing = await self.executor.aget_state(config)
             messages = [] if existing.values.get("messages") else self._history(interactions or [])
@@ -839,31 +1189,65 @@ class ERPImplementationAgent:
                     metadata = getattr(output, "response_metadata", None) or {}
                     self.usage["cost_usd"] += float(metadata.get("cost", 0) or 0)
                 elif event["event"] == "on_tool_start":
+                    tool_iterations += 1
+                    if tool_iterations > 40:
+                        raise RuntimeError("TaskExecutionLimitExceeded: current task exceeded 40 tool iterations")
+                    tool_name = event.get("name", "unknown")
                     self.activity_events.append(("tool.started", {
-                        "tool": event.get("name", "unknown"), "arguments": event.get("data", {}).get("input", {}),
+                        "tool": tool_name,
+                        "arguments": event.get("data", {}).get("input", {}),
+                        "category": tool_category(tool_name),
+                        # run_id wired in by worker when emitting SSE; not available here
                     }))
                     yield ""
                 elif event["event"] == "on_tool_end":
                     output = str(event.get("data", {}).get("output", ""))
+                    tool_name = event.get("name", "unknown")
                     # Detect ask_question sentinel — pause execution for user answer
                     if output.strip() == QUESTION_SENTINEL:
                         return
+                    # Parse ToolResult envelope when present; fall back to legacy outcome classifier
+                    tr = ToolResult.from_json(output)
+                    if tr is not None:
+                        outcome = "succeeded" if tr.ok else "failed"
+                        error_code = (tr.error or {}).get("code")
+                    else:
+                        outcome = tool_outcome(tool_name, output)
+                        error_code = None
                     self.activity_events.append(("tool.completed", {
-                        "tool": event.get("name", "unknown"), "result": output[:10_000], "truncated": len(output) > 10_000,
+                        "tool": tool_name,
+                        "result": output[:10_000],
+                        "truncated": len(output) > 10_000,
+                        "outcome": outcome,
+                        "error_code": error_code,
+                        "category": tool_category(tool_name),
+                        "evidence": tr.evidence if tr else [],
+                    }))
+                    yield ""
+                    if tool_name == "complete_task":
+                        task_report_seen = True
+                        return
+                elif event["event"] == "on_tool_error":
+                    error = str(event.get("data", {}).get("error", "Tool execution failed"))
+                    self.activity_events.append(("tool.failed", {
+                        "tool": event.get("name", "unknown"), "error": error[:10_000],
+                        "outcome": "failed", "truncated": len(error) > 10_000,
+                        "category": tool_category(event.get("name", "unknown")),
                     }))
                     yield ""
             state = await self.executor.aget_state(config)
             if not state.next:
-                if not any(e[0] == "final_report" for e in self.activity_events) and getattr(self, "_reminders", 0) < 2:
+                if not task_report_seen and getattr(self, "_reminders", 0) < 1:
                     self._reminders = getattr(self, "_reminders", 0) + 1
-                    input_data = {"messages": [HumanMessage(content="You must call emit_final_report to finish the task.")]}
+                    input_data = {"messages": [HumanMessage(content="You must call complete_task exactly once to finish the current supervisor task.")]}
                     continue
                 return
             if "tools" not in state.next:
                 input_data = None
                 continue
             call = self._single_pending_call(state)
-            if call["name"] not in self.SAFE_TOOLS:
+            safe = getattr(self, "safe_tools", self.SAFE_TOOLS)
+            if call["name"] in self.RISK_CLASSES and call["name"] not in safe:
                 return
             input_data = None
 
@@ -872,7 +1256,8 @@ class ERPImplementationAgent:
         if "tools" not in state.next:
             return None
         call = self._single_pending_call(state)
-        if call["name"] in self.SAFE_TOOLS:
+        safe = getattr(self, "safe_tools", self.SAFE_TOOLS)
+        if call["name"] in safe or call["name"] not in self.RISK_CLASSES:
             return None
         return call
 
@@ -929,6 +1314,19 @@ class ERPImplementationAgent:
                 "module_name": args.get("module_name"),
                 "expected_models": args.get("expected_models", []),
                 "expected_fields": args.get("expected_fields", []),
+            }
+        if name == "install_module_dependency":
+            modules = self.client.search_read(
+                "ir.module.module", [("name", "=", args.get("module_name"))], ["state"], 1
+            )
+            return {
+                "operation": "install Odoo module dependency",
+                "module_name": args.get("module_name"),
+                "current_state": modules[0]["state"] if modules else "not_found",
+                "affected_models": args.get("expected_models", []),
+                "risk_class": 3,
+                "risk": "Installs a server module and may update the staging database schema.",
+                "verification_plan": "Verify module state is installed and every expected model exists.",
             }
         if name == "update_company_contact":
             return {
@@ -1073,6 +1471,58 @@ class SupervisorPlanner:
     """
 
     @staticmethod
+    def build_from_specification(spec_requirements: list[dict]) -> list[dict]:
+        """Build a targeted, requirement-driven task graph from a RunSpecification."""
+        tasks = [
+            {
+                "task_id": "scaffold_module",
+                "title": "Inspect environment and scaffold module files",
+                "depends_on": [],
+                "status": "pending",
+                "max_retries": 2,
+                "retry_count": 0,
+                "acceptance_criteria": "Module manifest, security CSV, and __init__.py files are created and valid.",
+            },
+            {
+                "task_id": "implement_models",
+                "title": "Implement Python models, fields, and constraints",
+                "depends_on": ["scaffold_module"],
+                "status": "pending",
+                "max_retries": 2,
+                "retry_count": 0,
+                "acceptance_criteria": "All required models and fields from the specification are implemented.",
+            },
+            {
+                "task_id": "implement_views",
+                "title": "Implement XML views, menus, and actions",
+                "depends_on": ["implement_models"],
+                "status": "pending",
+                "max_retries": 2,
+                "retry_count": 0,
+                "acceptance_criteria": "Form, list, and action XML views are created and valid.",
+            },
+            {
+                "task_id": "implement_security",
+                "title": "Configure access control and security rules",
+                "depends_on": ["implement_models"],
+                "status": "pending",
+                "max_retries": 2,
+                "retry_count": 0,
+                "acceptance_criteria": "ACL entries exist for all models in ir.model.access.csv.",
+            },
+            {
+                "task_id": "validate_and_verify",
+                "title": "Package module and verify installation on Odoo 19",
+                "depends_on": ["implement_views", "implement_security"],
+                "status": "pending",
+                "max_retries": 2,
+                "retry_count": 0,
+                "acceptance_criteria": "Module passes static validation and verify_module_installation confirms clean installation.",
+            },
+        ]
+        return tasks
+
+    @staticmethod
     def is_module_build(prompt: str) -> bool:
         """Return True if the prompt describes a complex multi-step module build."""
         lower = prompt.lower()
@@ -1184,4 +1634,3 @@ async def connect_odoo(url: str, db: str, username: str, password: str) -> OdooC
 
 async def connect_odoo_json2(url: str, db: str, api_key: str) -> OdooJSON2Client:
     return await asyncio.wait_for(asyncio.to_thread(OdooJSON2Client, url, db, api_key), timeout=10)
-

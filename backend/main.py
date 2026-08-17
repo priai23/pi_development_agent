@@ -32,15 +32,80 @@ from security import decrypt_secret, encrypt_secret, hash_password, new_token, t
 from worker import emit, enqueue
 from workspace import Workspace
 from validation import package_module, validate_module
+from specification import get_specification_summary
+
+
+def get_worker_status(db: Session) -> tuple[str, str | None, float | None, int]:
+    now = datetime.now(timezone.utc)
+    queue_depth = db.query(models.OutboxEvent).filter(models.OutboxEvent.completed_at.is_(None)).count()
+    setting = db.get(models.Setting, "worker_last_seen_at")
+    if not setting or not setting.value:
+        return ("offline", None, None, queue_depth)
+    try:
+        last_seen = datetime.fromisoformat(setting.value)
+        if last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        age = max(0.0, (now - last_seen).total_seconds())
+        worker_status = "healthy" if age <= 15.0 else "offline"
+        return (worker_status, last_seen.isoformat(), round(age, 2), queue_depth)
+    except Exception:
+        return ("offline", None, None, queue_depth)
+
+
+async def worker_availability_monitor():
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            with SessionLocal() as db:
+                worker_status, _, _, _ = get_worker_status(db)
+                if worker_status == "offline":
+                    cutoff_30s = now - timedelta(seconds=30)
+                    stale_queued = db.query(models.AgentRun).filter(
+                        models.AgentRun.status == "queued",
+                        models.AgentRun.created_at < cutoff_30s,
+                    ).with_for_update(skip_locked=True).all()
+
+                    stale_running = db.query(models.AgentRun).filter(
+                        models.AgentRun.status == "running",
+                        (models.AgentRun.heartbeat_at < cutoff_30s) | (models.AgentRun.heartbeat_at.is_(None)),
+                    ).with_for_update(skip_locked=True).all()
+
+                    for run in (*stale_queued, *stale_running):
+                        if run.status not in {"queued", "running"}:
+                            continue
+                        run.status = "interrupted"
+                        run.error_category = "WorkerUnavailable"
+                        run.error_message = "Background worker process is unavailable. Check worker process health or retry."
+                        run.retryable = True
+                        run.finished_at = now
+                        if run.active_task_id:
+                            run.active_task_id = None
+                        emit(db, run.id, "run.interrupted", {
+                            "category": "WorkerUnavailable",
+                            "message": run.error_message,
+                            "retryable": True,
+                            "support_id": run.support_id,
+                            "task_id": None,
+                            "tool": None,
+                        })
+                    db.commit()
+        except Exception:
+            pass
+        await asyncio.sleep(5)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.workspace_root.expanduser().resolve().mkdir(parents=True, exist_ok=True)
+    monitor_task = asyncio.create_task(worker_availability_monitor())
     async with AsyncPostgresSaver.from_conn_string(settings.checkpoint_url) as checkpointer:
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
-        yield
+        try:
+            yield
+        finally:
+            monitor_task.cancel()
+            await asyncio.gather(monitor_task, return_exceptions=True)
 
 
 app = FastAPI(
@@ -127,6 +192,7 @@ async def project_agent(request: Request, db: Session, project: models.Project) 
         else connect_odoo(instance.url, instance.db_name or "", instance.username or "", decrypt_secret(instance.password_encrypted or ""))
     )
     model, key = llm_config(db)
+    fallback = db.get(models.Setting, "llm_fallback_model_name")
     return ERPImplementationAgent(
         client,
         project.workspace_slug,
@@ -134,6 +200,7 @@ async def project_agent(request: Request, db: Session, project: models.Project) 
         model,
         key,
         "https://openrouter.ai/api/v1" if key else None,
+        fallback_model=fallback.value if fallback and fallback.value else "anthropic/claude-3.5-sonnet",
     )
 
 
@@ -602,8 +669,17 @@ def setup_admin(payload: schemas.SetupAdminRequest, response: Response, db: Sess
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(db: Session = Depends(get_db)):
+    worker_status, last_seen, age, queue_depth = get_worker_status(db)
+    return {
+        "status": "ok",
+        "api": "healthy",
+        "database": "healthy",
+        "worker": worker_status,
+        "worker_last_seen_at": last_seen,
+        "worker_age_seconds": age,
+        "queue_depth": queue_depth,
+    }
 
 
 @app.post("/auth/login", response_model=schemas.AuthState)
@@ -856,11 +932,14 @@ def export_audit_events(_: models.User = Depends(admin_user), db: Session = Depe
 def platform_health(_: models.User = Depends(admin_user), db: Session = Depends(get_db)):
     now = datetime.now(timezone.utc)
     stale_before = now - timedelta(minutes=5)
+    worker_status, last_seen, age, queue_depth = get_worker_status(db)
     return {
         "api": "healthy",
         "database": "healthy",
-        "worker": "healthy" if db.query(models.AgentRun).filter(models.AgentRun.status == "running", models.AgentRun.heartbeat_at < stale_before).count() == 0 else "stale_runs",
-        "queue_depth": db.query(models.OutboxEvent).filter(models.OutboxEvent.completed_at.is_(None)).count(),
+        "worker": worker_status,
+        "worker_last_seen_at": last_seen,
+        "worker_age_seconds": age,
+        "queue_depth": queue_depth,
         "stale_actions": db.query(models.PendingAction).filter(models.PendingAction.status.in_(["claimed", "executing"]), models.PendingAction.claimed_at < stale_before).count(),
         "failed_deployments": db.query(models.Deployment).filter(models.Deployment.status == "failed").count(),
         "instances": [{"id": item.id, "status": item.status, "bridge_status": item.bridge_status} for item in db.query(models.Instance).filter(models.Instance.is_active.is_(True)).all()],
@@ -1209,7 +1288,7 @@ async def update_llm_settings(payload: schemas.LLMSettingsUpdate, admin: models.
             "max_output_tokens": payload.max_output_tokens}
 
 
-ACTIVE_RUN_STATUSES = ("running", "awaiting_approval", "cancelling")
+ACTIVE_RUN_STATUSES = ("queued", "running", "awaiting_question", "awaiting_approval", "cancelling")
 
 
 @app.post("/projects/{project_id}/runs", response_model=schemas.RunOut, status_code=201)
@@ -1234,15 +1313,38 @@ def create_run(project_id: int, payload: schemas.RunCreate, user: models.User = 
     ).first()
     if active and not payload.queue_if_busy:
         raise HTTPException(status_code=409, detail={"message": "A project run is already active", "active_run_id": active.id})
+    configured_model = db.get(models.Setting, "llm_model_name")
+    configured_fallback = db.get(models.Setting, "llm_fallback_model_name")
     run = models.AgentRun(
         project_id=project_id,
         requested_by_id=user.id,
         prompt=payload.message,
         thread_id=f"project:{project_id}:run:{uuid4()}",
+        planner_model=configured_model.value if configured_model else None,
+        fallback_model=configured_fallback.value if configured_fallback and configured_fallback.value else None,
+        workspace_base_revision=Workspace(project.workspace_slug).head(),
     )
     db.add(run)
     db.flush()
+
+    # Phase 4 — create an environment snapshot for this run if instance exists
+    instance = db.query(models.Instance).filter(models.Instance.project_id == project_id).first()
+    if instance:
+        snapshot = models.SourceSnapshot(
+            instance_id=instance.id,
+            odoo_version="19.0",
+            odoo_edition="community",
+            fingerprint="pending",
+            status="pending_index",
+        )
+        db.add(snapshot)
+        db.flush()
+        run.source_snapshot_id = snapshot.id
+
+    emit(db, run.id, "run.queued", {"support_id": run.support_id})
     enqueue(db, "run.start", run.id)
+    # Enqueue async source index (best-effort; run proceeds even if it fails)
+    enqueue(db, "source.index", run.id, {"snapshot_id": snapshot.id})
     audit(db, "run.queued", user.id, project_id, {"run_id": run.id}, support_id=run.support_id, result="queued")
     db.commit()
     db.refresh(run)
@@ -1270,10 +1372,18 @@ def cancel_run(run_id: str, user: models.User = Depends(current_user), db: Sessi
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     require_project(db, user, run.project_id)
-    if run.status not in {"queued", "running", "awaiting_approval"}:
+    if run.status not in {"queued", "running", "awaiting_question", "awaiting_approval"}:
         raise HTTPException(status_code=409, detail="Run cannot be cancelled")
     previous_status = run.status
     run.status = "cancelled" if previous_status == "queued" else "cancelling"
+    if previous_status == "awaiting_question":
+        question = db.query(models.AgentQuestion).filter(
+            models.AgentQuestion.run_id == run.id,
+            models.AgentQuestion.status == "pending",
+        ).first()
+        if question:
+            question.status = "cancelled"
+        run.status = "cancelled"
     if previous_status == "awaiting_approval":
         action = db.query(models.PendingAction).filter(models.PendingAction.run_id == run.id, models.PendingAction.status == "pending").first()
         if action:
@@ -1286,8 +1396,18 @@ def cancel_run(run_id: str, user: models.User = Depends(current_user), db: Sessi
             run.status = "cancelled"
             run.finished_at = datetime.now(timezone.utc)
     if run.status == "cancelled":
+        if run.active_task_id:
+            task_id = run.active_task_id
+            run.task_graph = [
+                {**task, "status": "cancelled"} if task.get("task_id") == task_id else {**task}
+                for task in (run.task_graph or [])
+            ]
+            emit(db, run.id, "task.cancelled", {"task_id": task_id, "task_graph": run.task_graph})
+            run.active_task_id = None
         run.finished_at = datetime.now(timezone.utc)
     emit(db, run.id, "run.cancellation_requested", {})
+    if run.status == "cancelled":
+        emit(db, run.id, "run.cancelled", {"task_graph": run.task_graph or []})
     db.commit()
     db.refresh(run)
     return run
@@ -1301,11 +1421,29 @@ def retry_run(run_id: str, user: models.User = Depends(current_user), db: Sessio
     require_project(db, user, failed.project_id)
     if failed.status not in {"failed", "interrupted", "expired"}:
         raise HTTPException(status_code=409, detail="Run is not retryable")
+    active = db.query(models.AgentRun).filter(
+        models.AgentRun.project_id == failed.project_id,
+        models.AgentRun.status.in_(ACTIVE_RUN_STATUSES),
+    ).first()
+    if active:
+        raise HTTPException(status_code=409, detail={"message": "A project run is already active", "active_run_id": active.id})
     run = models.AgentRun(
-        project_id=failed.project_id, requested_by_id=user.id, prompt=failed.prompt,
-        thread_id=f"project:{failed.project_id}:run:{uuid4()}", retry_of_id=failed.id,
+        project_id=failed.project_id,
+        requested_by_id=user.id,
+        prompt=failed.prompt,
+        thread_id=f"project:{failed.project_id}:run:{uuid4()}",
+        retry_of_id=failed.id,
+        planner_model=failed.planner_model,
+        fallback_model=failed.fallback_model,
+        workspace_base_revision=failed.workspace_base_revision,
     )
-    db.add(run); db.flush(); enqueue(db, "run.start", run.id); db.commit(); db.refresh(run)
+    db.add(run)
+    db.flush()
+    emit(db, run.id, "run.queued", {"support_id": run.support_id})
+    enqueue(db, "run.start", run.id)
+    audit(db, "run.queued", user.id, failed.project_id, {"run_id": run.id, "retry_of_id": failed.id}, support_id=run.support_id, result="queued")
+    db.commit()
+    db.refresh(run)
     return run
 
 
@@ -1317,6 +1455,19 @@ def delete_run(run_id: str, user: models.User = Depends(current_user), db: Sessi
     require_project(db, user, run.project_id)
     db.delete(run)
     db.commit()
+
+
+@app.get("/runs/{run_id}/spec")
+def get_run_spec(run_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    """Return the structured specification and acceptance checks for a run."""
+    run = db.get(models.AgentRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    require_project(db, user, run.project_id)
+    summary = get_specification_summary(run_id, db)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="No specification found for this run")
+    return summary
 
 
 @app.get("/runs/{run_id}/events", response_model=list[schemas.ToolEventOut])
@@ -1331,14 +1482,16 @@ def run_events(run_id: str, after: int = 0, user: models.User = Depends(current_
 
 
 @app.get("/runs/{run_id}/stream")
-async def stream_run_events(run_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+async def stream_run_events(run_id: str, request: Request, after: int = 0, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     run = db.get(models.AgentRun, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     require_project(db, user, run.project_id)
 
     async def events():
-        sequence = 0
+        header_sequence = request.headers.get("Last-Event-ID")
+        sequence = max(after, int(header_sequence) if header_sequence and header_sequence.isdigit() else 0)
+        heartbeat_at = datetime.now(timezone.utc)
         while True:
             with SessionLocal() as event_db:
                 rows = event_db.query(models.ToolEvent).filter(
@@ -1347,12 +1500,24 @@ async def stream_run_events(run_id: str, user: models.User = Depends(current_use
                 status_value = event_db.get(models.AgentRun, run_id).status
             for row in rows:
                 sequence = row.sequence
-                yield f"data: {json.dumps({'sequence': row.sequence, 'type': row.event_type, 'payload': row.payload})}\n\n"
-            if status_value in {"succeeded", "failed", "cancelled", "expired", "interrupted", "awaiting_approval"} and not rows:
+                envelope = {
+                    "id": row.id,
+                    "run_id": row.run_id,
+                    "sequence": row.sequence,
+                    "type": row.event_type,
+                    "payload": row.payload,
+                    "created_at": row.created_at.isoformat(),
+                }
+                yield f"id: {row.sequence}\ndata: {json.dumps(envelope)}\n\n"
+                heartbeat_at = datetime.now(timezone.utc)
+            if status_value in {"succeeded", "failed", "cancelled", "expired", "interrupted", "awaiting_approval", "awaiting_question"} and not rows:
                 break
+            if (datetime.now(timezone.utc) - heartbeat_at).total_seconds() >= 15:
+                yield ": keep-alive\n\n"
+                heartbeat_at = datetime.now(timezone.utc)
             await asyncio.sleep(0.5)
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def can_approve(db: Session, user: models.User, action: models.PendingAction) -> bool:
@@ -1405,7 +1570,10 @@ def decide_run_action(action_id: str, payload: schemas.ActionDecision, user: mod
     run = db.get(models.AgentRun, action.run_id)
     run.status = "queued"
     enqueue(db, "action.resume", run.id, {"action_id": action.id, "decision": payload.decision})
-    emit(db, run.id, f"approval.{action.status}", {"action_id": action.id, "decided_by": user.id})
+    emit(db, run.id, "approval.decided", {
+        "action_id": action.id, "decision": payload.decision,
+        "status": action.status, "decided_by": user.id,
+    })
     audit(db, f"action.{action.status}", user.id, action.project_id, {"action_id": action.id}, risk_class=action.risk_class, support_id=run.support_id, result=action.status)
     db.commit(); db.refresh(run)
     return run
@@ -1414,59 +1582,60 @@ def decide_run_action(action_id: str, payload: schemas.ActionDecision, user: mod
 @app.post("/projects/{project_id}/chat")
 async def chat(project_id: int, payload: schemas.ChatRequest, request: Request, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, project_id)
-    pending = db.query(models.PendingAction).filter(
-        models.PendingAction.project_id == project_id,
-        models.PendingAction.status == "pending",
-        models.PendingAction.expires_at > datetime.now(timezone.utc),
-    ).first()
-    if pending:
-        raise HTTPException(status_code=409, detail="Resolve the pending action before sending another message")
-    interaction = models.Interaction(project_id=project_id, role="user", content=payload.message)
-    db.add(interaction)
-    audit(db, "agent.request", user.id, project_id, {})
-    db.commit()
-    history = db.query(models.Interaction).filter(
-        models.Interaction.project_id == project_id,
-        models.Interaction.id < interaction.id,
-    ).order_by(models.Interaction.created_at.desc()).limit(20).all()[::-1]
-    agent = await project_agent(request, db, project)
-    thread_id = f"project:{project_id}"
+    run = create_run(project_id, schemas.RunCreate(message=payload.message), user, db)
 
     async def events():
-        response_text = ""
-        try:
-            async for chunk in agent.stream(payload.message, thread_id, history):
-                response_text += chunk
-                yield chunk
-            call = await agent.pending_call(thread_id)
-            if call:
-                preview = agent.preview(call)
-                action = models.PendingAction(
-                    project_id=project_id,
-                    requested_by_id=user.id,
-                    thread_id=thread_id,
-                    tool_call_id=call["id"],
-                    tool_name=call["name"],
-                    arguments=call["args"],
-                    preview=preview,
-                    risk_class=agent.RISK_CLASSES[call["name"]],
-                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.action_expiry_minutes),
-                )
-                with SessionLocal() as action_db:
-                    action_db.add(action)
-                    action_db.flush()
-                    audit(action_db, "agent.action_requested", user.id, project_id, {"action_id": action.id, "tool": action.tool_name})
-                    action_db.commit()
-                    action_id = action.id
-                yield "\n_ACTION_PENDING_||" + json.dumps({"id": action_id, "tool": call["name"], "risk_class": agent.RISK_CLASSES[call["name"]], "preview": preview}) + "\n"
-        except Exception:
-            yield "\n\nThe agent could not complete this request."
-        finally:
-            with SessionLocal() as save_db:
-                save_db.add(models.Interaction(project_id=project_id, role="agent", content=response_text))
-                save_db.commit()
+        sequence = 0
+        while True:
+            with SessionLocal() as event_db:
+                rows = event_db.query(models.ToolEvent).filter(
+                    models.ToolEvent.run_id == run.id,
+                    models.ToolEvent.sequence > sequence,
+                ).order_by(models.ToolEvent.sequence).all()
+                status_value = event_db.get(models.AgentRun, run.id).status
+            for row in rows:
+                sequence = row.sequence
+                if row.event_type == "message.delta":
+                    yield str(row.payload.get("text", ""))
+                elif row.event_type in {"approval.required", "question.required"}:
+                    marker = {"id": row.payload.get("action_id") or row.payload.get("question_id"), **row.payload}
+                    yield "\n_ACTION_PENDING_||" + json.dumps(marker) + "\n"
+            if status_value in {"succeeded", "failed", "cancelled", "expired", "interrupted", "awaiting_approval", "awaiting_question"} and not rows:
+                break
+            await asyncio.sleep(0.5)
 
     return StreamingResponse(events(), media_type="text/plain")
+
+
+@app.post("/runs/{run_id}/question", response_model=schemas.RunOut)
+async def answer_run_question(run_id: str, payload: schemas.QuestionAnswer, request: Request, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    run = db.get(models.AgentRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    require_project(db, user, run.project_id)
+    if run.status != "awaiting_question":
+        raise HTTPException(status_code=409, detail="Run is not waiting for a question answer")
+    question = db.query(models.AgentQuestion).filter(
+        models.AgentQuestion.run_id == run.id,
+        models.AgentQuestion.status == "pending",
+    ).first()
+    if not question or question.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail="This question has expired")
+    project = require_project(db, user, run.project_id)
+    agent = await project_agent(request, db, project)
+    await agent.answer_question(run.thread_id, payload.answer)
+    question.answer = payload.answer
+    question.status = "answered"
+    question.answered_at = datetime.now(timezone.utc)
+    run.status = "queued"
+    emit(db, run.id, "question.answered", {
+        "question_id": question.id, "answer": payload.answer, "answered_by": user.id,
+    })
+    enqueue(db, "run.resume", run.id)
+    audit(db, "agent.question_answered", user.id, run.project_id, {"run_id": run.id, "question_id": question.id})
+    db.commit()
+    db.refresh(run)
+    return run
 
 
 @app.post("/projects/{project_id}/actions/{action_id}/decision")
@@ -1522,28 +1691,29 @@ async def answer_question_endpoint(project_id: int, payload: schemas.QuestionAns
     agent = await project_agent(request, db, project)
     run = db.query(models.AgentRun).filter(
         models.AgentRun.project_id == project_id,
-        models.AgentRun.status.in_(["running", "queued"]),
+        models.AgentRun.status == "awaiting_question",
     ).order_by(models.AgentRun.created_at.desc()).first()
     if not run:
         raise HTTPException(status_code=409, detail="No active agent run awaiting an answer")
+    question = db.query(models.AgentQuestion).filter(
+        models.AgentQuestion.run_id == run.id,
+        models.AgentQuestion.status == "pending",
+    ).first()
+    if not question or question.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail="This question has expired")
     await agent.answer_question(run.thread_id, payload.answer)
-    audit(db, "agent.question_answered", user.id, project_id, {"run_id": run.id})
+    question.answer = payload.answer
+    question.status = "answered"
+    question.answered_at = datetime.now(timezone.utc)
+    run.status = "queued"
+    emit(db, run.id, "question.answered", {
+        "question_id": question.id, "answer": payload.answer, "answered_by": user.id,
+    })
+    enqueue(db, "run.resume", run.id)
+    audit(db, "agent.question_answered", user.id, project_id, {"run_id": run.id, "question_id": question.id})
     db.commit()
-
-    async def events():
-        response_text = ""
-        try:
-            async for chunk in agent.stream(None, run.thread_id):
-                response_text += chunk
-                yield chunk
-        except Exception:
-            yield "Could not resume after question answer."
-        finally:
-            with SessionLocal() as save_db:
-                save_db.add(models.Interaction(project_id=project_id, role="agent", content=response_text))
-                save_db.commit()
-
-    return StreamingResponse(events(), media_type="text/plain")
+    db.refresh(run)
+    return run
 
 
 @app.get("/projects/{project_id}/actions/pending", response_model=schemas.PendingActionOut | None)
@@ -1594,9 +1764,21 @@ def workspace_commits(project_id: int, user: models.User = Depends(current_user)
 
 
 @app.get("/projects/{project_id}/workspace/diff")
-def workspace_diff(project_id: int, old: str, new: str = "HEAD", user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+def workspace_diff(project_id: int, old: str | None = None, new: str = "HEAD", run_id: str | None = None, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, project_id)
-    return {"diff": Workspace(project.workspace_slug).diff(old, new)}
+    workspace = Workspace(project.workspace_slug)
+    head_revision = workspace.head()
+    base_revision = old
+    if run_id:
+        run = db.get(models.AgentRun, run_id)
+        if not run or run.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Run not found")
+        base_revision = run.workspace_base_revision
+    if not head_revision or (not run_id and not base_revision):
+        return {"diff": "", "base_revision": base_revision, "head_revision": head_revision, "truncated": False}
+    comparison_base = base_revision or Workspace.EMPTY_TREE_REVISION
+    diff, truncated = workspace.diff_result(comparison_base, new)
+    return {"diff": diff, "base_revision": base_revision, "head_revision": head_revision, "truncated": truncated}
 
 
 @app.get("/projects/{project_id}/workspace/archive")

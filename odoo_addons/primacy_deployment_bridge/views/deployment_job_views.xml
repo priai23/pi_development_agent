@@ -10,7 +10,7 @@
                 <field name="operation"/>
                 <field name="module_name"/>
                 <field name="module_version"/>
-                <field name="state"/>
+                <field name="status"/>
                 <field name="runner_id"/>
             </list>
         </field>

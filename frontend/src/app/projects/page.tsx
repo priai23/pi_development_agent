@@ -5,6 +5,7 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import { FolderGit2, Plus, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/AppShell";
 import { apiFetch, Organization, Project } from "@/lib/api";
+import ConfirmDialog from "@/components/ConfirmDialog";
 
 export default function ProjectsPage() {
   const { user } = useAuth();
@@ -14,6 +15,7 @@ export default function ProjectsPage() {
   const [organizationId, setOrganizationId] = useState(0);
   const [newOrganization, setNewOrganization] = useState("");
   const [error, setError] = useState("");
+  const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -54,7 +56,6 @@ export default function ProjectsPage() {
   };
 
   const remove = async (project: Project) => {
-    if (!window.confirm(`Delete ${project.name}?`)) return;
     try { await apiFetch<void>(`/projects/${project.id}`, { method: "DELETE" }); await load(); }
     catch (caught) { setError(caught instanceof Error ? caught.message : "Could not delete project"); }
   };
@@ -87,10 +88,11 @@ export default function ProjectsPage() {
         {projects.map((project) => (
           <div key={project.id} className="group relative rounded-2xl border bg-white p-5 shadow-sm dark:border-white/10 dark:bg-white/5">
             <Link href={`/projects/${project.id}`} className="block"><FolderGit2 className="mb-4 h-7 w-7 text-blue-600" /><h2 className="font-semibold">{project.name}</h2><p className="mt-1 text-xs text-gray-500">{project.instances.length ? "ERP connected" : "No ERP connection"}</p></Link>
-            {(user?.role === "admin" || user?.id === project.created_by_id) && <button aria-label={`Delete ${project.name}`} onClick={() => void remove(project)} className="absolute right-4 top-4 rounded p-1 text-gray-400 opacity-0 hover:text-red-600 group-hover:opacity-100"><Trash2 className="h-4 w-4" /></button>}
+            {(user?.role === "admin" || user?.id === project.created_by_id) && <button aria-label={`Delete ${project.name}`} onClick={() => setProjectToDelete(project)} className="absolute right-4 top-4 rounded p-1 text-gray-400 opacity-0 hover:text-red-600 focus:opacity-100 group-hover:opacity-100"><Trash2 className="h-4 w-4" /></button>}
           </div>
         ))}
       </div>
+      <ConfirmDialog open={Boolean(projectToDelete)} title="Delete project?" description={projectToDelete ? `${projectToDelete.name} and its workspace history will be removed.` : ""} onClose={() => setProjectToDelete(null)} onConfirm={() => { if (projectToDelete) void remove(projectToDelete); setProjectToDelete(null); }} />
     </div>
   );
 }

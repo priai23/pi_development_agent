@@ -5,8 +5,9 @@
         "storage.googleapis.com",
         "s3.amazonaws.com"
     ],
-    "odoo_path": "/opt/odoo/odoo-server",
     "custom_addons_path": "/opt/odoo/custom_addons",
-    "odoo_user": "odoo",
+    "backup_path": "/opt/odoo/primacy-backups",
+    "nonce_store_path": "/opt/odoo/primacy-backups/nonce-ledger.txt",
+    "runner_id": "odoo-runner-1",
     "restart_command": ["sudo", "systemctl", "restart", "odoo"]
 }

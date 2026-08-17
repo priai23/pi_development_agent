@@ -20,7 +20,7 @@ export default function LoginPage() {
           setNeedsSetup(true);
         }
       } catch (err) {
-        console.error("Failed to check setup status:", err);
+        setError(err instanceof Error ? err.message : "Could not reach the backend API");
       }
     }
     void checkSetup();
@@ -115,4 +115,3 @@ export default function LoginPage() {
     </div>
   );
 }
-
