@@ -2,9 +2,11 @@ import argparse
 import asyncio
 import getpass
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 
 from sqlalchemy.orm import Session
 
@@ -17,7 +19,7 @@ def create_admin(db: Session, email: str) -> None:
     normalized = email.strip().lower()
     if db.query(models.User).filter(models.User.email == normalized).first():
         raise SystemExit("A user with that email already exists")
-    password = getpass.getpass("Password (minimum 12 characters): ")
+    password = getpass.getpass("Password: ")
     confirmation = getpass.getpass("Confirm password: ")
     if password != confirmation:
         raise SystemExit("Passwords do not match")
@@ -31,47 +33,83 @@ def run_worker() -> None:
     asyncio.run(serve())
 
 
-def run_supervisor(host: str = "0.0.0.0", port: int = 8000) -> None:
-    """Supervised single-command entry point running API + worker."""
-    env = os.environ.copy()
-    api_proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app", "--host", host, "--port", str(port)],
-        env=env,
-    )
-    worker_proc = subprocess.Popen(
-        [sys.executable, "worker.py"],
-        env=env,
-    )
+def _terminate_proc(proc: subprocess.Popen | None, timeout: float = 5.0) -> None:
+    """Gracefully terminate a child process, escalating to kill if it hangs."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
-    def _shutdown(signum, frame):
-        print(f"\nReceived signal {signum}, shutting down supervised processes...")
-        api_proc.terminate()
-        worker_proc.terminate()
-        try:
-            api_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            api_proc.kill()
-        try:
-            worker_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            worker_proc.kill()
+
+def run_supervisor(host: str = "0.0.0.0", port: int = 8001, reload: bool = False, loop_delay: float = 0.5) -> None:
+    """Supervised single-command entry point running API + exactly one worker."""
+    backend_dir = str(Path(__file__).resolve().parent)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    api_cmd = [sys.executable, "-m", "uvicorn", "main:app", "--host", host, "--port", str(port)]
+    if reload:
+        api_cmd.extend([
+            "--reload",
+            "--reload-exclude", "*.pyc",
+            "--reload-exclude", "*__pycache__*",
+            "--reload-exclude", "*.pytest_cache*",
+            "--reload-exclude", "*tests*",
+            "--reload-exclude", "*workspaces*",
+        ])
+
+    worker_cmd = [sys.executable, "worker.py"]
+
+    api_proc: subprocess.Popen | None = None
+    worker_proc: subprocess.Popen | None = None
+    shutting_down = False
+
+    def _shutdown(signum, _frame):
+        nonlocal shutting_down
+        if shutting_down:
+            return
+        shutting_down = True
+        print(f"\nReceived signal {signum}, shutting down supervised API and worker processes...")
+        _terminate_proc(api_proc, timeout=5.0)
+        _terminate_proc(worker_proc, timeout=5.0)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
+    print(f"Starting supervised stack (API on http://{host}:{port}, Worker in background, cwd={backend_dir})...")
+    api_proc = subprocess.Popen(api_cmd, cwd=backend_dir, env=env)
+    worker_proc = subprocess.Popen(worker_cmd, cwd=backend_dir, env=env)
+
     try:
-        while True:
+        while not shutting_down:
             api_code = api_proc.poll()
-            worker_code = worker_proc.poll()
             if api_code is not None:
-                print(f"API process exited with code {api_code}; stopping worker...")
-                worker_proc.terminate()
-                break
-            if worker_code is not None:
+                print(f"API process exited with code {api_code}; stopping background worker...")
+                _terminate_proc(worker_proc, timeout=5.0)
+                sys.exit(api_code)
+
+            worker_code = worker_proc.poll()
+            if worker_code is not None and not shutting_down:
                 print(f"Worker process exited with code {worker_code}; restarting worker in 3s...")
-                worker_proc = subprocess.Popen([sys.executable, "worker.py"], env=env)
-            asyncio.run(asyncio.sleep(1))
+                time.sleep(3.0)
+                if shutting_down:
+                    break
+                if api_proc.poll() is not None:
+                    print("API died during worker restart delay; aborting...")
+                    sys.exit(api_proc.poll() or 1)
+                worker_proc = subprocess.Popen(worker_cmd, cwd=backend_dir, env=env)
+
+            time.sleep(loop_delay)
     except KeyboardInterrupt:
         _shutdown(signal.SIGINT, None)
 
@@ -87,7 +125,8 @@ def main() -> None:
 
     serve_parser = subparsers.add_parser("serve", help="Run supervised API + worker processes")
     serve_parser.add_argument("--host", default="0.0.0.0", help="API host (default: 0.0.0.0)")
-    serve_parser.add_argument("--port", type=int, default=8000, help="API port (default: 8000)")
+    serve_parser.add_argument("--port", type=int, default=8001, help="API port (default: 8001)")
+    serve_parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development (Uvicorn only)")
 
     args = parser.parse_args()
 
@@ -97,7 +136,7 @@ def main() -> None:
     elif args.command == "worker":
         run_worker()
     elif args.command == "serve":
-        run_supervisor(host=args.host, port=args.port)
+        run_supervisor(host=args.host, port=args.port, reload=args.reload)
 
 
 if __name__ == "__main__":

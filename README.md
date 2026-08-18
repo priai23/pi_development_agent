@@ -98,14 +98,18 @@ Migrate the database and create the initial administrator:
 ```bash
 alembic upgrade head
 python manage.py create-admin admin@example.com
-uvicorn main:app --reload --port 8001
 ```
 
-Run the durable tool/deployment worker in a second process:
+Start the supervised development stack (launches both the API and the background worker with live reload):
 
 ```bash
-cd backend
-venv/bin/python worker.py
+python manage.py serve --reload --port 8001
+```
+
+For production deployments, manage the stack via systemd:
+
+```bash
+sudo systemctl enable --now primacy.target
 ```
 
 Agent use is disabled until an administrator configures an OpenRouter key, selects a catalogue-validated model, and sets an organization monthly budget.

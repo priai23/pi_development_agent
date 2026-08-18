@@ -1102,10 +1102,11 @@ def create_project(payload: schemas.ProjectCreate, user: models.User = Depends(c
     project_name = payload.name.strip()
     existing = db.query(models.Project).filter(
         models.Project.organization_id == payload.organization_id,
+        models.Project.created_by_id == user.id,
         models.Project.name.ilike(project_name),
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail=f"A project named '{project_name}' already exists in this organization.")
+        raise HTTPException(status_code=409, detail=f"A project named '{project_name}' already exists in your workspace.")
     project = models.Project(
         name=project_name,
         organization_id=payload.organization_id,
@@ -1141,12 +1142,14 @@ def delete_project(project_id: int, user: models.User = Depends(current_user), d
 @app.post("/instances/detect")
 async def detect_instance(payload: schemas.DetectRequest, _: models.User = Depends(current_user), db: Session = Depends(get_db)):
     url = validate_erp_url(str(payload.url), db)
-    if payload.erp_type != "odoo":
-        raise HTTPException(status_code=501, detail="Pi ERP connectivity is not implemented")
 
     def list_databases():
         proxy = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/db", transport=xmlrpc_transport(url), allow_none=True)
         return proxy.list()
+
+    def get_server_version():
+        common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", transport=xmlrpc_transport(url), allow_none=True)
+        return common.version()
 
     try:
         databases = await asyncio.wait_for(asyncio.to_thread(list_databases), timeout=10)
@@ -1155,23 +1158,27 @@ async def detect_instance(payload: schemas.DetectRequest, _: models.User = Depen
         return {"status": "timeout", "databases": [], "message": "Database discovery timed out"}
     except socket.gaierror:
         return {"status": "dns_error", "databases": [], "message": "ERP hostname could not be resolved"}
-    except xmlrpc.client.ProtocolError as exc:
-        status_name = "authentication_required" if exc.errcode in {401, 403} else "endpoint_unsupported" if exc.errcode == 404 else "network_error"
-        return {"status": status_name, "databases": [], "message": f"Database endpoint returned HTTP {exc.errcode}"}
     except ssl.SSLError:
         return {"status": "tls_error", "databases": [], "message": "TLS certificate validation failed"}
-    except OSError as exc:
-        return {"status": "network_error", "databases": [], "message": str(exc)[:300]}
     except Exception:
-        return {"status": "manual_required", "databases": [], "message": "Database listing is disabled; enter the name manually"}
+        # Check if server is active via /xmlrpc/2/common version endpoint
+        try:
+            ver_info = await asyncio.wait_for(asyncio.to_thread(get_server_version), timeout=5)
+            version_str = ver_info.get("server_version", "Active") if isinstance(ver_info, dict) else "Active"
+            return {
+                "status": "manual_required",
+                "databases": [],
+                "server_version": version_str,
+                "message": f"Odoo {version_str} active (list_db disabled on server; enter database name manually)",
+            }
+        except Exception:
+            return {"status": "manual_required", "databases": [], "message": "Database listing is disabled; enter the name manually"}
 
 
 @app.post("/instances", response_model=schemas.InstanceOut, status_code=201)
 async def create_instance(payload: schemas.InstanceCreate, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, payload.project_id)
     url = validate_erp_url(str(payload.url), db)
-    if payload.erp_type != "odoo":
-        raise HTTPException(status_code=501, detail="Pi ERP connectivity is not implemented")
     if not payload.db_name:
         raise HTTPException(status_code=400, detail="Database name is required")
     if payload.auth_method == "xmlrpc" and (not payload.username or not payload.password):
@@ -1187,11 +1194,11 @@ async def create_instance(payload: schemas.InstanceCreate, user: models.User = D
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=400, detail="ERP server timed out") from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Odoo authentication failed. Check the database, username, and password") from exc
+        raise HTTPException(status_code=400, detail="Authentication failed. Check the database, username, and password") from exc
     except (OSError, xmlrpc.client.Error) as exc:
-        raise HTTPException(status_code=400, detail="Could not reach the Odoo XML-RPC endpoint. Check the URL and server availability") from exc
+        raise HTTPException(status_code=400, detail="Could not reach the ERP endpoint. Check the URL and server availability") from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="Odoo connection failed. Check the URL, database, and credentials") from exc
+        raise HTTPException(status_code=400, detail="ERP connection failed. Check the URL, database, and credentials") from exc
     instance = models.Instance(
         project_id=project.id,
         erp_type=payload.erp_type,
@@ -1333,7 +1340,7 @@ def read_llm_settings(_: models.User = Depends(admin_user), db: Session = Depend
         "model_name": model.value if model else "openai/gpt-4o-mini", "api_key_configured": key is not None,
         "fallback_model_name": fallback.value if fallback else None,
         "timeout_seconds": int(timeout.value) if timeout else 120,
-        "max_output_tokens": int(max_tokens.value) if max_tokens else 8000,
+        "max_output_tokens": int(max_tokens.value) if max_tokens else 2048,
     }
 
 
@@ -1355,7 +1362,7 @@ async def list_llm_models(search: str = "", _: models.User = Depends(admin_user)
         raise HTTPException(status_code=502, detail="OpenRouter model catalogue is unavailable") from exc
     needle = search.casefold()
     return [{"id": item["id"], "name": item.get("name", item["id"]), "context_length": item.get("context_length")}
-            for item in catalogue if not needle or needle in item["id"].casefold() or needle in item.get("name", "").casefold()][:100]
+            for item in catalogue if not needle or needle in item["id"].casefold() or needle in item.get("name", "").casefold()]
 
 
 @app.post("/admin/settings/llm/test")
@@ -1424,8 +1431,11 @@ def create_run(project_id: int, payload: schemas.RunCreate, user: models.User = 
     require_project(db, user, project_id)
     project = enforce_budget(db, project_id)
     
-    instance = db.query(models.Instance).filter(models.Instance.project_id == project_id).first()
-    if not instance or instance.status != "ready":
+    instance = db.query(models.Instance).filter(
+        models.Instance.project_id == project_id,
+        models.Instance.is_active.is_(True),
+    ).first()
+    if not instance or instance.status not in {"ready", "connected"}:
         raise HTTPException(status_code=409, detail="No active staging instance")
 
     key = db.get(models.Setting, "openrouter_api_key")
@@ -1583,6 +1593,16 @@ def retry_run(run_id: str, user: models.User = Depends(current_user), db: Sessio
     if active:
         raise HTTPException(status_code=409, detail={"message": "A project run is already active", "active_run_id": active.id})
     enforce_budget(db, failed.project_id)
+    preserved_graph = None
+    if failed.task_graph:
+        preserved_graph = []
+        for task in failed.task_graph:
+            task_copy = dict(task)
+            if task_copy.get("status") in {"failed", "in_progress"}:
+                task_copy["status"] = "pending"
+                task_copy.pop("result", None)
+            preserved_graph.append(task_copy)
+
     run = models.AgentRun(
         project_id=failed.project_id,
         requested_by_id=user.id,
@@ -1592,10 +1612,11 @@ def retry_run(run_id: str, user: models.User = Depends(current_user), db: Sessio
         planner_model=failed.planner_model,
         fallback_model=failed.fallback_model,
         workspace_base_revision=failed.workspace_base_revision,
+        task_graph=preserved_graph,
     )
     db.add(run)
     db.flush()
-    emit(db, run.id, "run.queued", {"support_id": run.support_id})
+    emit(db, run.id, "run.queued", {"support_id": run.support_id, "task_graph": preserved_graph})
     enqueue(db, "run.start", run.id)
     audit(db, "run.queued", user.id, failed.project_id, {"run_id": run.id, "retry_of_id": failed.id}, support_id=run.support_id, result="queued")
     db.commit()
@@ -1726,8 +1747,11 @@ def decide_run_action(action_id: str, payload: schemas.ActionDecision, user: mod
     if not action.run_id:
         raise HTTPException(status_code=409, detail="Unsupported standalone action")
     run = db.get(models.AgentRun, action.run_id)
-    run.status = "queued"
-    enqueue(db, "action.resume", run.id, {"action_id": action.id, "decision": payload.decision})
+    enqueue(db, "action.resume", run.id, {
+        "action_id": action.id,
+        "decision": payload.decision,
+        "auto_approve_task": payload.auto_approve_task,
+    })
     emit(db, run.id, "approval.decided", {
         "action_id": action.id, "decision": payload.decision,
         "status": action.status, "decided_by": user.id,
@@ -1912,7 +1936,10 @@ def workspace_tree(project_id: int, path: str = "", user: models.User = Depends(
 @app.get("/projects/{project_id}/workspace/files")
 def workspace_file(project_id: int, path: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, project_id)
-    return {"path": path, "content": Workspace(project.workspace_slug).read_file(path)}
+    try:
+        return {"path": path, "content": Workspace(project.workspace_slug).read_file(path)}
+    except (FileNotFoundError, ValueError):
+        raise HTTPException(status_code=404, detail="File not found in workspace")
 
 
 @app.get("/projects/{project_id}/workspace/commits")
@@ -2179,6 +2206,87 @@ def create_deployment(project_id: int, payload: schemas.DeploymentCreate, user: 
     db.commit()
     db.refresh(deployment)
     return deployment
+
+
+@app.post("/projects/{project_id}/quick-deploy")
+def quick_deploy_module(project_id: int, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    project = require_project(db, user, project_id)
+    workspace = Workspace(project.workspace_slug)
+    ws_path = workspace.path
+    manifest_files = list(ws_path.glob("**/__manifest__.py"))
+    if not manifest_files:
+        raise HTTPException(status_code=400, detail="No Odoo module with __manifest__.py found in workspace")
+    
+    manifest_path = manifest_files[0]
+    module_dir = manifest_path.parent
+    rel_path = str(module_dir.relative_to(ws_path))
+    module_name = module_dir.name
+    
+    import ast
+    version = "19.0.1.0.0"
+    try:
+        manifest_data = ast.literal_eval(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(manifest_data, dict):
+            version = str(manifest_data.get("version", version))
+    except Exception:
+        pass
+        
+    report = validate_module(module_dir)
+    commit_hash = workspace.commit(f"Auto-package {module_name} {version}")
+    archive_digest = hashlib.sha256(package_module(module_dir)).hexdigest()
+    
+    artifact = models.Artifact(
+        project_id=project_id,
+        artifact_type="odoo_module",
+        name=module_name,
+        version=version,
+        commit_hash=commit_hash,
+        digest=archive_digest,
+        path=rel_path,
+        status="validated" if report["passed"] else "failed_validation",
+        created_by_id=user.id,
+    )
+    db.add(artifact)
+    db.flush()
+    
+    validation = models.ValidationRun(
+        project_id=project_id,
+        artifact_id=artifact.id,
+        status="passed" if report["passed"] else "failed",
+        report=report,
+        finished_at=datetime.now(timezone.utc),
+    )
+    db.add(validation)
+    
+    instance = db.query(models.Instance).filter(models.Instance.project_id == project_id).first()
+    deployment = None
+    if instance and instance.deployment_config_encrypted:
+        deployment = models.Deployment(
+            project_id=project_id,
+            instance_id=instance.id,
+            artifact_id=artifact.id,
+            validation_id=validation.id,
+            environment=instance.environment,
+            requested_by_id=user.id,
+            rollback_plan="Automated rollback to prior workspace revision",
+        )
+        db.add(deployment)
+        db.flush()
+        enqueue(db, "deployment.start", deployment.id)
+    
+    audit(db, "artifact.quick_deployed", user.id, project_id, {
+        "artifact_id": artifact.id, "module": module_name, "deployed": deployment is not None
+    })
+    db.commit()
+    return {
+        "artifact_id": artifact.id,
+        "module_name": module_name,
+        "version": version,
+        "passed": report["passed"],
+        "deployed": deployment is not None,
+        "deployment_id": deployment.id if deployment else None,
+        "message": f"Module {module_name} validated." + (" Deployment initiated." if deployment else " Connect an instance with a deployment bridge to deploy live.")
+    }
 
 
 @app.get("/projects/{project_id}/memories", response_model=list[schemas.MemoryOut])

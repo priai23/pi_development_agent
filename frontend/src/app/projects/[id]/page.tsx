@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Bot, Brain, ChevronDown, ChevronUp, Code2, Database, GitBranch, History, Layers, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, RotateCcw, Send, Square } from "lucide-react";
+import { AlertTriangle, Bot, Brain, ChevronDown, ChevronUp, Code2, Database, GitBranch, History, Layers, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, Rocket, RotateCcw, Send, Square } from "lucide-react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
@@ -38,7 +38,7 @@ export default function ProjectWorkspace() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [authMethod, setAuthMethod] = useState<"json2" | "xmlrpc">("json2");
+  const [authMethod] = useState<"json2" | "xmlrpc">("xmlrpc");
   const [deciding, setDeciding] = useState(false);
   const [diagnosticExpanded, setDiagnosticExpanded] = useState(false);
   const [questionAnswer, setQuestionAnswer] = useState("");
@@ -56,6 +56,8 @@ export default function ProjectWorkspace() {
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [runs, setRuns] = useState<AgentRun[]>([]);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
+  const [deploying, setDeploying] = useState(false);
+  const [deployMsg, setDeployMsg] = useState<string | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
   const discoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const discoverySequence = useRef(0);
@@ -184,7 +186,7 @@ export default function ProjectWorkspace() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
   }, [load]);
-  useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth" }); }, [chat, pending]);
+  useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth" }); }, [chat, pending, agentQuestion, error, finalReport, steps]);
   useEffect(() => () => {
     if (discoveryTimer.current) clearTimeout(discoveryTimer.current);
     streamAbortRef.current?.abort();
@@ -297,11 +299,14 @@ export default function ProjectWorkspace() {
     } finally { setSubmittingRun(false); }
   };
 
-  const decide = async (decision: "approve" | "reject") => {
+  const decide = async (decision: "approve" | "reject", autoApproveTask = false) => {
     if (!pending) return;
     const action = pending; setDeciding(true); setPageError("");
     try {
-      const run = await apiFetch<AgentRun>(`/actions/${action.id}/decision`, { method: "POST", body: JSON.stringify({ decision }) });
+      const run = await apiFetch<AgentRun>(`/actions/${action.id}/decision`, {
+        method: "POST",
+        body: JSON.stringify({ decision, auto_approve_task: autoApproveTask }),
+      });
       setRun(run);
       setRuns((current) => current.map((item) => item.id === run.id ? run : item));
     } catch (caught) {
@@ -325,6 +330,22 @@ export default function ProjectWorkspace() {
     } catch (caught) {
       setPageError(caught instanceof Error ? caught.message : "Failed to submit answer");
     } finally { setSubmittingAnswer(false); }
+  };
+
+  const handleQuickDeploy = async () => {
+    setDeploying(true);
+    setDeployMsg(null);
+    try {
+      const res = await apiFetch<{ message: string; deployed: boolean }>(`/projects/${projectId}/quick-deploy`, {
+        method: "POST",
+      });
+      setDeployMsg(res.message);
+      void loadWorkspaceDetails();
+    } catch (err) {
+      setDeployMsg(err instanceof Error ? err.message : "Deployment failed");
+    } finally {
+      setDeploying(false);
+    }
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -431,8 +452,8 @@ export default function ProjectWorkspace() {
           )}
           {discoveryMessage && <span className="mt-1 block text-xs text-gray-500">{discoveryMessage}</span>}
         </label>
-        <label className="block text-sm font-medium">Authentication<select value={authMethod} onChange={(event) => setAuthMethod(event.target.value as "json2" | "xmlrpc")} className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm"><option value="json2">Odoo 19 JSON-2 API key (recommended)</option><option value="xmlrpc">XML-RPC username and password</option></select></label>
-        {authMethod === "json2" ? <label className="block text-sm font-medium">Scoped API key<input type="password" required value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="off" placeholder="Enter API key" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label> : <><label className="block text-sm font-medium">Username<input required value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="admin@example.com" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label><label className="block text-sm font-medium">Password<input type="password" required value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Password" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label></>}
+        <label className="block text-sm font-medium">Username<input required value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="admin@example.com" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label>
+        <label className="block text-sm font-medium">Password<input type="password" required value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Password" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label>
         {error && <p className="text-sm text-red-600">{error}</p>}
         <button disabled={loading || detectingDatabases} className="w-full rounded-xl bg-blue-600 py-3 font-medium text-white disabled:opacity-50 transition active:scale-95">{loading ? "Verifying…" : detectingDatabases ? "Discovering databases…" : "Verify and connect"}</button>
       </form>
@@ -587,6 +608,39 @@ export default function ProjectWorkspace() {
             })}
           </AnimatePresence>
 
+          {/* Activity Stepper */}
+          <ActivityStepper
+            steps={steps}
+            usage={usage}
+            supervisorTaskGraph={supervisorTaskGraph}
+            activeTaskId={activeTaskId}
+            recoveringTaskId={recoveringTaskId}
+            planItems={runState.planItems}
+            onOpenDiff={() => {
+              setShowRightPanel(true);
+              setRightPanelTab("diff");
+            }}
+            onOpenFile={(filepath) => {
+              setShowRightPanel(true);
+              setRightPanelTab("code");
+              void openFile(filepath);
+            }}
+          />
+
+          {/* Thinking Text (Protocol 2 — muted italic inline) */}
+          <AnimatePresence>
+            {thinkingText && loading && (
+              <motion.p
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="max-w-2xl pl-9 text-xs italic text-gray-400 dark:text-gray-500"
+              >
+                {thinkingText}
+              </motion.p>
+            )}
+          </AnimatePresence>
+
           {/* Pending Approval Card */}
           <AnimatePresence>
             {pending && (
@@ -597,7 +651,7 @@ export default function ProjectWorkspace() {
                 transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
                 className="max-w-2xl"
               >
-                <ApprovalCard action={pending} busy={deciding} onDecision={(decision) => void decide(decision)} />
+                <ApprovalCard action={pending} busy={deciding} onDecision={(decision, autoApprove) => void decide(decision, autoApprove)} />
               </motion.div>
             )}
           </AnimatePresence>
@@ -649,20 +703,6 @@ export default function ProjectWorkspace() {
             )}
           </AnimatePresence>
 
-          {/* Thinking Text (Protocol 2 — muted italic inline) */}
-          <AnimatePresence>
-            {thinkingText && loading && (
-              <motion.p
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="max-w-2xl pl-9 text-xs italic text-gray-400 dark:text-gray-500"
-              >
-                {thinkingText}
-              </motion.p>
-            )}
-          </AnimatePresence>
-
           {/* Final Report Card (Protocol 4 — pinned, non-collapsible) */}
           {runStatus === "cancelled" && (
             <div className="max-w-2xl rounded-2xl border border-gray-600/40 bg-gray-900/40 p-4 text-sm text-gray-300" role="status">
@@ -704,25 +744,6 @@ export default function ProjectWorkspace() {
               )}
             </div>
           )}
-
-          {/* Activity Stepper */}
-          <ActivityStepper
-            steps={steps}
-            usage={usage}
-            supervisorTaskGraph={supervisorTaskGraph}
-            activeTaskId={activeTaskId}
-            recoveringTaskId={recoveringTaskId}
-            planItems={runState.planItems}
-            onOpenDiff={() => {
-              setShowRightPanel(true);
-              setRightPanelTab("diff");
-            }}
-            onOpenFile={(filepath) => {
-              setShowRightPanel(true);
-              setRightPanelTab("code");
-              void openFile(filepath);
-            }}
-          />
 
           {/* Diagnostic Error / Failure Card */}
           <AnimatePresence>
@@ -890,8 +911,26 @@ export default function ProjectWorkspace() {
                 Artifacts
               </button>
             </div>
-            <button type="button" onClick={() => setShowRightPanel(false)} className="rounded p-1 text-gray-400 hover:bg-white/10 hover:text-white xl:hidden" aria-label="Close workspace panel"><PanelRightClose className="h-4 w-4" /></button>
+            <div className="flex items-center gap-2">
+              <button
+                disabled={deploying}
+                onClick={() => void handleQuickDeploy()}
+                title="Package module and deploy/install to connected Odoo instance"
+                className="flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-950/40 px-2.5 py-1 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-900/60 active:scale-95 disabled:opacity-40"
+              >
+                {deploying ? <Loader2 className="h-3 w-3 animate-spin text-emerald-400" /> : <Rocket className="h-3 w-3 text-emerald-400" />}
+                <span>{deploying ? "Deploying…" : "Deploy to Odoo"}</span>
+              </button>
+              <button type="button" onClick={() => setShowRightPanel(false)} className="rounded p-1 text-gray-400 hover:bg-white/10 hover:text-white xl:hidden" aria-label="Close workspace panel"><PanelRightClose className="h-4 w-4" /></button>
+            </div>
           </div>
+
+          {deployMsg && (
+            <div className="flex items-center justify-between border-b border-emerald-500/20 bg-emerald-950/30 px-3 py-1.5 text-xs text-emerald-300">
+              <span>{deployMsg}</span>
+              <button onClick={() => setDeployMsg(null)} className="ml-2 text-emerald-400 hover:text-emerald-200">✕</button>
+            </div>
+          )}
 
           {workspaceError && <div className="flex items-center justify-between border-b border-red-500/20 bg-red-950/30 px-3 py-2 text-xs text-red-300" role="alert"><span>{workspaceError}</span><button onClick={() => void loadWorkspaceDetails()} className="font-semibold underline">Retry</button></div>}
 

@@ -1,6 +1,7 @@
 [Unit]
 Description=Primacy ERP Implementation Agent - API Service
 After=network.target postgresql.service
+Wants=primacy-worker.service
 PartOf=primacy.target
 
 [Service]

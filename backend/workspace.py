@@ -26,7 +26,13 @@ class Workspace:
             self._git("config", "user.email", "erp-agent@localhost")
 
     def resolve(self, relative_path: str, *, must_exist: bool = False) -> Path:
-        candidate = (self.root / relative_path).resolve(strict=False)
+        clean = (relative_path or "").strip()
+        while clean.startswith("/") or clean.startswith("./"):
+            if clean.startswith("/"):
+                clean = clean.lstrip("/")
+            if clean.startswith("./"):
+                clean = clean[2:]
+        candidate = (self.root / clean).resolve(strict=False)
         if not candidate.is_relative_to(self.root):
             raise ValueError("Path is outside the workspace")
         if must_exist and not candidate.exists():

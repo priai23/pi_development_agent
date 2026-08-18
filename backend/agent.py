@@ -369,7 +369,7 @@ class ERPImplementationAgent:
         api_key: str | None = None,
         base_url: str | None = None,
         request_timeout: int = 120,
-        max_output_tokens: int = 16000,
+        max_output_tokens: int = 2048,
         project_id: int | None = None,
         requested_by_id: int | None = None,
         instance_id: int | None = None,
@@ -1187,14 +1187,18 @@ class ERPImplementationAgent:
         else:
             if reject:
                 state = await self.executor.aget_state(config)
-                last = state.values.get("messages", [])[-1]
-                calls = getattr(last, "tool_calls", [])
-                if len(calls) != 1:
-                    raise ValueError("Pending checkpoint does not contain one tool call")
-                call = calls[0]
+                messages = state.values.get("messages", [])
+                last = messages[-1] if messages else None
+                calls = getattr(last, "tool_calls", []) if last else []
+                if not calls:
+                    raise ValueError("Pending checkpoint does not contain a tool call")
+                tool_messages = [
+                    ToolMessage(tool_call_id=c["id"], name=c.get("name", "tool"), content="User rejected this action.")
+                    for c in calls
+                ]
                 await self.executor.aupdate_state(
                     config,
-                    {"messages": [ToolMessage(tool_call_id=call["id"], name=call["name"], content="User rejected this action.")]},
+                    {"messages": tool_messages},
                     as_node="tools",
                 )
             input_data = None
@@ -1213,24 +1217,18 @@ class ERPImplementationAgent:
                     metadata = getattr(output, "response_metadata", None) or {}
                     self.usage["cost_usd"] += float(metadata.get("cost", 0) or 0)
                 elif event["event"] == "on_tool_start":
-                    tool_iterations += 1
-                    if tool_iterations > 40:
-                        raise RuntimeError("TaskExecutionLimitExceeded: current task exceeded 40 tool iterations")
                     tool_name = event.get("name", "unknown")
                     self.activity_events.append(("tool.started", {
                         "tool": tool_name,
                         "arguments": event.get("data", {}).get("input", {}),
                         "category": tool_category(tool_name),
-                        # run_id wired in by worker when emitting SSE; not available here
                     }))
                     yield ""
                 elif event["event"] == "on_tool_end":
                     output = str(event.get("data", {}).get("output", ""))
                     tool_name = event.get("name", "unknown")
-                    # Detect ask_question sentinel — pause execution for user answer
                     if output.strip() == QUESTION_SENTINEL:
                         return
-                    # Parse ToolResult envelope when present; fall back to legacy outcome classifier
                     tr = ToolResult.from_json(output)
                     if tr is not None:
                         outcome = "succeeded" if tr.ok else "failed"
@@ -1247,10 +1245,8 @@ class ERPImplementationAgent:
                         "category": tool_category(tool_name),
                         "evidence": tr.evidence if tr else [],
                     }))
-                    yield ""
                     if tool_name == "complete_task":
                         task_report_seen = True
-                        return
                 elif event["event"] == "on_tool_error":
                     error = str(event.get("data", {}).get("error", "Tool execution failed"))
                     self.activity_events.append(("tool.failed", {
@@ -1269,7 +1265,27 @@ class ERPImplementationAgent:
             if "tools" not in state.next:
                 input_data = None
                 continue
+
+            # Sanitize multi-tool calls to avoid dangling unfulfilled tool calls in state
+            messages = state.values.get("messages", [])
+            if messages and getattr(messages[-1], "tool_calls", []):
+                last = messages[-1]
+                calls = getattr(last, "tool_calls", [])
+                if len(calls) > 1:
+                    pruned_msg = AIMessage(
+                        content=last.content,
+                        tool_calls=[calls[0]],
+                        id=getattr(last, "id", None),
+                    )
+                    await self.executor.aupdate_state(
+                        config,
+                        {"messages": [pruned_msg]},
+                    )
+
             call = self._single_pending_call(state)
+            if not call:
+                input_data = None
+                continue
             safe = getattr(self, "safe_tools", self.SAFE_TOOLS)
             if call["name"] in self.RISK_CLASSES and call["name"] not in safe:
                 return
@@ -1280,6 +1296,8 @@ class ERPImplementationAgent:
         if "tools" not in state.next:
             return None
         call = self._single_pending_call(state)
+        if not call:
+            return None
         safe = getattr(self, "safe_tools", self.SAFE_TOOLS)
         if call["name"] in safe or call["name"] not in self.RISK_CLASSES:
             return None
@@ -1291,31 +1309,44 @@ class ERPImplementationAgent:
         if "tools" not in state.next:
             return None
         call = self._single_pending_call(state)
-        if call["name"] != "ask_question":
+        if not call or call["name"] != "ask_question":
             return None
         return call
 
     async def answer_question(self, thread_id: str, answer: str) -> None:
-        """Resume the graph after ask_question by injecting the user's answer as a ToolMessage."""
+        """Resume the graph after ask_question by injecting the user's answer."""
         config = {"configurable": {"thread_id": thread_id}}
         state = await self.executor.aget_state(config)
-        last = state.values.get("messages", [])[-1]
-        calls = getattr(last, "tool_calls", [])
-        if len(calls) != 1 or calls[0]["name"] != "ask_question":
-            raise ValueError("No pending ask_question call to answer")
-        call = calls[0]
-        await self.executor.aupdate_state(
-            config,
-            {"messages": [ToolMessage(tool_call_id=call["id"], name=call["name"], content=answer)]},
-            as_node="tools",
-        )
+        messages = state.values.get("messages", [])
+        last = messages[-1] if messages else None
+        calls = getattr(last, "tool_calls", []) if last else []
+        if calls:
+            tool_messages = []
+            for c in calls:
+                if c.get("name") == "ask_question":
+                    tool_messages.append(ToolMessage(tool_call_id=c["id"], name=c["name"], content=answer))
+                else:
+                    tool_messages.append(ToolMessage(tool_call_id=c["id"], name=c.get("name", "unknown"), content="Clarification provided by user."))
+            await self.executor.aupdate_state(
+                config,
+                {"messages": tool_messages},
+                as_node="tools",
+            )
+        else:
+            await self.executor.aupdate_state(
+                config,
+                {"messages": [HumanMessage(content=answer)]},
+            )
 
     @staticmethod
-    def _single_pending_call(state) -> dict:
-        last = state.values.get("messages", [])[-1]
+    def _single_pending_call(state) -> dict | None:
+        messages = state.values.get("messages", [])
+        if not messages:
+            return None
+        last = messages[-1]
         calls = getattr(last, "tool_calls", [])
-        if len(calls) != 1:
-            raise ValueError("The agent must request exactly one tool at a time")
+        if not calls:
+            return None
         return calls[0]
 
     def preview(self, call: dict) -> dict:

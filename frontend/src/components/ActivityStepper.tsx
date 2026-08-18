@@ -67,9 +67,8 @@ export default function ActivityStepper({
 
   const totalTime = cleanSteps.reduce((acc, s) => acc + (s.elapsed || 0), 0);
 
-  // Group steps for Antigravity-style transparency rendering
   const viewSteps = cleanSteps.filter((s) => s.category === "inspect" || (!s.category && (s.tool.includes("view") || s.tool.includes("read") || s.tool.includes("inspect") || s.tool.includes("list"))));
-  const editSteps = cleanSteps.filter((s) => s.category === "edit" || (!s.category && (s.tool.includes("write") || s.tool.includes("patch") || s.tool.includes("replace"))));
+  const editSteps = cleanSteps.filter((s) => s.tool === "write_file" || s.tool === "patch_file" || (s.category === "edit" && !s.tool.includes("directory") && !s.tool.includes("mkdir")));
   const verifySteps = cleanSteps.filter((s) => s.category === "verify" || (!s.category && s.tool.includes("verify")));
   const runSteps = cleanSteps.filter((s) => !viewSteps.includes(s) && !editSteps.includes(s) && !verifySteps.includes(s));
   const verificationFailed = verifySteps.some((step) => step.status === "failed" || step.outcome === "failed");
@@ -336,8 +335,10 @@ export default function ActivityStepper({
           const plusLines = diffMatch ? diffMatch[1] : "1";
           const minusLines = diffMatch ? diffMatch[2] : "0";
 
-          const pathMatch = step.result?.match(/(?:Wrote|Patched)\s+([A-Za-z0-9_./-]+)/) || step.label.match(/(?:file|path)?\s*:?\s*([A-Za-z0-9_./-]+)/);
-          const filepath = pathMatch ? pathMatch[1] : step.label.replace(/^write_file\s*/, "").replace(/^patch_file\s*/, "");
+          const pathMatch = step.result?.match(/(?:Wrote|Patched)\s+([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)/) || step.label.match(/(?:file|path)?\s*:?\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)/);
+          const rawPath = pathMatch ? pathMatch[1] : step.label.replace(/^write_file\s*/, "").replace(/^patch_file\s*/, "");
+          const filepath = rawPath.includes(".") ? rawPath : "";
+          if (!filepath) return null;
 
           return (
             <div

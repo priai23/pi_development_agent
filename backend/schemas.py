@@ -110,11 +110,11 @@ class ProjectOut(ORMModel):
 
 class DetectRequest(BaseModel):
     url: AnyHttpUrl
-    erp_type: Literal["odoo", "pi_erp"]
+    erp_type: Literal["odoo", "pri_erp", "pi_erp"]
 
 
 class InstanceCreate(BaseModel):
-    erp_type: Literal["odoo", "pi_erp"]
+    erp_type: Literal["odoo", "pri_erp", "pi_erp"]
     url: AnyHttpUrl
     db_name: str | None = None
     username: str | None = None
@@ -152,6 +152,7 @@ class ChatRequest(BaseModel):
 
 class ActionDecision(BaseModel):
     decision: Literal["approve", "reject"]
+    auto_approve_task: bool = False
 
 
 class QuestionAnswer(BaseModel):
@@ -186,7 +187,7 @@ class LLMSettingsOut(BaseModel):
     api_key_configured: bool
     fallback_model_name: str | None = None
     timeout_seconds: int = 120
-    max_output_tokens: int = 8000
+    max_output_tokens: int = 2048
 
 
 class LLMSettingsUpdate(BaseModel):
@@ -194,7 +195,7 @@ class LLMSettingsUpdate(BaseModel):
     openrouter_api_key: str | None = Field(default=None, min_length=10)
     fallback_model_name: str | None = None
     timeout_seconds: int = Field(default=120, ge=10, le=600)
-    max_output_tokens: int = Field(default=8000, ge=256, le=100_000)
+    max_output_tokens: int = Field(default=2048, ge=256, le=100_000)
 
 
 class RunCreate(BaseModel):
