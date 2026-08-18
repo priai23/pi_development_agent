@@ -47,7 +47,7 @@ def execute_bridge(deployment: models.Deployment, instance: models.Instance, art
         "module_version": artifact.version,
         "artifact_url": f"{settings.public_base_url.rstrip('/')}/deployments/{deployment.id}/artifact",
         "artifact_digest": artifact.digest,
-        "nonce": new_token(24),
+        "nonce": new_token(),
         "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat(),
     }
     private = Ed25519PrivateKey.from_private_bytes(base64.b64decode(config["signing_private_key"]))

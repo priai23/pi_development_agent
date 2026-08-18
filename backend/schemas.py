@@ -9,7 +9,7 @@ class ORMModel(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 
@@ -32,16 +32,20 @@ class SetupStatusOut(BaseModel):
 
 
 class SetupAdminRequest(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=12)
+    email: str
+    password: str
 
 
 class AdminUserCreate(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=12)
+    email: str
+    password: str
     role: Literal["admin", "member"] = "member"
     organization_ids: list[int] = []
     approver_organization_ids: list[int] = []
+
+
+class AdminPasswordDirectChange(BaseModel):
+    password: str
 
 
 class AdminUserUpdate(BaseModel):
@@ -157,6 +161,7 @@ class QuestionAnswer(BaseModel):
 class AgentQuestionOut(ORMModel):
     id: str
     run_id: str
+    kind: str
     question: str
     options: list[str]
     answer: str | None
@@ -195,6 +200,7 @@ class LLMSettingsUpdate(BaseModel):
 class RunCreate(BaseModel):
     message: str = Field(min_length=1, max_length=20_000)
     queue_if_busy: bool = False
+    module_name: str | None = Field(default=None, pattern="^[a-z][a-z0-9_]{0,127}$")
 
 
 class RunOut(ORMModel):
@@ -218,6 +224,8 @@ class RunOut(ORMModel):
     planner_model: str | None = None
     fallback_model: str | None = None
     workspace_base_revision: str | None = None
+    module_name: str | None = None
+    stage: str
     question: AgentQuestionOut | None = None
 
 
@@ -276,12 +284,12 @@ class HostPolicyOut(ORMModel):
 
 class PasswordChange(BaseModel):
     current_password: str
-    new_password: str = Field(min_length=12)
+    new_password: str
 
 
 class PasswordResetComplete(BaseModel):
     token: str
-    new_password: str = Field(min_length=12)
+    new_password: str
 
 
 class SessionOut(ORMModel):

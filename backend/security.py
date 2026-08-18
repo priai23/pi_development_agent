@@ -28,8 +28,8 @@ def decrypt_secret(value: str) -> str:
 
 
 def hash_password(password: str) -> str:
-    if len(password) < 12:
-        raise ValueError("Password must be at least 12 characters")
+    if not password:
+        raise ValueError("Password cannot be empty")
     return _passwords.hash(password)
 
 

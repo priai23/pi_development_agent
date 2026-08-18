@@ -24,6 +24,7 @@ from deployment import execute_deployment
 from security import decrypt_secret
 from source_indexer import index_addon_roots
 from workspace import Workspace
+from specification import compile_specification
 
 # ─── Watchdog tunables ─────────────────────────────────────────────────────────
 SUBTASK_STALE_SECONDS = 90   # per sub-task heartbeat threshold
@@ -274,12 +275,19 @@ def recover_stale_work() -> None:
 
 def claim_outbox():
     with SessionLocal() as db:
+        # Find active aggregate_ids (runs that have an event currently claimed)
+        active_aggregates = select(models.OutboxEvent.aggregate_id).where(
+            models.OutboxEvent.completed_at.is_(None),
+            models.OutboxEvent.claimed_at.is_not(None)
+        )
+        
         event = db.execute(
             select(models.OutboxEvent)
             .where(
                 models.OutboxEvent.completed_at.is_(None),
                 models.OutboxEvent.claimed_at.is_(None),
                 models.OutboxEvent.available_at <= datetime.now(timezone.utc),
+                models.OutboxEvent.aggregate_id.not_in(active_aggregates)
             )
             .order_by(models.OutboxEvent.id)
             .with_for_update(skip_locked=True)
@@ -332,32 +340,82 @@ async def build_agent(db, run: models.AgentRun, checkpointer):
     )
 
 
-def process_source_index(run_id: str, snapshot_id: str) -> None:
-    """Index available addon roots and persist SourceSymbol rows for the snapshot."""
+def process_run_prepare(run_id: str) -> None:
+    """Execute idempotent run preparation: index, spec, task graph, then enqueue run.start."""
     with SessionLocal() as db:
-        snapshot = db.get(models.SourceSnapshot, snapshot_id)
-        if not snapshot:
-            return
         run = db.get(models.AgentRun, run_id)
-        if not run:
+        if not run or run.status not in ("queued", "running"):
             return
         project = db.get(models.Project, run.project_id)
-        if not project:
-            return
-        try:
-            snapshot.status = "indexing"
-            db.commit()
-            ws = Workspace(project.workspace_slug)
-            roots = [ws.root]
-            symbol_count = index_addon_roots(roots, snapshot_id, db)
-            snapshot.status = "indexed"
-            snapshot.symbol_count = symbol_count
-            snapshot.indexed_at = datetime.now(timezone.utc)
-            db.commit()
-        except Exception as exc:
-            snapshot.status = "failed"
-            snapshot.index_error = str(exc)[:2000]
-            db.commit()
+        snapshot = db.get(models.SourceSnapshot, run.source_snapshot_id) if run.source_snapshot_id else None
+
+        # 1. Index snapshot
+        if snapshot and snapshot.status == "pending_index":
+            try:
+                snapshot.status = "indexing"
+                db.commit()
+                ws = Workspace(project.workspace_slug)
+                symbol_count = index_addon_roots([ws.root], snapshot.id, db)
+                snapshot.status = "indexed"
+                snapshot.symbol_count = symbol_count
+                snapshot.indexed_at = datetime.now(timezone.utc)
+                db.commit()
+            except Exception as exc:
+                snapshot.status = "failed"
+                snapshot.index_error = str(exc)[:2000]
+                run.status = "failed"
+                run.error_message = f"Indexing failed: {exc}"
+                run.finished_at = datetime.now(timezone.utc)
+                db.commit()
+                return
+
+        # 2. Resolve install vs upgrade
+        is_upgrade = False
+        if snapshot:
+            mod_exists = db.query(models.SourceSymbol).filter(
+                models.SourceSymbol.snapshot_id == snapshot.id,
+                models.SourceSymbol.kind == "module",
+                models.SourceSymbol.name == run.module_name
+            ).first()
+            if mod_exists:
+                is_upgrade = True
+
+        # 3. Call compile_specification
+        if not run.specification_id:
+            symbols = db.query(models.SourceSymbol).filter(models.SourceSymbol.snapshot_id == snapshot.id).all() if snapshot else []
+            try:
+                spec = compile_specification(
+                    run_id=run.id,
+                    project_id=project.id,
+                    snapshot_id=snapshot.id if snapshot else None,
+                    prompt=run.prompt,
+                    module_name=run.module_name or "unknown",
+                    is_upgrade=is_upgrade,
+                    snapshot_symbols=symbols,
+                    db=db
+                )
+                run.specification_id = spec.specification_id
+                db.commit()
+            except Exception as exc:
+                run.status = "failed"
+                run.error_message = f"Specification compilation failed: {exc}"
+                run.finished_at = datetime.now(timezone.utc)
+                db.commit()
+                return
+
+        # 4 & 5. Build task graph
+        if not run.task_graph:
+            spec_row = db.get(models.RunSpecification, run.specification_id)
+            if spec_row and spec_row.requirements:
+                graph = SupervisorPlanner.build_from_specification(spec_row.requirements)
+                run.task_graph = graph
+                run.task_retries = {}
+                db.commit()
+
+        # 6. enqueue run.start
+        from database import enqueue
+        enqueue(db, "run.start", run.id)
+        db.commit()
 
 
 async def _initialise_task_graph(db, run: models.AgentRun) -> list[dict]:
@@ -702,18 +760,18 @@ async def process_run(
                     outcome = str(task_report.get("outcome", "FAILED")).upper()
                     task_succeeded = outcome == "SUCCESS"
 
-                    # Backend acceptance check gate: verify if any required acceptance check failed
+                    # Backend acceptance check gate: verify if any required acceptance check failed or is pending
                     unsatisfied_checks = finish_db.query(models.AcceptanceCheck).filter(
                         models.AcceptanceCheck.run_id == current.id,
                         models.AcceptanceCheck.task_id == task_id,
                         models.AcceptanceCheck.required == True,
-                        models.AcceptanceCheck.status == "failed",
+                        models.AcceptanceCheck.status != "passed",
                     ).all()
                     if unsatisfied_checks:
                         task_succeeded = False
                         failed_names = [f"{c.kind}:{c.spec_target}" for c in unsatisfied_checks]
                         task_report["errors"] = (
-                            f"AcceptanceCheckFailed: {len(unsatisfied_checks)} required checks failed: {', '.join(failed_names)}"
+                            f"AcceptanceCheckFailed: {len(unsatisfied_checks)} required checks pending or failed: {', '.join(failed_names)}"
                         )
 
                     handoff = {
@@ -814,10 +872,8 @@ async def handle_event(event, checkpointer):
             await process_run(run_id, checkpointer, action_id=payload["action_id"], decision=payload["decision"], cancel_after=payload.get("cancel_after", False))
         elif event_type == "deployment.start":
             await asyncio.to_thread(execute_deployment, run_id)
-        elif event_type == "source.index":
-            snapshot_id = payload.get("snapshot_id")
-            if snapshot_id:
-                await asyncio.to_thread(process_source_index, run_id, snapshot_id)
+        elif event_type == "run.prepare":
+            await asyncio.to_thread(process_run_prepare, run_id)
         with SessionLocal() as db:
             stored = db.get(models.OutboxEvent, event_id)
             stored.completed_at = datetime.now(timezone.utc)
@@ -862,25 +918,34 @@ async def handle_event(event, checkpointer):
             db.commit()
 
 
+async def worker_loop(worker_id: int, checkpointer):
+    while True:
+        event = await asyncio.to_thread(claim_outbox)
+        if event:
+            await handle_event(event, checkpointer)
+        else:
+            await asyncio.sleep(1)
+
+
 async def serve():
     shutdown_event = threading.Event()
     start_worker_lease_thread(shutdown_event)
-    recover_stale_work()
-    last_recovery = time.time()
+    
+    async def recovery_loop():
+        while not shutdown_event.is_set():
+            await asyncio.to_thread(recover_stale_work)
+            await asyncio.sleep(10)
+            
+    recovery_task = asyncio.create_task(recovery_loop())
+    
     try:
         async with AsyncPostgresSaver.from_conn_string(settings.checkpoint_url) as checkpointer:
             await checkpointer.setup()
-            while True:
-                if time.time() - last_recovery >= 10:
-                    recover_stale_work()
-                    last_recovery = time.time()
-                event = claim_outbox()
-                if event:
-                    await handle_event(event, checkpointer)
-                else:
-                    await asyncio.sleep(1)
+            workers = [asyncio.create_task(worker_loop(i, checkpointer)) for i in range(settings.worker_concurrency)]
+            await asyncio.gather(*workers)
     finally:
         shutdown_event.set()
+        recovery_task.cancel()
 
 
 if __name__ == "__main__":

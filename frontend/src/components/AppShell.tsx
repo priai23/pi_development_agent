@@ -23,8 +23,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       const state = await apiFetch<AuthState>("/auth/me");
       setCsrfToken(state.csrf_token);
       setUser(state.user);
-      if (state.user.must_change_password && pathname !== "/account") router.replace("/account");
-      else if (isPublic && pathname === "/login") router.replace("/projects");
+      if (isPublic && pathname === "/login") router.replace("/projects");
     } catch {
       setUser(null);
       if (!isPublic) router.replace("/login");

@@ -15,10 +15,20 @@ from specification import compile_specification, get_specification_summary, VALI
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "test_addon"
 
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 @pytest.fixture
 def db_session():
-    with SessionLocal() as db:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    models.Base.metadata.create_all(bind=engine)
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    
+    db = TestingSessionLocal()
+    try:
         yield db
+    finally:
+        db.close()
 
 
 def test_valid_check_kinds():
@@ -56,7 +66,7 @@ def test_compile_specification_basic(db_session):
             org = models.Organization(name="Test Org")
             db_session.add(org)
             db_session.flush()
-        project = models.Project(organization_id=org.id, name="Test Project", workspace_slug="test_slug")
+        project = models.Project(organization_id=org.id, name="Test Project", workspace_slug="test_slug", created_by_id=user.id)
         db_session.add(project)
         db_session.flush()
 
@@ -105,7 +115,19 @@ def test_compile_specification_with_indexed_symbols(db_session):
     run_id = f"test-run-{pytest.importorskip('uuid').uuid4().hex[:8]}"
 
     user = db_session.query(models.User).first()
+    if not user:
+        user = models.User(email="test@example.com", password_hash="hash", role="admin")
+        db_session.add(user)
+        db_session.flush()
+
     project = db_session.query(models.Project).first()
+    if not project:
+        org = models.Organization(name="Test Org")
+        db_session.add(org)
+        db_session.flush()
+        project = models.Project(organization_id=org.id, name="Test Project", workspace_slug="test_slug", created_by_id=user.id)
+        db_session.add(project)
+        db_session.flush()
 
     run = models.AgentRun(
         id=run_id,
@@ -121,7 +143,6 @@ def test_compile_specification_with_indexed_symbols(db_session):
     if not instance:
         instance = models.Instance(
             project_id=project.id,
-            name="Test Instance",
             url="http://localhost:8069",
             erp_type="odoo",
         )

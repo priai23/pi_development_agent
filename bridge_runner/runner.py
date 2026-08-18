@@ -108,6 +108,26 @@ def bridge_rpc(bridge_url: str, endpoint: str, params: dict | None = None) -> di
 def update_job_status(bridge_url: str, job_uuid: str, state: str, logs: str = "") -> None:
     bridge_rpc(bridge_url, f"/primacy/bridge/v1/jobs/{job_uuid}/result", {"state": state, "logs": logs[-100_000:]})
 
+def save_terminal_status(config: dict, job_uuid: str, state: str, logs: str = "") -> None:
+    reports_dir = Path(config.get("reports_path", "pending_reports"))
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    temp_file = reports_dir / f"{job_uuid}.tmp"
+    final_file = reports_dir / f"{job_uuid}.json"
+    temp_file.write_text(json.dumps({"job_uuid": job_uuid, "state": state, "logs": logs}))
+    temp_file.replace(final_file)
+
+def flush_pending_results(config: dict) -> None:
+    reports_dir = Path(config.get("reports_path", "pending_reports"))
+    if not reports_dir.exists():
+        return
+    for report_file in reports_dir.glob("*.json"):
+        try:
+            report = json.loads(report_file.read_text())
+            update_job_status(config["bridge_url"], report["job_uuid"], report["state"], report["logs"])
+            report_file.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.error("Failed to flush report %s: %s", report_file.name, exc)
+
 
 def restart_odoo(command: list[str]) -> None:
     if not command or any(not isinstance(item, str) or not item for item in command):
@@ -475,21 +495,27 @@ def run_deploy(job: dict, config: dict, seen_nonces: set) -> None:
                 if existing.exists():
                     shutil.rmtree(existing)
                 shutil.move(str(backup), str(existing))
-                update_job_status(config["bridge_url"], job_uuid, "rolled_back",
-                                  f"Restart failed; previous artifact restored: {restart_error}")
+                try:
+                    restart_odoo(config["restart_command"])
+                    save_terminal_status(config, job_uuid, "rolled_back", f"Restart failed; previous artifact restored: {restart_error}")
+                except Exception as rollback_error:
+                    save_terminal_status(config, job_uuid, "failed", f"Restart failed AND rollback restart failed! Manual recovery required. Original error: {restart_error}. Rollback error: {rollback_error}")
                 return
             raise
-        update_job_status(config["bridge_url"], job_uuid, "succeeded", "Deployment completed successfully")
+        save_terminal_status(config, job_uuid, "succeeded", "Deployment completed successfully")
     except Exception as exc:
         try:
             if backup and backup.exists() and existing:
                 if existing.exists():
                     shutil.rmtree(existing)
                 shutil.move(str(backup), str(existing))
-                update_job_status(config["bridge_url"], job_uuid, "rolled_back",
-                                  f"Deployment failed; previous artifact restored: {exc}")
+                try:
+                    restart_odoo(config["restart_command"])
+                    save_terminal_status(config, job_uuid, "rolled_back", f"Deployment failed; previous artifact restored: {exc}")
+                except Exception as rollback_error:
+                    save_terminal_status(config, job_uuid, "failed", f"Deployment failed AND rollback restart failed! Manual recovery required. Original error: {exc}. Rollback error: {rollback_error}")
             else:
-                update_job_status(config["bridge_url"], job_uuid, "failed", f"{type(exc).__name__}: {exc}")
+                save_terminal_status(config, job_uuid, "failed", f"{type(exc).__name__}: {exc}")
         except Exception:
             pass
 
@@ -541,6 +567,7 @@ def main():
     nonce_store = Path(config.get("nonce_store_path", "nonce-ledger.txt"))
     seen_nonces: set[str] = set(nonce_store.read_text(encoding="utf-8").splitlines()) if nonce_store.exists() else set()
     while True:
+        flush_pending_results(config)
         try:
             job = bridge_rpc(config["bridge_url"], "/primacy/bridge/v1/jobs/next", {"runner_id": runner_id})
             if job:

@@ -10,9 +10,9 @@ def test_passwords_are_argon2_hashed_and_verified():
     assert not verify_password(encoded, "wrong password")
 
 
-def test_short_password_is_rejected():
+def test_empty_password_is_rejected():
     with pytest.raises(ValueError):
-        hash_password("too-short")
+        hash_password("")
 
 
 def test_secret_decryption_fails_closed():

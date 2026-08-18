@@ -82,7 +82,7 @@ def test_retry_run_preserves_models_and_revision(test_db):
     test_db.add_all([user, org])
     test_db.flush()
     test_db.add(models.OrganizationMembership(user_id=user.id, organization_id=org.id, is_approver=True))
-    project = models.Project(name="Proj", organization_id=org.id, created_by_id=user.id, workspace_slug="proj")
+    project = models.Project(name="Proj", organization_id=org.id, created_by_id=user.id, workspace_slug="proj", monthly_budget_usd=100.0)
     test_db.add(project)
     test_db.flush()
 

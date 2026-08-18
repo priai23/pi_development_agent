@@ -238,6 +238,7 @@ class AgentRun(Base):
     last_progress_at = Column(DateTime(timezone=True), nullable=True)
     current_operation = Column(String(128), nullable=True)        # human-readable current op description
     operation_deadline_at = Column(DateTime(timezone=True), nullable=True)
+    module_name = Column(String(128), nullable=True)
     question = relationship("AgentQuestion", back_populates="run", uselist=False, cascade="all, delete-orphan")
 
 
@@ -247,6 +248,7 @@ class AgentQuestion(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
     run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    kind = Column(String(32), nullable=False, default="agent")
     question = Column(Text, nullable=False)
     options = Column(JSON, nullable=False, default=list)
     answer = Column(Text, nullable=True)
@@ -278,8 +280,8 @@ class OutboxEvent(Base):
     aggregate_id = Column(String(36), nullable=False, index=True)
     payload = Column(JSON, nullable=False, default=dict)
     available_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
-    claimed_at = Column(DateTime(timezone=True), nullable=True)
-    completed_at = Column(DateTime(timezone=True), nullable=True)
+    claimed_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True, index=True)
     attempts = Column(Integer, nullable=False, default=0)
     last_error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
