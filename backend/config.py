@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     action_expiry_minutes: int = 30
     public_base_url: str = Field(default="http://localhost:8001", validation_alias="PUBLIC_BASE_URL")
     worker_concurrency: int = Field(default=5, validation_alias="WORKER_CONCURRENCY")
+    validation_postgres_admin_dsn: str = Field(default="", validation_alias="VALIDATION_POSTGRES_ADMIN_DSN")
+    validation_postgres_host: str = Field(default="localhost", validation_alias="VALIDATION_POSTGRES_HOST")
+    validation_postgres_port: int = Field(default=5432, validation_alias="VALIDATION_POSTGRES_PORT")
+    validation_postgres_user: str = Field(default="odoo", validation_alias="VALIDATION_POSTGRES_USER")
+    validation_postgres_password: str = Field(default="", validation_alias="VALIDATION_POSTGRES_PASSWORD")
+    validation_odoo_image: str = Field(default="odoo:19.0", validation_alias="VALIDATION_ODOO_IMAGE")
+    validation_timeout_seconds: int = Field(default=600, validation_alias="VALIDATION_TIMEOUT_SECONDS")
+    autonomous_repair_enabled: bool = Field(default=True, validation_alias="AUTONOMOUS_REPAIR_ENABLED")
 
     @field_validator("encryption_key")
     @classmethod

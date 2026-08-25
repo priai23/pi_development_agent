@@ -873,7 +873,12 @@ class ERPImplementationAgent:
             """Package a custom module in the workspace into a versioned artifact and run automated validations after approval."""
             module_path = self.workspace.resolve(path, must_exist=True)
             commit_hash = self.workspace.commit(f"Package {name} {version}")
-            report = validation.validate_module(module_path)
+            installed = self.client.search_read("ir.module.module", [("name", "=", name)], ["state"], 1)
+            report = validation.validate_module_full(
+                module_path,
+                name,
+                is_upgrade=bool(installed and installed[0].get("state") == "installed"),
+            )
             archive_digest = hashlib.sha256(validation.package_module(module_path)).hexdigest()
             
             with SessionLocal() as db:
@@ -903,21 +908,19 @@ class ERPImplementationAgent:
                 if self.run_id:
                     checks = db.query(models.AcceptanceCheck).filter(
                         models.AcceptanceCheck.run_id == self.run_id,
-                        models.AcceptanceCheck.status == "pending"
+                        models.AcceptanceCheck.status != "passed"
                     ).all()
                     for check in checks:
-                        if check.kind == "artifact_digest":
+                        if check.kind == "artifact_digest" and report["static"]["passed"]:
                             check.status = "passed"
                             check.evidence = [{"kind": "artifact", "ref": artifact.id, "digest": archive_digest, "summary": "Artifact packaged and hashed"}]
                             check.evaluated_at = datetime.now(timezone.utc)
-                        elif check.kind in ("python_test", "acl", "xml_id", "model_field"):
-                            # This is a bit simplified, but let's assume validate_module handles static checks
-                            if report["passed"]:
-                                check.status = "passed"
-                                check.evidence = [{"kind": "validation_report", "ref": val_run.id, "digest": archive_digest, "summary": "Passed static validation"}]
-                            else:
-                                check.status = "failed"
-                                check.result_detail = "Static validation failed"
+                        elif check.task_id == "validate_and_verify":
+                            runtime_ok = report["runtime"].get("ok") is True
+                            tests_ok = int(report["runtime"].get("test_count", 0)) > 0
+                            check.status = "passed" if runtime_ok and (check.kind != "business_scenario" or tests_ok) else "failed"
+                            check.result_detail = "Disposable Odoo install/upgrade and tests passed" if check.status == "passed" else (report["runtime"].get("error") or "Runtime evidence did not satisfy this check")
+                            check.evidence = [{"kind": "runtime_validation", "ref": val_run.id, "digest": archive_digest, "summary": check.result_detail}]
                             check.evaluated_at = datetime.now(timezone.utc)
 
                 db.commit()
@@ -930,35 +933,26 @@ class ERPImplementationAgent:
 
         @tool
         def execute_deployment(artifact_id: str, environment: str) -> str:
-            """Trigger a deployment of an artifact to an environment (staging or production) after approval."""
+            """Request deployment of a validated artifact. Execution remains subject to deployment approval."""
             with SessionLocal() as db:
                 artifact = db.get(models.Artifact, artifact_id)
                 if not artifact or artifact.project_id != self.project_id:
                     return "Artifact not found"
-                val = db.query(models.ValidationRun).filter(
-                    models.ValidationRun.artifact_id == artifact.id, models.ValidationRun.status == "passed"
-                ).order_by(models.ValidationRun.created_at.desc()).first()
-                if not val:
-                    return "Cannot deploy artifact without a passed validation run"
-                
-                deploy = models.Deployment(
-                    project_id=self.project_id,
-                    instance_id=self.instance_id,
-                    artifact_id=artifact.id,
-                    validation_id=val.id,
-                    environment=environment,
-                    status="queued",
-                    requested_by_id=self.requested_by_id,
-                )
-                db.add(deploy)
-                db.commit()
-                
+                if environment not in {"staging", "production"}:
+                    return "Unsupported deployment environment"
+                instance = db.get(models.Instance, self.instance_id)
+                if not instance or instance.project_id != self.project_id or instance.environment != environment:
+                    return "Deployment environment does not match the connected project instance"
+                project = db.get(models.Project, self.project_id)
                 try:
-                    deployment.execute_deployment(deploy.id)
-                    db.refresh(deploy)
-                    return json.dumps({"deployment_id": deploy.id, "status": deploy.status})
-                except Exception as exc:
-                    return json.dumps({"deployment_id": deploy.id, "status": "failed", "error": str(exc)})
+                    deploy = deployment.request_deployment(
+                        db, project, instance, artifact, self.requested_by_id,
+                        rollback_plan="Agent-prepared rollback to the previously verified artifact",
+                    )
+                except ValueError as exc:
+                    return str(exc)
+                db.commit()
+                return json.dumps({"deployment_id": deploy.id, "status": deploy.status})
 
         @tool
         def check_deployment_status(deployment_id: str) -> str:
@@ -1566,9 +1560,18 @@ class SupervisorPlanner:
                 "acceptance_criteria": "ACL entries exist for all models in ir.model.access.csv.",
             },
             {
+                "task_id": "generate_tests",
+                "title": "Generate Odoo tests for the required business scenario",
+                "depends_on": ["implement_models", "implement_views", "implement_security"],
+                "status": "pending",
+                "max_retries": 2,
+                "retry_count": 0,
+                "acceptance_criteria": "Odoo tests cover the core scenario and security-sensitive behavior.",
+            },
+            {
                 "task_id": "validate_and_verify",
                 "title": "Package module and verify installation on Odoo 19",
-                "depends_on": ["implement_views", "implement_security"],
+                "depends_on": ["generate_tests"],
                 "status": "pending",
                 "max_retries": 2,
                 "retry_count": 0,

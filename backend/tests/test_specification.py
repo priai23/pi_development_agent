@@ -10,7 +10,14 @@ from database import SessionLocal
 import models
 from pathlib import Path
 from source_indexer import index_addon
-from specification import compile_specification, get_specification_summary, VALID_CHECK_KINDS
+from specification import (
+    CHECK_GATED_TASKS,
+    TASK_VALIDATE_AND_VERIFY,
+    VALID_CHECK_KINDS,
+    compile_specification,
+    get_specification_summary,
+)
+from worker import required_acceptance_failures
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "test_addon"
 
@@ -104,6 +111,33 @@ def test_compile_specification_basic(db_session):
     for c in summary["acceptance_checks"]:
         assert c["kind"] in VALID_CHECK_KINDS
         assert c["status"] == "pending"
+        assert not c["task_id"].startswith("run:")
+
+    task_ids = {c["task_id"] for c in summary["acceptance_checks"]}
+    assert TASK_VALIDATE_AND_VERIFY in task_ids
+    assert task_ids <= CHECK_GATED_TASKS
+
+
+def test_acceptance_gate_fails_closed_and_requires_passed_checks(db_session):
+    assert required_acceptance_failures(db_session, "missing-run", TASK_VALIDATE_AND_VERIFY) == [
+        "AcceptanceCheckMissing: no required checks were compiled for validate_and_verify"
+    ]
+
+    check = models.AcceptanceCheck(
+        run_id="run-1",
+        task_id=TASK_VALIDATE_AND_VERIFY,
+        kind="module_install",
+        spec_target={"module": "sample"},
+        required=True,
+        status="pending",
+    )
+    db_session.add(check)
+    db_session.flush()
+    assert required_acceptance_failures(db_session, "run-1", TASK_VALIDATE_AND_VERIFY)
+
+    check.status = "passed"
+    db_session.flush()
+    assert required_acceptance_failures(db_session, "run-1", TASK_VALIDATE_AND_VERIFY) == []
 
 
 def test_compile_specification_with_indexed_symbols(db_session):

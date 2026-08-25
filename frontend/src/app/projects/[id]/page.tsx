@@ -342,7 +342,7 @@ export default function ProjectWorkspace() {
       setDeployMsg(res.message);
       void loadWorkspaceDetails();
     } catch (err) {
-      setDeployMsg(err instanceof Error ? err.message : "Deployment failed");
+      setDeployMsg(err instanceof Error ? err.message : "Validation failed");
     } finally {
       setDeploying(false);
     }
@@ -915,11 +915,11 @@ export default function ProjectWorkspace() {
               <button
                 disabled={deploying}
                 onClick={() => void handleQuickDeploy()}
-                title="Package module and deploy/install to connected Odoo instance"
+                title="Package module and run disposable Odoo installation tests"
                 className="flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-950/40 px-2.5 py-1 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-900/60 active:scale-95 disabled:opacity-40"
               >
                 {deploying ? <Loader2 className="h-3 w-3 animate-spin text-emerald-400" /> : <Rocket className="h-3 w-3 text-emerald-400" />}
-                <span>{deploying ? "Deploying…" : "Deploy to Odoo"}</span>
+                <span>{deploying ? "Validating…" : "Validate module"}</span>
               </button>
               <button type="button" onClick={() => setShowRightPanel(false)} className="rounded p-1 text-gray-400 hover:bg-white/10 hover:text-white xl:hidden" aria-label="Close workspace panel"><PanelRightClose className="h-4 w-4" /></button>
             </div>

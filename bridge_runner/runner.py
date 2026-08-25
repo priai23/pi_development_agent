@@ -21,6 +21,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 logger = logging.getLogger(__name__)
+MODULE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 
 CONFIG_PATH = os.environ.get("PRIMACY_RUNNER_CONFIG", "config.json")
 BRIDGE_TOKEN = os.environ.get("PRIMACY_BRIDGE_TOKEN")
@@ -133,6 +134,42 @@ def restart_odoo(command: list[str]) -> None:
     if not command or any(not isinstance(item, str) or not item for item in command):
         raise RunnerError("Invalid restart command")
     subprocess.run(command, check=True, timeout=120)
+
+
+def run_odoo_module_command(command: list[str], operation: str, module_name: str, timeout: int = 600) -> str:
+    if not command or any(not isinstance(item, str) or not item for item in command):
+        raise RunnerError("Invalid Odoo module command")
+    if operation not in {"install", "upgrade"}:
+        raise RunnerError(f"Unsupported deployment operation: {operation}")
+    if not MODULE_NAME_RE.fullmatch(module_name):
+        raise RunnerError("Invalid Odoo module name")
+    completed = subprocess.run(
+        [*command, "-i" if operation == "install" else "-u", module_name],
+        capture_output=True,
+        text=True,
+        timeout=max(1, min(int(timeout), 3600)),
+        check=False,
+    )
+    output = ((completed.stdout or "") + (completed.stderr or ""))[-100_000:]
+    if completed.returncode:
+        raise RunnerError(f"Odoo module {operation} failed with exit code {completed.returncode}:\n{output}")
+    return output
+
+
+def backup_database(command: list[str], destination: Path, timeout: int = 600) -> None:
+    if not command or any(not isinstance(item, str) or not item for item in command):
+        raise RunnerError("A fixed database_backup_command is required")
+    subprocess.run([*command, f"--file={destination}"], check=True, capture_output=True, timeout=timeout)
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RunnerError("Database backup command did not create a backup")
+
+
+def restore_database(command: list[str], source: Path, timeout: int = 600) -> None:
+    if not command or any(not isinstance(item, str) or not item for item in command):
+        raise RunnerError("A fixed database_restore_command is required")
+    if not source.is_file():
+        raise RunnerError("Database backup is unavailable for rollback")
+    subprocess.run([*command, str(source)], check=True, capture_output=True, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -425,12 +462,39 @@ def run_validate_module(job: dict, config: dict) -> dict:
             checks.append({"name": "db_create", "passed": True, "message": "Skipped (no admin_dsn)"})
 
         try:
-            flag = "-i" if not is_upgrade else "-u"
+            if is_upgrade:
+                # ponytail: validates registry/update idempotence; supply a sanitized prior-version DB for migration semantics.
+                baseline_rc, baseline_output = _run_docker_odoo(
+                    ["-d", test_db, "-i", module_name],
+                    addon_root, db_host, db_port, db_user, db_password, config, timeout,
+                )
+                log_combined += baseline_output
+                checks.append({
+                    "name": "upgrade_baseline_install",
+                    "passed": baseline_rc == 0,
+                    "message": f"Candidate baseline install exited with {baseline_rc}",
+                })
+                if baseline_rc != 0:
+                    return {
+                        "ok": False,
+                        "module_name": module_name,
+                        "is_upgrade": True,
+                        "checks": checks,
+                        "test_count": 0,
+                        "log": log_combined[-8_000:],
+                        "error": "Upgrade baseline installation failed",
+                    }
+            flag = "-u" if is_upgrade else "-i"
             args = ["-d", test_db, flag, module_name, "--test-enable"]
             rc, output = _run_docker_odoo(args, addon_root, db_host, db_port, db_user, db_password, config, timeout)
             log_combined += output
             parsed = _parse_odoo_log(output)
             checks.extend(parsed["checks"])
+            checks.append({
+                "name": "odoo_exit_code",
+                "passed": rc == 0,
+                "message": f"Odoo exited with {rc}",
+            })
         finally:
             if db_created and admin_dsn:
                 try:
@@ -451,13 +515,14 @@ def run_validate_module(job: dict, config: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Legacy deploy operation (v1 unchanged)
+# Signed install/upgrade deployment operation
 # ---------------------------------------------------------------------------
 
 def run_deploy(job: dict, config: dict, seen_nonces: set) -> None:
     job_uuid = job["job_uuid"]
     existing = None
     backup = None
+    database_backup = None
     try:
         public_key = Ed25519PublicKey.from_public_bytes(base64.b64decode(config["public_key_base64"], validate=True))
         verify_job(job, public_key, seen_nonces)
@@ -475,6 +540,12 @@ def run_deploy(job: dict, config: dict, seen_nonces: set) -> None:
         backup_root.mkdir(parents=True, exist_ok=True)
         existing = addon_root / job["module_name"]
         backup = backup_root / f"{job_uuid}-{job['module_name']}"
+        database_backup = backup_root / f"{job_uuid}-database.dump"
+        backup_database(
+            config.get("database_backup_command", []),
+            database_backup,
+            config.get("database_command_timeout_seconds", 600),
+        )
         if existing.exists():
             if backup.exists():
                 shutil.rmtree(backup)
@@ -488,32 +559,52 @@ def run_deploy(job: dict, config: dict, seen_nonces: set) -> None:
         finally:
             Path(archive_path).unlink(missing_ok=True)
 
+        operation = job.get("operation")
+        update_log = ""
         try:
+            update_log = run_odoo_module_command(
+                config.get("odoo_module_command", []),
+                operation,
+                job["module_name"],
+                config.get("module_command_timeout_seconds", 600),
+            )
             restart_odoo(config["restart_command"])
-        except Exception as restart_error:
+        except Exception as deploy_error:
             if backup and backup.exists():
                 if existing.exists():
                     shutil.rmtree(existing)
                 shutil.move(str(backup), str(existing))
-                try:
-                    restart_odoo(config["restart_command"])
-                    save_terminal_status(config, job_uuid, "rolled_back", f"Restart failed; previous artifact restored: {restart_error}")
-                except Exception as rollback_error:
-                    save_terminal_status(config, job_uuid, "failed", f"Restart failed AND rollback restart failed! Manual recovery required. Original error: {restart_error}. Rollback error: {rollback_error}")
-                return
-            raise
-        save_terminal_status(config, job_uuid, "succeeded", "Deployment completed successfully")
+            elif existing.exists():
+                shutil.rmtree(existing)
+            try:
+                restore_database(
+                    config.get("database_restore_command", []),
+                    database_backup,
+                    config.get("database_command_timeout_seconds", 600),
+                )
+                restart_odoo(config["restart_command"])
+                save_terminal_status(config, job_uuid, "rolled_back", f"Deployment failed; database and addon restored: {deploy_error}")
+            except Exception as rollback_error:
+                save_terminal_status(config, job_uuid, "failed", f"Deployment failed AND rollback verification failed. Manual recovery required. Original error: {deploy_error}. Rollback error: {rollback_error}")
+            return
+        save_terminal_status(config, job_uuid, "succeeded", f"Odoo module {operation} completed successfully.\n{update_log}"[-100_000:])
     except Exception as exc:
         try:
-            if backup and backup.exists() and existing:
+            if database_backup and database_backup.exists() and existing:
                 if existing.exists():
                     shutil.rmtree(existing)
-                shutil.move(str(backup), str(existing))
+                if backup and backup.exists():
+                    shutil.move(str(backup), str(existing))
                 try:
+                    restore_database(
+                        config.get("database_restore_command", []),
+                        database_backup,
+                        config.get("database_command_timeout_seconds", 600),
+                    )
                     restart_odoo(config["restart_command"])
-                    save_terminal_status(config, job_uuid, "rolled_back", f"Deployment failed; previous artifact restored: {exc}")
+                    save_terminal_status(config, job_uuid, "rolled_back", f"Deployment failed; database and addon restored: {exc}")
                 except Exception as rollback_error:
-                    save_terminal_status(config, job_uuid, "failed", f"Deployment failed AND rollback restart failed! Manual recovery required. Original error: {exc}. Rollback error: {rollback_error}")
+                    save_terminal_status(config, job_uuid, "failed", f"Deployment failed AND rollback verification failed. Manual recovery required. Original error: {exc}. Rollback error: {rollback_error}")
             else:
                 save_terminal_status(config, job_uuid, "failed", f"{type(exc).__name__}: {exc}")
         except Exception:

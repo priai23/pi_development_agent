@@ -24,7 +24,7 @@ from deployment import execute_deployment
 from security import decrypt_secret
 from source_indexer import index_addon_roots
 from workspace import Workspace
-from specification import compile_specification
+from specification import CHECK_GATED_TASKS, compile_specification
 
 # ─── Watchdog tunables ─────────────────────────────────────────────────────────
 SUBTASK_STALE_SECONDS = 90   # per sub-task heartbeat threshold
@@ -33,6 +33,60 @@ RUN_STALE_SECONDS = 300      # whole-run safety net (supervisor itself silent)
 
 class ProjectBusy(RuntimeError):
     pass
+
+
+def required_acceptance_failures(db, run_id: str, task_id: str | None) -> list[str]:
+    if not task_id:
+        return ["AcceptanceCheckMissing: task id is required"]
+    checks = db.query(models.AcceptanceCheck).filter(
+        models.AcceptanceCheck.run_id == run_id,
+        models.AcceptanceCheck.task_id == task_id,
+        models.AcceptanceCheck.required == True,
+    ).all()
+    if task_id in CHECK_GATED_TASKS and not checks:
+        return [f"AcceptanceCheckMissing: no required checks were compiled for {task_id}"]
+    return [
+        f"{check.kind}:{check.spec_target}"
+        for check in checks
+        if check.status != "passed"
+    ]
+
+
+def requeue_failed_task(db, run: models.AgentRun, task_id: str, report: dict) -> bool:
+    if not settings.autonomous_repair_enabled:
+        return False
+    task = next((item for item in (run.task_graph or []) if item["task_id"] == task_id), None)
+    if not task:
+        return False
+    retry_count = int(task.get("retry_count", 0))
+    if retry_count >= int(task.get("max_retries", MAX_TASK_RETRIES)):
+        return False
+    graph = _apply_task_status(
+        db,
+        run,
+        task_id,
+        "pending",
+        retry_count=retry_count + 1,
+        result=report,
+        context_bundle={
+            "repair_required": True,
+            "failed_verification": report.get("verification", ""),
+            "errors": report.get("errors", ""),
+        },
+    )
+    run.active_task_id = None
+    run.subtask_heartbeat_at = None
+    run.status = "queued"
+    run.retryable = True
+    run.finished_at = None
+    _emit_task_transition(db, run, "task.retrying", task_id, {
+        "task_graph": graph,
+        "retry_count": retry_count + 1,
+        "max_retries": task.get("max_retries", MAX_TASK_RETRIES),
+        "errors": report.get("errors", ""),
+    })
+    enqueue(db, "run.resume", run.id)
+    return True
 
 
 def update_worker_lease() -> None:
@@ -745,18 +799,6 @@ async def process_run(
                     })
             else:
                 if not task_report:
-                    target_task_id = current.active_task_id
-                    if not target_task_id and current.task_graph:
-                        target_task_id = next((t["task_id"] for t in current.task_graph if t.get("status") != "done"), current.task_graph[0]["task_id"])
-                    if target_task_id:
-                        task_report = {
-                            "outcome": "SUCCESS",
-                            "done": [response.strip()[:300] or "Task completed."],
-                            "verification": "Completed via execution.",
-                            "errors": "",
-                            "task_id": target_task_id,
-                        }
-                if not task_report:
                     current.status = "failed"
                     current.error_category = "MissingTaskReport"
                     current.error_message = "Agent finished without calling complete_task."
@@ -775,17 +817,12 @@ async def process_run(
                     task_succeeded = outcome == "SUCCESS"
 
                     # Backend acceptance check gate: verify if any required acceptance check failed or is pending
-                    unsatisfied_checks = finish_db.query(models.AcceptanceCheck).filter(
-                        models.AcceptanceCheck.run_id == current.id,
-                        models.AcceptanceCheck.task_id == task_id,
-                        models.AcceptanceCheck.required == True,
-                        models.AcceptanceCheck.status != "passed",
-                    ).all()
-                    if unsatisfied_checks:
+                    acceptance_failures = required_acceptance_failures(finish_db, current.id, task_id)
+                    if acceptance_failures:
                         task_succeeded = False
-                        failed_names = [f"{c.kind}:{c.spec_target}" for c in unsatisfied_checks]
                         task_report["errors"] = (
-                            f"AcceptanceCheckFailed: {len(unsatisfied_checks)} required checks pending or failed: {', '.join(failed_names)}"
+                            f"AcceptanceCheckFailed: {len(acceptance_failures)} required checks missing, pending, or failed: "
+                            f"{', '.join(acceptance_failures)}"
                         )
 
                     handoff = {
@@ -881,22 +918,23 @@ async def process_run(
                     else:
                         error_text = str(task_report.get("errors") or "Task reported failure")
                         error_category = "DependencyInstallFailed" if "DependencyInstallFailed" in error_text else "TaskFailed"
-                        _emit_task_transition(finish_db, current, "task.failed", task_id, {
-                            "task_graph": graph, "error_category": error_category,
-                        })
-                        current.status = "failed"
-                        current.error_category = error_category
-                        current.error_message = error_text[:500]
-                        current.finished_at = datetime.now(timezone.utc)
-                        emit(finish_db, run.id, "final_report", {"scope": "run", **task_report})
-                        emit(finish_db, run.id, "run.failed", {
-                            "category": error_category,
-                            "message": current.error_message,
-                            "retryable": False,
-                            "support_id": current.support_id,
-                            "task_id": task_id,
-                            "tool": None,
-                        })
+                        if not requeue_failed_task(finish_db, current, task_id, task_report):
+                            _emit_task_transition(finish_db, current, "task.failed", task_id, {
+                                "task_graph": graph, "error_category": error_category,
+                            })
+                            current.status = "failed"
+                            current.error_category = error_category
+                            current.error_message = error_text[:500]
+                            current.finished_at = datetime.now(timezone.utc)
+                            emit(finish_db, run.id, "final_report", {"scope": "run", **task_report})
+                            emit(finish_db, run.id, "run.failed", {
+                                "category": error_category,
+                                "message": current.error_message,
+                                "retryable": False,
+                                "support_id": current.support_id,
+                                "task_id": task_id,
+                                "tool": None,
+                            })
 
                 if action_id:
                     action_rec = finish_db.get(models.PendingAction, action_id)

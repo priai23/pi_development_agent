@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import models
 from agent import SupervisorPlanner
-from worker import _apply_task_status
+from worker import _apply_task_status, requeue_failed_task
 
 
 def test_nested_task_updates_are_immutable_and_drive_dependency_selection():
@@ -26,3 +26,43 @@ def test_nested_task_updates_are_immutable_and_drive_dependency_selection():
     assert updated[0]["status"] == "done"
     assert run.task_graph == updated
     assert SupervisorPlanner.get_next_task(updated)["task_id"] == "two"
+
+
+def test_requirement_graph_generates_tests_before_validation():
+    graph = SupervisorPlanner.build_from_specification([{"title": "Build module"}])
+    by_id = {task["task_id"]: task for task in graph}
+
+    assert "generate_tests" in by_id
+    assert by_id["validate_and_verify"]["depends_on"] == ["generate_tests"]
+
+
+def test_failed_task_is_requeued_with_repair_context(monkeypatch):
+    graph = [{
+        "task_id": "validate_and_verify",
+        "title": "Validate",
+        "depends_on": [],
+        "status": "failed",
+        "retry_count": 0,
+        "max_retries": 2,
+        "context_bundle": {},
+        "result": None,
+    }]
+    run = models.AgentRun(
+        id="run-repair",
+        project_id=1,
+        requested_by_id=1,
+        prompt="build module",
+        thread_id="thread",
+        task_graph=graph,
+        active_task_id="validate_and_verify",
+    )
+    queued = []
+    monkeypatch.setattr("worker.enqueue", lambda db, event, aggregate, payload=None: queued.append((event, aggregate)))
+    monkeypatch.setattr("worker._emit_task_transition", lambda *args, **kwargs: None)
+
+    assert requeue_failed_task(None, run, "validate_and_verify", {"errors": "ViewValidationError"}) is True
+    task = run.task_graph[0]
+    assert task["status"] == "pending"
+    assert task["retry_count"] == 1
+    assert task["context_bundle"]["repair_required"] is True
+    assert queued == [("run.resume", "run-repair")]

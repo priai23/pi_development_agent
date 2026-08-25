@@ -9,5 +9,29 @@
     "backup_path": "/opt/odoo/primacy-backups",
     "nonce_store_path": "/opt/odoo/primacy-backups/nonce-ledger.txt",
     "runner_id": "odoo-runner-1",
+    "odoo_module_command": [
+        "sudo",
+        "-u",
+        "odoo",
+        "/opt/odoo/odoo-bin",
+        "-d",
+        "YOUR_ODOO_DATABASE",
+        "--config=/etc/odoo.conf",
+        "--stop-after-init",
+        "--no-http"
+    ],
+    "module_command_timeout_seconds": 600,
+    "database_backup_command": [
+        "pg_dump",
+        "--format=custom",
+        "--dbname=postgresql://odoo:REPLACE_ME@localhost:5432/YOUR_ODOO_DATABASE"
+    ],
+    "database_restore_command": [
+        "pg_restore",
+        "--clean",
+        "--if-exists",
+        "--dbname=postgresql://odoo:REPLACE_ME@localhost:5432/YOUR_ODOO_DATABASE"
+    ],
+    "database_command_timeout_seconds": 600,
     "restart_command": ["sudo", "systemctl", "restart", "odoo"]
 }

@@ -5,6 +5,7 @@ import ipaddress
 import hashlib
 import hmac
 import json
+import re
 import socket
 import ssl
 import xmlrpc.client
@@ -27,11 +28,11 @@ from agent import ERPImplementationAgent, connect_odoo, connect_odoo_json2, xmlr
 from auth import CSRF_COOKIE, SESSION_COOKIE, admin_user, current_user, organization_ids, require_project
 from config import settings
 from database import SessionLocal, get_db
-from deployment import execute_deployment, generate_signing_config, refresh_bridge_deployment
+from deployment import execute_deployment, generate_signing_config, refresh_bridge_deployment, request_deployment
 from security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, verify_password
 from worker import emit, enqueue
 from workspace import Workspace
-from validation import package_module, validate_module
+from validation import package_module, validate_module, validate_module_full
 from specification import get_specification_summary
 
 
@@ -172,6 +173,15 @@ def llm_config(db: Session) -> tuple[str, str | None]:
     model = db.get(models.Setting, "llm_model_name")
     key = db.get(models.Setting, "openrouter_api_key")
     return (model.value if model else "gpt-4o-mini", decrypt_secret(key.value) if key else None)
+
+
+def normalized_odoo_environment(version_info: dict | None) -> tuple[str, str]:
+    info = version_info or {}
+    raw_version = str(info.get("server_serie") or info.get("server_version") or "").strip()
+    match = re.match(r"^(\d+\.\d+)", raw_version)
+    version = match.group(1) if match else "unknown"
+    edition = str(info.get("server_edition") or "unknown").lower()
+    return version, edition if edition in {"community", "enterprise"} else "unknown"
 
 
 async def project_agent(request: Request, db: Session, project: models.Project) -> ERPImplementationAgent:
@@ -1060,6 +1070,13 @@ def platform_health(_: models.User = Depends(admin_user), db: Session = Depends(
         "queue_depth": queue_depth,
         "stale_actions": db.query(models.PendingAction).filter(models.PendingAction.status.in_(["claimed", "executing"]), models.PendingAction.claimed_at < stale_before).count(),
         "failed_deployments": db.query(models.Deployment).filter(models.Deployment.status == "failed").count(),
+        "validation_metrics": {
+            "passed": db.query(models.ValidationRun).filter(models.ValidationRun.status == "passed").count(),
+            "failed": db.query(models.ValidationRun).filter(models.ValidationRun.status == "failed").count(),
+            "static_only": db.query(models.ValidationRun).filter(models.ValidationRun.status == "static_passed").count(),
+            "repair_attempts": db.query(models.ToolEvent).filter(models.ToolEvent.event_type == "task.retrying").count(),
+        },
+        "autonomous_repair_enabled": settings.autonomous_repair_enabled,
         "instances": [{"id": item.id, "status": item.status, "bridge_status": item.bridge_status} for item in db.query(models.Instance).filter(models.Instance.is_active.is_(True)).all()],
     }
 
@@ -1199,6 +1216,15 @@ async def create_instance(payload: schemas.InstanceCreate, user: models.User = D
         raise HTTPException(status_code=400, detail="Could not reach the ERP endpoint. Check the URL and server availability") from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail="ERP connection failed. Check the URL, database, and credentials") from exc
+    version_info = client.version()
+    try:
+        enterprise = client.search_read("ir.module.module", [("name", "=", "web_enterprise"), ("state", "=", "installed")], ["id"], 1)
+        version_info = {**version_info, "server_edition": "enterprise" if enterprise else "community"}
+    except Exception:
+        version_info = {**version_info, "server_edition": "unknown"}
+    odoo_version, _ = normalized_odoo_environment(version_info)
+    if odoo_version != "19.0":
+        raise HTTPException(status_code=409, detail=f"This implementation agent requires Odoo 19.0; detected {odoo_version}")
     instance = models.Instance(
         project_id=project.id,
         erp_type=payload.erp_type,
@@ -1210,7 +1236,7 @@ async def create_instance(payload: schemas.InstanceCreate, user: models.User = D
         environment=payload.environment,
         hosting_type=payload.hosting_type,
         auth_method=payload.auth_method,
-        version_info=client.version(),
+        version_info=version_info,
         capabilities={"xmlrpc": True, "json2": payload.auth_method == "json2"},
         last_tested_at=datetime.now(timezone.utc),
     )
@@ -1257,7 +1283,13 @@ async def test_instance(instance_id: int, user: models.User = Depends(current_us
             else connect_odoo(instance.url, instance.db_name or "", instance.username or "", decrypt_secret(instance.password_encrypted or ""))
         )
         instance.status = "connected"
-        instance.version_info = client.version()
+        version_info = client.version()
+        try:
+            enterprise = client.search_read("ir.module.module", [("name", "=", "web_enterprise"), ("state", "=", "installed")], ["id"], 1)
+            version_info = {**version_info, "server_edition": "enterprise" if enterprise else "community"}
+        except Exception:
+            version_info = {**version_info, "server_edition": "unknown"}
+        instance.version_info = version_info
         instance.last_error = None
     except Exception as exc:
         instance.status = "error"
@@ -1496,10 +1528,13 @@ def create_run(project_id: int, payload: schemas.RunCreate, user: models.User = 
         db.add(question)
         db.flush()
 
+    odoo_version, odoo_edition = normalized_odoo_environment(instance.version_info)
+    if odoo_version != "19.0" or odoo_edition == "unknown":
+        raise HTTPException(status_code=409, detail="The staging Odoo 19 version and edition must be verified before starting the agent")
     snapshot = models.SourceSnapshot(
         instance_id=instance.id,
-        odoo_version="19.0",
-        odoo_edition="community",
+        odoo_version=odoo_version,
+        odoo_edition=odoo_edition,
         fingerprint="pending",
         status="pending_index",
     )
@@ -2143,7 +2178,7 @@ def create_artifact(project_id: int, payload: schemas.ArtifactCreate, user: mode
     project = require_project(db, user, project_id)
     workspace = Workspace(project.workspace_slug)
     module_path = workspace.resolve(payload.path, must_exist=True)
-    report = validate_module(module_path)
+    report = validate_module_full(module_path, payload.name)
     commit_hash = workspace.commit(f"Package {payload.name} {payload.version}")
     archive_digest = hashlib.sha256(package_module(module_path)).hexdigest()
     artifact = models.Artifact(
@@ -2182,27 +2217,10 @@ def create_deployment(project_id: int, payload: schemas.DeploymentCreate, user: 
     artifact = db.get(models.Artifact, payload.artifact_id)
     if not instance or instance.project_id != project_id or not artifact or artifact.project_id != project_id:
         raise HTTPException(status_code=400, detail="Instance and artifact must belong to this project")
-    validation = db.query(models.ValidationRun).filter(
-        models.ValidationRun.artifact_id == artifact.id, models.ValidationRun.status == "passed"
-    ).order_by(models.ValidationRun.created_at.desc()).first()
-    if not validation:
-        raise HTTPException(status_code=409, detail="Only a passed immutable validation artifact can be deployed")
-
-
-    if not instance.deployment_config_encrypted:
-        raise HTTPException(status_code=409, detail="Configure the deployment bridge or Odoo.sh repository first")
-    if instance.environment == "production":
-        staged = db.query(models.Deployment).filter(
-            models.Deployment.artifact_id == artifact.id, models.Deployment.environment == "staging",
-            models.Deployment.status == "succeeded",
-        ).first()
-        if not staged or project.phase not in {"uat", "ready_for_production"}:
-            raise HTTPException(status_code=409, detail="The exact artifact must pass staging and UAT before production")
-    deployment = models.Deployment(
-        project_id=project_id, instance_id=instance.id, artifact_id=artifact.id, validation_id=validation.id,
-        environment=instance.environment, requested_by_id=user.id, rollback_plan=payload.rollback_plan,
-    )
-    db.add(deployment)
+    try:
+        deployment = request_deployment(db, project, instance, artifact, user.id, payload.rollback_plan)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
     db.refresh(deployment)
     return deployment
@@ -2231,7 +2249,12 @@ def quick_deploy_module(project_id: int, user: models.User = Depends(current_use
     except Exception:
         pass
         
-    report = validate_module(module_dir)
+    report = validate_module_full(module_dir, module_name)
+    if not report["passed"]:
+        raise HTTPException(status_code=409, detail={
+            "message": "Module failed static validation; deployment was not created",
+            "checks": report["static"]["checks"] + report["runtime"].get("checks", []),
+        })
     commit_hash = workspace.commit(f"Auto-package {module_name} {version}")
     archive_digest = hashlib.sha256(package_module(module_dir)).hexdigest()
     
@@ -2258,24 +2281,8 @@ def quick_deploy_module(project_id: int, user: models.User = Depends(current_use
     )
     db.add(validation)
     
-    instance = db.query(models.Instance).filter(models.Instance.project_id == project_id).first()
-    deployment = None
-    if instance and instance.deployment_config_encrypted:
-        deployment = models.Deployment(
-            project_id=project_id,
-            instance_id=instance.id,
-            artifact_id=artifact.id,
-            validation_id=validation.id,
-            environment=instance.environment,
-            requested_by_id=user.id,
-            rollback_plan="Automated rollback to prior workspace revision",
-        )
-        db.add(deployment)
-        db.flush()
-        enqueue(db, "deployment.start", deployment.id)
-    
     audit(db, "artifact.quick_deployed", user.id, project_id, {
-        "artifact_id": artifact.id, "module": module_name, "deployed": deployment is not None
+        "artifact_id": artifact.id, "module": module_name, "deployed": False
     })
     db.commit()
     return {
@@ -2283,9 +2290,9 @@ def quick_deploy_module(project_id: int, user: models.User = Depends(current_use
         "module_name": module_name,
         "version": version,
         "passed": report["passed"],
-        "deployed": deployment is not None,
-        "deployment_id": deployment.id if deployment else None,
-        "message": f"Module {module_name} validated." + (" Deployment initiated." if deployment else " Connect an instance with a deployment bridge to deploy live.")
+        "deployed": False,
+        "deployment_id": None,
+        "message": f"Module {module_name} passed disposable Odoo validation and is ready for a staging deployment request."
     }
 
 

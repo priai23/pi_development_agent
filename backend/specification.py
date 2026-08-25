@@ -39,6 +39,14 @@ VALID_CHECK_KINDS = {
     "business_scenario",
 }
 
+TASK_IMPLEMENT_VIEWS = "implement_views"
+TASK_IMPLEMENT_SECURITY = "implement_security"
+TASK_GENERATE_TESTS = "generate_tests"
+TASK_VALIDATE_AND_VERIFY = "validate_and_verify"
+CHECK_GATED_TASKS = {
+    TASK_VALIDATE_AND_VERIFY,
+}
+
 
 # ---------------------------------------------------------------------------
 # Internal data structures
@@ -136,71 +144,71 @@ def _classify_feature_areas(prompt: str) -> list[str]:
 # Acceptance check builders — one per concern
 # ---------------------------------------------------------------------------
 
-def _build_module_checks(module_name: str, is_upgrade: bool, task_prefix: str) -> list[CheckSpec]:
+def _build_module_checks(module_name: str, is_upgrade: bool) -> list[CheckSpec]:
     checks = [
         CheckSpec(
             kind="module_install" if not is_upgrade else "module_upgrade",
             spec_target={"module": module_name},
             required=True,
-            task_id=f"{task_prefix}.validate_odoo",
+            task_id=TASK_VALIDATE_AND_VERIFY,
         ),
         CheckSpec(
             kind="artifact_digest",
             spec_target={"module": module_name},
             required=True,
-            task_id=f"{task_prefix}.validate_odoo",
+            task_id=TASK_VALIDATE_AND_VERIFY,
         ),
     ]
     return checks
 
 
-def _build_model_field_checks(model_name: str, field_names: list[str], task_prefix: str) -> list[CheckSpec]:
+def _build_model_field_checks(model_name: str, field_names: list[str]) -> list[CheckSpec]:
     return [
         CheckSpec(
             kind="model_field",
             spec_target={"model": model_name, "field": f},
             required=True,
-            task_id=f"{task_prefix}.validate_odoo",
+            task_id=TASK_VALIDATE_AND_VERIFY,
         )
         for f in field_names
     ]
 
 
-def _build_view_checks(model_name: str, xml_ids: list[str], task_prefix: str) -> list[CheckSpec]:
+def _build_view_checks(model_name: str, xml_ids: list[str]) -> list[CheckSpec]:
     checks = []
     for xml_id in xml_ids:
         checks.append(CheckSpec(
             kind="xml_id",
             spec_target={"xml_id": xml_id},
             required=True,
-            task_id=f"{task_prefix}.implement_views",
+            task_id=TASK_IMPLEMENT_VIEWS,
         ))
         checks.append(CheckSpec(
             kind="view_load",
             spec_target={"xml_id": xml_id, "model": model_name},
             required=True,
-            task_id=f"{task_prefix}.validate_odoo",
+            task_id=TASK_VALIDATE_AND_VERIFY,
         ))
     return checks
 
 
-def _build_security_checks(model_name: str, task_prefix: str) -> list[CheckSpec]:
+def _build_security_checks(model_name: str) -> list[CheckSpec]:
     return [
         CheckSpec(
             kind="acl",
             spec_target={"model": model_name},
             required=True,
-            task_id=f"{task_prefix}.implement_security",
+            task_id=TASK_IMPLEMENT_SECURITY,
         ),
     ]
 
 
-def _build_test_check(scenario: str, task_prefix: str) -> CheckSpec:
+def _build_test_check(scenario: str) -> CheckSpec:
     return CheckSpec(
         kind="business_scenario",
         spec_target={"scenario": scenario},
         required=True,
-        task_id=f"{task_prefix}.generate_tests",
+        task_id=TASK_VALIDATE_AND_VERIFY,
     )
 
 
@@ -237,8 +245,6 @@ def compile_specification(
     import models as m
 
     now = datetime.now(timezone.utc)
-    task_prefix = f"run:{run_id}"
-
     # ---- heuristic analysis ----
     model_targets = _extract_model_targets(prompt, snapshot_symbols)
     field_targets = _extract_field_targets(prompt, model_targets, snapshot_symbols)
@@ -253,7 +259,7 @@ def compile_specification(
         title=f"{'Upgrade' if is_upgrade else 'Install'} module {module_name}",
         description=f"The module must {'upgrade cleanly' if is_upgrade else 'install'} on the target Odoo 19 instance.",
         implementation_targets=[module_name],
-        check_specs=_build_module_checks(module_name, is_upgrade, task_prefix),
+        check_specs=_build_module_checks(module_name, is_upgrade),
     )
     requirements.append(r_module)
 
@@ -268,7 +274,7 @@ def compile_specification(
                 title=f"Model {model_name} has required fields",
                 description=f"Fields {model_fields} must be present on {model_name} after installation.",
                 implementation_targets=[model_name],
-                check_specs=_build_model_field_checks(model_name, model_fields, task_prefix),
+                check_specs=_build_model_field_checks(model_name, model_fields),
             )
             requirements.append(r_fields)
 
@@ -282,7 +288,7 @@ def compile_specification(
                 title=f"Views for {model_name} load without error",
                 description=f"Form and list views for {model_name} must be loadable.",
                 implementation_targets=[model_name],
-                check_specs=_build_view_checks(model_name, xml_ids, task_prefix),
+                check_specs=_build_view_checks(model_name, xml_ids),
             )
             requirements.append(r_views)
 
@@ -293,7 +299,7 @@ def compile_specification(
             title=f"Access control rules for {model_name}",
             description="ACL rows must be present for every new model.",
             implementation_targets=[model_name],
-            check_specs=_build_security_checks(model_name, task_prefix),
+            check_specs=_build_security_checks(model_name),
         )
         requirements.append(r_sec)
 
@@ -304,7 +310,7 @@ def compile_specification(
         title="Automated scenario test passes",
         description=f"An odoo.tests.common test covering the core scenario must pass: {scenario_label}",
         implementation_targets=[module_name],
-        check_specs=[_build_test_check(scenario_label, task_prefix)],
+        check_specs=[_build_test_check(scenario_label)],
     )
     requirements.append(r_test)
 

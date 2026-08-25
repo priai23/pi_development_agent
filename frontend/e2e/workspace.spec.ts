@@ -78,6 +78,6 @@ test("displays diagnostic failure card with retry button on worker unavailable r
   await expect(page.getByRole("alert").getByText("WorkerUnavailable")).toBeVisible();
   await expect(page.getByRole("alert").getByText("Background worker process is unavailable")).toBeVisible();
   await page.getByRole("button", { name: "Retry Run" }).click();
+  expect(retried).toBe(true);
   await expect(page.getByRole("button", { name: "Retry Run" })).toHaveCount(0);
 });
-

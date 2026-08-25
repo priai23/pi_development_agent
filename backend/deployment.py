@@ -20,6 +20,45 @@ from security import decrypt_secret, new_token
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,180}$")
 
 
+def request_deployment(db, project: models.Project, instance: models.Instance, artifact: models.Artifact, requested_by_id: int, rollback_plan: str = "") -> models.Deployment:
+    if instance.project_id != project.id or artifact.project_id != project.id:
+        raise ValueError("Instance and artifact must belong to this project")
+    if instance.environment not in {"staging", "production"}:
+        raise ValueError("Deployment target must be staging or production")
+    if not instance.is_active or not instance.deployment_config_encrypted:
+        raise ValueError("Configure an active deployment bridge or Odoo.sh repository first")
+    validation = db.query(models.ValidationRun).filter(
+        models.ValidationRun.artifact_id == artifact.id,
+        models.ValidationRun.status == "passed",
+    ).order_by(models.ValidationRun.created_at.desc()).first()
+    if not validation or artifact.status != "validated":
+        raise ValueError("Only a runtime-validated immutable artifact can be deployed")
+    if instance.environment == "production":
+        staged = db.query(models.Deployment).filter(
+            models.Deployment.artifact_id == artifact.id,
+            models.Deployment.environment == "staging",
+            models.Deployment.status == "succeeded",
+        ).first()
+        uat = db.query(models.UATEvidence).filter(models.UATEvidence.artifact_id == artifact.id).first()
+        if not staged or not uat or project.phase not in {"uat", "ready_for_production"}:
+            raise ValueError("Production requires the exact artifact to pass staging and have UAT evidence")
+        if not rollback_plan.strip():
+            raise ValueError("Production deployment requires a rollback plan")
+    deployment = models.Deployment(
+        project_id=project.id,
+        instance_id=instance.id,
+        artifact_id=artifact.id,
+        validation_id=validation.id,
+        environment=instance.environment,
+        requested_by_id=requested_by_id,
+        rollback_plan=rollback_plan,
+        status="pending_approval",
+    )
+    db.add(deployment)
+    db.flush()
+    return deployment
+
+
 def canonical_job(job: dict) -> bytes:
     return json.dumps(job, sort_keys=True, separators=(",", ":")).encode()
 
