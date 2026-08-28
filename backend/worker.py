@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 import time
 import traceback
@@ -29,6 +30,8 @@ from specification import CHECK_GATED_TASKS, compile_specification
 # ─── Watchdog tunables ─────────────────────────────────────────────────────────
 SUBTASK_STALE_SECONDS = 90   # per sub-task heartbeat threshold
 RUN_STALE_SECONDS = 300      # whole-run safety net (supervisor itself silent)
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectBusy(RuntimeError):
@@ -106,7 +109,7 @@ def start_worker_lease_thread(shutdown_event: threading.Event | None = None) -> 
             try:
                 update_worker_lease()
             except Exception:
-                pass
+                logger.exception("Worker lease heartbeat failed")
             if shutdown_event:
                 if shutdown_event.wait(5):
                     break

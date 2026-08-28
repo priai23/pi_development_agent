@@ -5,6 +5,7 @@ import ipaddress
 import hashlib
 import hmac
 import json
+import logging
 import re
 import socket
 import ssl
@@ -34,6 +35,8 @@ from worker import emit, enqueue
 from workspace import Workspace
 from validation import package_module, validate_module, validate_module_full
 from specification import get_specification_summary
+
+logger = logging.getLogger(__name__)
 
 
 def get_worker_status(db: Session) -> tuple[str, str | None, float | None, int]:
@@ -91,7 +94,7 @@ async def worker_availability_monitor():
                         })
                     db.commit()
         except Exception:
-            pass
+            logger.exception("Worker availability monitor failed")
         await asyncio.sleep(5)
 
 
@@ -576,13 +579,13 @@ BACKEND_UI_HTML = """<!DOCTYPE html>
             </td>
             <td>
               <div class="actions-cell">
-                <button onclick="openPwdModal(${u.id}, '${escapeHtml(u.email)}')" class="btn btn-secondary" title="Change Password">
+                <button onclick="openPwdModal(${u.id})" class="btn btn-secondary" title="Change Password">
                   🔑 Password
                 </button>
                 <button onclick="toggleUserStatus(${u.id}, ${!u.is_active})" class="btn btn-secondary" title="${u.is_active ? 'Deactivate' : 'Activate'}">
                   ${u.is_active ? 'Disable' : 'Enable'}
                 </button>
-                <button onclick="deleteUser(${u.id}, '${escapeHtml(u.email)}')" class="btn btn-danger" title="Delete User">
+                <button onclick="deleteUser(${u.id})" class="btn btn-danger" title="Delete User">
                   🗑️
                 </button>
               </div>
@@ -599,7 +602,7 @@ BACKEND_UI_HTML = """<!DOCTYPE html>
         } catch(e) {}
 
       } catch (err) {
-        document.getElementById('users-tbody').innerHTML = `<tr><td colspan="5" style="text-align: center; color: #fca5a5; padding: 2rem;">${err.message}</td></tr>`;
+        document.getElementById('users-tbody').innerHTML = `<tr><td colspan="5" style="text-align: center; color: #fca5a5; padding: 2rem;">${escapeHtml(err.message)}</td></tr>`;
       }
     }
 
@@ -628,14 +631,15 @@ BACKEND_UI_HTML = """<!DOCTYPE html>
           loadUsers();
         } else {
           const detail = typeof data.detail === 'string' ? data.detail : (Array.isArray(data.detail) ? data.detail.map(d => d.msg).join(', ') : JSON.stringify(data.detail));
-          msg.innerHTML = `<div class="alert alert-error">${detail || 'Failed to create account.'}</div>`;
+          msg.innerHTML = `<div class="alert alert-error">${escapeHtml(detail || 'Failed to create account.')}</div>`;
         }
       } catch (err) {
-        msg.innerHTML = `<div class="alert alert-error">${err.message}</div>`;
+        msg.innerHTML = `<div class="alert alert-error">${escapeHtml(err.message)}</div>`;
       }
     });
 
-    function openPwdModal(id, email) {
+    function openPwdModal(id) {
+      const email = currentUsers.find(u => u.id === id)?.email || '';
       document.getElementById('pwd-modal-userid').value = id;
       document.getElementById('pwd-modal-user').innerText = 'Setting new password for: ' + email;
       document.getElementById('pwd-modal-input').value = '';
@@ -667,10 +671,10 @@ BACKEND_UI_HTML = """<!DOCTYPE html>
           setTimeout(() => { tableMsg.innerHTML = ''; }, 3000);
         } else {
           const data = await res.json();
-          msg.innerHTML = `<div class="alert alert-error" style="margin-top: 0.5rem;">${data.detail || 'Failed to change password'}</div>`;
+          msg.innerHTML = `<div class="alert alert-error" style="margin-top: 0.5rem;">${escapeHtml(data.detail || 'Failed to change password')}</div>`;
         }
       } catch (err) {
-        msg.innerHTML = `<div class="alert alert-error" style="margin-top: 0.5rem;">${err.message}</div>`;
+        msg.innerHTML = `<div class="alert alert-error" style="margin-top: 0.5rem;">${escapeHtml(err.message)}</div>`;
       }
     });
 
@@ -691,7 +695,8 @@ BACKEND_UI_HTML = """<!DOCTYPE html>
       }
     }
 
-    async function deleteUser(id, email) {
+    async function deleteUser(id) {
+      const email = currentUsers.find(u => u.id === id)?.email || '';
       if (!confirm(`Are you sure you want to permanently delete "${email}"?`)) return;
       try {
         const res = await fetch(`/admin/users/${id}`, {
@@ -1709,7 +1714,10 @@ async def stream_run_events(run_id: str, request: Request, after: int = 0, user:
                 rows = event_db.query(models.ToolEvent).filter(
                     models.ToolEvent.run_id == run_id, models.ToolEvent.sequence > sequence
                 ).order_by(models.ToolEvent.sequence).all()
-                status_value = event_db.get(models.AgentRun, run_id).status
+                current_run = event_db.get(models.AgentRun, run_id)
+                if not current_run:
+                    return
+                status_value = current_run.status
             for row in rows:
                 sequence = row.sequence
                 envelope = {
@@ -2230,7 +2238,7 @@ def create_deployment(project_id: int, payload: schemas.DeploymentCreate, user: 
 def quick_deploy_module(project_id: int, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, project_id)
     workspace = Workspace(project.workspace_slug)
-    ws_path = workspace.path
+    ws_path = workspace.root
     manifest_files = list(ws_path.glob("**/__manifest__.py"))
     if not manifest_files:
         raise HTTPException(status_code=400, detail="No Odoo module with __manifest__.py found in workspace")

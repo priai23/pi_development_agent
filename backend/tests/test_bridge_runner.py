@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from bridge_runner.runner import RunnerError, backup_database, canonical_job, restore_database, run_odoo_module_command, run_validate_module, safe_extract, verify_job  # noqa: E402
+from bridge_runner.runner import RunnerError, _parse_odoo_log, backup_database, canonical_job, restore_database, run_odoo_module_command, run_validate_module, safe_extract, verify_job  # noqa: E402
 
 
 def signed_job():
@@ -113,6 +113,33 @@ def test_disposable_validation_requires_zero_odoo_exit_code(tmp_path):
 
     assert result["ok"] is False
     assert any(check["name"] == "odoo_exit_code" and not check["passed"] for check in result["checks"])
+
+
+def test_disposable_validation_runs_only_target_module_tests(tmp_path):
+    archive = tmp_path / "sample.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("sample_module/__init__.py", "")
+        bundle.writestr("sample_module/__manifest__.py", "{'name': 'Sample'}")
+    payload = archive.read_bytes()
+    job = {
+        "job_uuid": "validation-tags",
+        "module_name": "sample_module",
+        "artifact_zip_b64": base64.b64encode(payload).decode(),
+        "artifact_digest": __import__("hashlib").sha256(payload).hexdigest(),
+    }
+
+    with patch("bridge_runner.runner._run_docker_odoo", return_value=(0, "Ran 1 test errors=0 failures=0")) as run:
+        result = run_validate_module(job, {"postgres_admin_dsn": None})
+
+    assert run.call_args.args[0][-2:] == ["--test-tags", "/sample_module"]
+    assert result["test_count"] == 1
+
+
+def test_odoo19_test_result_is_counted():
+    parsed = _parse_odoo_log("0 failed, 0 error(s) of 6 tests when loading database 'test'")
+
+    assert parsed["test_count"] == 6
+    assert any(check["name"] == "tests_pass" and check["passed"] for check in parsed["checks"])
 
 
 def test_database_backup_and_restore_use_fixed_commands(tmp_path):

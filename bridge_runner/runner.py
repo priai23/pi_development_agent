@@ -406,6 +406,10 @@ def _parse_odoo_log(output: str) -> dict:
         test_ok = False
     m = re.search(r"Ran (\d+) tests?", output)
     test_count = int(m.group(1)) if m else 0
+    odoo19_result = re.search(r"(\d+) failed, (\d+) error\(s\) of (\d+) tests", output)
+    if odoo19_result:
+        test_ok = odoo19_result.group(1) == "0" and odoo19_result.group(2) == "0"
+        test_count = int(odoo19_result.group(3))
     checks = [{"name": "install_clean", "passed": not failed,
                "message": "No critical errors" if not failed else "Critical error detected"}]
     if test_count > 0:
@@ -485,7 +489,7 @@ def run_validate_module(job: dict, config: dict) -> dict:
                         "error": "Upgrade baseline installation failed",
                     }
             flag = "-u" if is_upgrade else "-i"
-            args = ["-d", test_db, flag, module_name, "--test-enable"]
+            args = ["-d", test_db, flag, module_name, "--test-tags", f"/{module_name}"]
             rc, output = _run_docker_odoo(args, addon_root, db_host, db_port, db_user, db_password, config, timeout)
             log_combined += output
             parsed = _parse_odoo_log(output)
@@ -509,6 +513,7 @@ def run_validate_module(job: dict, config: dict) -> dict:
         "module_name": module_name,
         "is_upgrade": is_upgrade,
         "checks": checks,
+        "test_count": parsed["test_count"],
         "log": log_combined[-8_000:],
         "error": None if all_passed else "One or more validation checks failed",
     }

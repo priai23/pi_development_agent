@@ -1,7 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
 
+from fastapi import HTTPException
 from unittest.mock import patch
 
+import main
 from validation import package_module, validate_module, validate_module_full
 
 
@@ -79,6 +82,33 @@ def test_full_validation_does_not_run_odoo_after_static_failure(tmp_path):
     runtime.assert_not_called()
 
 
+def test_runtime_validation_derives_missing_postgres_config(tmp_path):
+    root = module(tmp_path)
+    captured = {}
+
+    def validate(_job, config):
+        captured.update(config)
+        return {"ok": True, "checks": [], "test_count": 1, "error": None, "log": ""}
+
+    with (
+        patch("validation.settings.validation_postgres_admin_dsn", ""),
+        patch("validation.settings.database_url", "postgresql+psycopg://agent:secret@localhost:5432/erp_agent"),
+        patch("validation.platform.system", return_value="Darwin"),
+        patch("validation.importlib.util.spec_from_file_location", return_value=SimpleNamespace(
+            loader=SimpleNamespace(exec_module=lambda _module: None)
+        )),
+        patch("validation.importlib.util.module_from_spec", return_value=SimpleNamespace(
+            run_validate_module=validate
+        )),
+    ):
+        validate_module_full(root, "sample_module")
+
+    assert captured["postgres_admin_dsn"] == "postgresql://agent:secret@localhost:5432/postgres"
+    assert captured["postgres_host"] == "host.docker.internal"
+    assert captured["postgres_user"] == "agent"
+    assert captured["postgres_password"] == "secret"
+
+
 def test_duplicate_xml_ids_and_missing_model_acl_are_rejected(tmp_path):
     root = module(tmp_path)
     models_dir = root / "models"
@@ -96,3 +126,34 @@ def test_duplicate_xml_ids_and_missing_model_acl_are_rejected(tmp_path):
     failures = {check["name"] for check in report["checks"] if not check["passed"]}
     assert "xml id:same" in failures
     assert "access control" in failures
+
+
+def test_odoo19_obsolete_security_fields_are_rejected(tmp_path):
+    root = module(tmp_path)
+    (root / "security.xml").write_text(
+        "<odoo><record id='g' model='res.groups'><field name='category_id'/></record>"
+        "</odoo>",
+        encoding="utf-8",
+    )
+
+    failures = {check["name"] for check in validate_module(root)["checks"] if not check["passed"]}
+
+    assert "odoo19 res.groups fields:security.xml" in failures
+
+
+def test_quick_deploy_uses_workspace_root(tmp_path):
+    module(tmp_path)
+    workspace = SimpleNamespace(root=tmp_path)
+    failed_report = {"passed": False, "static": {"checks": []}, "runtime": {"checks": []}}
+
+    with (
+        patch("main.require_project", return_value=SimpleNamespace(workspace_slug="project")),
+        patch("main.Workspace", return_value=workspace),
+        patch("main.validate_module_full", return_value=failed_report),
+    ):
+        try:
+            main.quick_deploy_module(1, SimpleNamespace(id=1), SimpleNamespace())
+        except HTTPException as exc:
+            assert exc.status_code == 409
+        else:
+            raise AssertionError("Expected failed validation response")

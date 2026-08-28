@@ -5,9 +5,11 @@ import hashlib
 import re
 import io
 import importlib.util
+import platform
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from sqlalchemy.engine import make_url
 
 from config import settings
 
@@ -84,6 +86,14 @@ def validate_module(module_root: Path) -> dict:
                         "message": f"Declared in {path.name}" if prior is None else f"Duplicate XML ID in {prior} and {path.name}",
                     })
                     xml_ids.setdefault(xml_id, path.name)
+                    if elem.tag == "record" and elem.get("model") == "res.groups":
+                        obsolete = [field.get("name") for field in elem.findall("field") if field.get("name") in {"category_id", "users"}]
+                        if obsolete:
+                            checks.append({
+                                "name": f"odoo19 res.groups fields:{path.name}",
+                                "passed": False,
+                                "message": f"Replace obsolete fields {', '.join(obsolete)} with privilege_id/user_ids",
+                            })
                 # Odoo 19 search view group filter check: filters with group_by in context must specify domain
                 text = path.read_text(encoding="utf-8")
                 if "<group" in text and "group_by" in text:
@@ -190,23 +200,22 @@ def validate_module_runtime(module_root: Path, module_name: str, *, is_upgrade: 
 
     archive = package_module(module_root)
     digest = hashlib.sha256(archive).hexdigest()
+    database_url = make_url(settings.database_url)
+    derive_database_config = not settings.validation_postgres_admin_dsn
+    postgres_host = database_url.host or "localhost"
+    if derive_database_config and postgres_host in {"localhost", "127.0.0.1", "::1"} and platform.system() in {"Darwin", "Windows"}:
+        postgres_host = "host.docker.internal"
     config = {
-        "postgres_admin_dsn": settings.validation_postgres_admin_dsn,
-        "postgres_host": settings.validation_postgres_host,
+        "postgres_admin_dsn": settings.validation_postgres_admin_dsn or database_url.set(
+            drivername="postgresql", database="postgres"
+        ).render_as_string(hide_password=False),
+        "postgres_host": postgres_host if derive_database_config else settings.validation_postgres_host,
         "postgres_port": settings.validation_postgres_port,
-        "postgres_user": settings.validation_postgres_user,
-        "postgres_password": settings.validation_postgres_password,
+        "postgres_user": (database_url.username or "postgres") if derive_database_config else settings.validation_postgres_user,
+        "postgres_password": (database_url.password or "") if derive_database_config else settings.validation_postgres_password,
         "odoo_docker_image": settings.validation_odoo_image,
         "test_timeout_seconds": settings.validation_timeout_seconds,
     }
-    if not config["postgres_admin_dsn"]:
-        return {
-            "ok": False,
-            "checks": [{"name": "validation_environment", "passed": False, "message": "VALIDATION_POSTGRES_ADMIN_DSN is required"}],
-            "test_count": 0,
-            "error": "Disposable Odoo validation is not configured",
-            "log": "",
-        }
     return runner.run_validate_module({
         "job_uuid": hashlib.sha256(f"{module_name}:{digest}".encode()).hexdigest()[:32],
         "module_name": module_name,

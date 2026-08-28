@@ -194,7 +194,9 @@ export async function followRun(
 ): Promise<AgentRun> {
   let sequence = options.after || 0;
   let retries = 0;
-  const maxRetries = options.maxRetries ?? 5;
+  // Keep following active runs across transient API/proxy/worker restarts.
+  // Callers can still pass maxRetries for bounded flows and tests.
+  const maxRetries = options.maxRetries ?? Number.POSITIVE_INFINITY;
   const readTimeoutMs = options.readTimeoutMs ?? 45_000;
   while (true) {
     options.signal?.throwIfAborted();
