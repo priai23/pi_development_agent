@@ -1,7 +1,14 @@
 import { AgentQuestion, AgentRun, ChatMessage, ConnectionState, FinalReport, PendingAction, Step, TaskGraphNode, ToolEvent } from "./api";
+export { type ChatMessage } from "./api";
 
 export const ACTIVE_RUN_STATUSES = new Set(["queued", "running", "cancelling", "awaiting_question", "awaiting_approval"]);
 export const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "expired", "interrupted"]);
+
+function terminalStepState(status: string): { status: Step["status"]; outcome: NonNullable<Step["outcome"]> } {
+  if (status === "succeeded") return { status: "done", outcome: "succeeded" };
+  if (status === "cancelled") return { status: "cancelled", outcome: "unknown" };
+  return { status: "failed", outcome: "failed" };
+}
 
 export type WorkspacePhase =
   | "idle"
@@ -148,7 +155,10 @@ function applyEvent(state: RunViewState, event: ToolEvent): RunViewState {
       next.connection = "paused";
       break;
     case "question.answered":
-      next.question = state.question ? { ...state.question, answer: String(payload.answer || ""), status: "answered" } : null;
+      next.question = null;
+      if (next.run && (next.run.status === "awaiting_question" || next.run.status.startsWith("awaiting_"))) {
+        next.run = { ...next.run, status: "queued" };
+      }
       next.transcript = [...state.transcript, { role: "user", content: String(payload.answer || ""), created_at: event.created_at }];
       break;
     case "approval.required":
@@ -158,7 +168,10 @@ function applyEvent(state: RunViewState, event: ToolEvent): RunViewState {
     case "approval.decided":
     case "approval.approved":
     case "approval.rejected":
-      next.pending = state.pending ? { ...state.pending, status: String(payload.status || payload.decision || event.event_type.split(".")[1]) } : null;
+      next.pending = null;
+      if (next.run && (next.run.status === "awaiting_approval" || next.run.status.startsWith("awaiting_"))) {
+        next.run = { ...next.run, status: "queued" };
+      }
       break;
     case "final_report":
       if (!payload.scope || payload.scope === "run") {
@@ -210,7 +223,7 @@ function applyEvent(state: RunViewState, event: ToolEvent): RunViewState {
       next.recoveringTaskId = null;
       next.thinkingText = "";
       next.connection = "idle";
-      next.steps = next.steps.map((s) => s.status === "running" ? { ...s, status: "done", outcome: s.outcome === "unknown" ? "succeeded" : s.outcome } : s);
+      next.steps = next.steps.map((s) => s.status === "running" ? { ...s, ...terminalStepState(String(payload.status || "succeeded")) } : s);
       break;
     case "run.failed":
       if (next.run) {
@@ -248,6 +261,25 @@ function applyEvent(state: RunViewState, event: ToolEvent): RunViewState {
       next.error = `${String(payload.message || "Agent run interrupted")}${payload.support_id ? ` · Support ${String(payload.support_id)}` : ""}`;
       next.steps = next.steps.map((s) => s.status === "running" ? { ...s, status: "failed", outcome: "failed" } : s);
       break;
+    case "run.expired":
+      if (next.run) {
+        next.run = {
+          ...next.run,
+          status: "expired",
+          error_category: String(payload.category || next.run.error_category || "RunExpired"),
+          error_message: String(payload.message || next.run.error_message || "The run expired while waiting for input or approval."),
+        };
+      }
+      next.question = null;
+      next.pending = null;
+      next.activeRunId = null;
+      next.activeTaskId = null;
+      next.recoveringTaskId = null;
+      next.thinkingText = "";
+      next.connection = "idle";
+      next.error = next.run?.error_message || "The run expired while waiting for input or approval.";
+      next.steps = next.steps.map((s) => s.status === "running" ? { ...s, ...terminalStepState("expired") } : s);
+      break;
     case "run.cancellation_requested":
       if (next.run) next.run = { ...next.run, status: "cancelling" };
       break;
@@ -261,19 +293,22 @@ function applyEvent(state: RunViewState, event: ToolEvent): RunViewState {
       next.taskGraph = (payload.task_graph as TaskGraphNode[]) || state.taskGraph;
       next.connection = "idle";
       next.error = "";
-      next.steps = next.steps.map((s) => s.status === "running" ? { ...s, status: "done", outcome: "unknown" } : s);
+      next.steps = next.steps.map((s) => s.status === "running" ? { ...s, ...terminalStepState("cancelled") } : s);
       break;
   }
   return next;
 }
 
-export function hydrateRun(run: AgentRun, events: ToolEvent[]): RunViewState {
+export function hydrateRun(run: AgentRun, events: ToolEvent[], priorTranscript: ChatMessage[] = []): RunViewState {
   let state: RunViewState = {
     ...emptyRunState,
     run,
     selectedRunId: run.id,
     activeRunId: ACTIVE_RUN_STATUSES.has(run.status) ? run.id : null,
-    transcript: [{ role: "user", content: run.prompt, created_at: run.created_at }],
+    transcript: [
+      ...priorTranscript,
+      { role: "user", content: run.prompt, created_at: run.created_at }
+    ],
     question: run.question?.status === "pending" ? run.question : null,
     taskGraph: run.task_graph || null,
     activeTaskId: run.active_task_id || null,
@@ -284,13 +319,12 @@ export function hydrateRun(run: AgentRun, events: ToolEvent[]): RunViewState {
     error: run.error_message || "",
   };
   for (const event of [...events].sort((a, b) => a.sequence - b.sequence)) state = applyEvent(state, event);
-  const reconciledGraph = run.task_graph?.map((task) => {
-    const hydrated = state.taskGraph?.find((candidate) => candidate.task_id === task.task_id);
-    return { ...task, result: task.result || hydrated?.result || null };
-  }) || state.taskGraph;
-  state = { ...state, taskGraph: reconciledGraph, activeTaskId: run.active_task_id || null };
+  // Event replay is newer than the initial run snapshot. Keep its task statuses
+  // and only use the snapshot to fill fields that events do not carry.
+  const reconciledGraph = state.taskGraph || run.task_graph || null;
+  state = { ...state, taskGraph: reconciledGraph, activeTaskId: state.activeTaskId || run.active_task_id || null };
   if (TERMINAL_RUN_STATUSES.has(run.status)) {
-    const isSuccess = run.status === "succeeded";
+    const terminalState = terminalStepState(run.status);
     state = {
       ...state,
       activeRunId: null,
@@ -300,14 +334,16 @@ export function hydrateRun(run: AgentRun, events: ToolEvent[]): RunViewState {
       connection: "idle",
       finalReport: run.status === "cancelled" || (run.status === "failed" && state.finalReport?.outcome === "SUCCESS") ? null : state.finalReport,
       error: (run.status === "failed" || run.status === "interrupted") ? (run.error_message || state.error || "") : "",
-      steps: state.steps.map((s) => s.status === "running" ? { ...s, status: isSuccess ? "done" : "failed", outcome: isSuccess ? "succeeded" : "failed" } : s),
+      steps: state.steps.map((s) => s.status === "running" ? { ...s, ...terminalState } : s),
     };
   }
   return state;
 }
 
 export type RunAction =
-  | { type: "hydrate"; run: AgentRun; events: ToolEvent[] }
+  | { type: "hydrate"; run: AgentRun; events: ToolEvent[]; priorTranscript?: ChatMessage[] }
+  | { type: "continue_run"; run: AgentRun }
+  | { type: "set_transcript"; transcript: ChatMessage[] }
   | { type: "event"; event: ToolEvent }
   | { type: "connection"; connection: RunViewState["connection"] }
   | { type: "run_status"; run: AgentRun }
@@ -315,24 +351,52 @@ export type RunAction =
   | { type: "clear" };
 
 export function runReducer(state: RunViewState, action: RunAction): RunViewState {
-  if (action.type === "hydrate") return hydrateRun(action.run, action.events);
+  if (action.type === "hydrate") return hydrateRun(action.run, action.events, action.priorTranscript || []);
+  if (action.type === "continue_run") {
+    const isTerminal = TERMINAL_RUN_STATUSES.has(action.run.status);
+    const active = ACTIVE_RUN_STATUSES.has(action.run.status);
+    return {
+      ...state,
+      run: action.run,
+      selectedRunId: action.run.id,
+      activeRunId: active ? action.run.id : null,
+      transcript: [
+        ...state.transcript,
+        { role: "user", content: action.run.prompt, created_at: action.run.created_at }
+      ],
+      cursor: 0,
+      steps: [],
+      thinkingText: "",
+      finalReport: null,
+      question: null,
+      pending: null,
+      taskGraph: action.run.task_graph || null,
+      activeTaskId: action.run.active_task_id || null,
+      recoveringTaskId: null,
+      connection: isTerminal ? "idle" : "connecting",
+      error: "",
+    };
+  }
+  if (action.type === "set_transcript") return { ...state, transcript: action.transcript };
   if (action.type === "event") return applyEvent(state, action.event);
   if (action.type === "connection") return { ...state, connection: action.connection };
   if (action.type === "error") return { ...state, error: action.error };
   if (action.type === "clear") return emptyRunState;
   const isTerminal = TERMINAL_RUN_STATUSES.has(action.run.status);
   const active = ACTIVE_RUN_STATUSES.has(action.run.status);
-  const isSuccess = action.run.status === "succeeded";
+  const terminalState = terminalStepState(action.run.status);
+  const sameRunWithEvents = state.run?.id === action.run.id && state.cursor > 0;
   return {
     ...state,
     run: action.run,
+    selectedRunId: action.run.id,
     activeRunId: active ? action.run.id : null,
     question: action.run.question?.status === "pending" ? action.run.question : state.question,
-    taskGraph: action.run.task_graph || state.taskGraph,
+    taskGraph: sameRunWithEvents ? state.taskGraph : action.run.task_graph || state.taskGraph,
     activeTaskId: isTerminal ? null : (action.run.active_task_id || null),
     recoveringTaskId: isTerminal ? null : state.recoveringTaskId,
     thinkingText: isTerminal ? "" : state.thinkingText,
-    steps: isTerminal ? state.steps.map((s) => s.status === "running" ? { ...s, status: isSuccess ? "done" : "failed", outcome: isSuccess ? "succeeded" : "failed" } : s) : state.steps,
+    steps: isTerminal ? state.steps.map((s) => s.status === "running" ? { ...s, ...terminalState } : s) : state.steps,
     finalReport: action.run.status === "cancelled" || (action.run.status === "failed" && state.finalReport?.outcome === "SUCCESS") ? null : state.finalReport,
     connection: action.run.status.startsWith("awaiting_") ? "paused" : isTerminal ? "idle" : state.connection,
     error: (action.run.status === "failed" || action.run.status === "interrupted") ? (action.run.error_message || state.error) : "",

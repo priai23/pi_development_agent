@@ -47,6 +47,17 @@ body {
   border: 1px solid rgba(0, 0, 0, 0.05);
 }
 
+/* Keep the project drawer's resize handle anchored to its own edge on desktop. */
+.project-navigation-panel {
+  position: fixed;
+}
+
+@media (min-width: 1280px) {
+  .project-navigation-panel {
+    position: relative;
+  }
+}
+
 @media (prefers-color-scheme: dark) {
   .glass-panel {
     background: rgba(28, 28, 30, 0.6);

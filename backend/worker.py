@@ -1,10 +1,13 @@
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 import traceback
+import hashlib
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from sqlalchemy import func, select, text
@@ -25,6 +28,9 @@ from deployment import execute_deployment
 from security import decrypt_secret
 from source_indexer import index_addon_roots
 from workspace import Workspace
+from permissions import PermissionEngine, active_grant, check_permission, resource_for
+from pri_erp_adapter import connect_pri_erp
+from tool_registry import TOOL_REGISTRY, validate_tool_call
 from specification import CHECK_GATED_TASKS, compile_specification
 
 # ─── Watchdog tunables ─────────────────────────────────────────────────────────
@@ -36,6 +42,116 @@ logger = logging.getLogger(__name__)
 
 class ProjectBusy(RuntimeError):
     pass
+
+
+def dispatch_due_schedules() -> int:
+    """Turn due schedules into normal durable runs.
+
+    This is deliberately performed by the worker, so a browser closing or an
+    API process restarting cannot lose a recurring prompt. A schedule advances
+    only after its due occurrence has been claimed in the same transaction as
+    the run enqueue.
+    """
+    dispatched = 0
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        schedules = db.query(models.AgentSchedule).filter(
+            models.AgentSchedule.enabled.is_(True),
+            models.AgentSchedule.next_run_at <= now,
+        ).order_by(models.AgentSchedule.next_run_at).with_for_update(skip_locked=True).limit(20).all()
+        for schedule in schedules:
+            schedule.next_run_at = now + timedelta(seconds=schedule.interval_seconds)
+            schedule.last_run_at = now
+            schedule.last_error = None
+            project = db.get(models.Project, schedule.project_id)
+            instance = db.query(models.Instance).filter(
+                models.Instance.project_id == schedule.project_id,
+                models.Instance.is_active.is_(True),
+            ).first()
+            active = db.query(models.AgentRun).filter(
+                models.AgentRun.project_id == schedule.project_id,
+                models.AgentRun.intent == "write",
+                models.AgentRun.status.in_(("queued", "running", "awaiting_question", "awaiting_approval", "cancelling")),
+            ).first()
+            key = db.get(models.Setting, "openrouter_api_key")
+            if active:
+                schedule.last_error = f"Deferred: project already has active run {active.id}"
+                schedule.next_run_at = now + timedelta(seconds=min(schedule.interval_seconds, 300))
+                db.commit()
+                continue
+            if not project or not instance or instance.status not in {"ready", "connected"}:
+                schedule.last_error = "Deferred: no active staging instance"
+                db.commit()
+                continue
+            try:
+                key_configured = bool(key and decrypt_secret(key.value).strip())
+            except ValueError:
+                key_configured = False
+            if not key_configured:
+                schedule.last_error = "Deferred: no API key configured"
+                db.commit()
+                continue
+            budget = project.monthly_budget_usd or project.organization.monthly_budget_usd
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            spent = db.query(models.AgentRun.cost_usd).filter(
+                models.AgentRun.project_id == project.id,
+                models.AgentRun.created_at >= month_start,
+            ).all()
+            if budget is None or sum(row[0] or 0 for row in spent) >= budget:
+                schedule.last_error = "Deferred: monthly agent budget is not configured or has been reached"
+                db.commit()
+                continue
+            version_info = instance.version_info or {}
+            if instance.erp_type in ("pri_erp", "pi_erp"):
+                version = "pri_erp"
+                edition = "managed"
+            else:
+                raw_version = str(version_info.get("server_serie") or version_info.get("server_version") or "").strip()
+                version_match = re.match(r"^(\d+\.\d+)", raw_version)
+                version = version_match.group(1) if version_match else "unknown"
+                edition = str(version_info.get("server_edition") or "unknown").casefold()
+                if version != "19.0" or edition not in {"community", "enterprise"}:
+                    schedule.last_error = "Deferred: staging Odoo 19 version and edition are not verified"
+                    db.commit()
+                    continue
+            schedule.idempotency_key = hashlib.sha256(f"{schedule.id}:{now.isoformat()}".encode()).hexdigest()
+            schedule.retry_count = 0
+            is_read_only = (
+                SupervisorPlanner.is_read_only_request(schedule.prompt)
+                or SupervisorPlanner.is_conversational_request(schedule.prompt)
+            )
+            intent = "read_only" if is_read_only else "write"
+            workspace = Workspace(project.workspace_slug, create=intent != "read_only")
+            run = models.AgentRun(
+                project_id=project.id,
+                requested_by_id=schedule.requested_by_id,
+                prompt=schedule.prompt,
+                thread_id=f"project:{project.id}:schedule:{schedule.id}:run:{uuid4()}",
+                planner_model=(db.get(models.Setting, "llm_model_name").value if db.get(models.Setting, "llm_model_name") else None),
+                fallback_model=(db.get(models.Setting, "llm_fallback_model_name").value if db.get(models.Setting, "llm_fallback_model_name") else None),
+                workspace_base_revision=workspace.head() if intent != "read_only" else None,
+                intent=intent,
+                workspace_slug=project.workspace_slug if intent != "read_only" else None,
+                status="queued",
+            )
+            db.add(run)
+            db.flush()
+            snapshot = models.SourceSnapshot(
+                instance_id=instance.id,
+                odoo_version=version,
+                odoo_edition=edition,
+                fingerprint="pending",
+                status="pending_index",
+            )
+            db.add(snapshot)
+            db.flush()
+            run.source_snapshot_id = snapshot.id
+            schedule.last_run_id = run.id
+            emit(db, run.id, "run.queued", {"support_id": run.support_id, "scheduled": True, "schedule_id": schedule.id})
+            enqueue(db, "run.prepare", run.id)
+            db.commit()
+            dispatched += 1
+    return dispatched
 
 
 def required_acceptance_failures(db, run_id: str, task_id: str | None) -> list[str]:
@@ -161,6 +277,12 @@ def _cancel_active_task(db, run: models.AgentRun) -> list[dict]:
     task_id = run.active_task_id
     graph = run.task_graph or []
     if task_id:
+        child = db.query(models.AgentSubtask).filter(
+            models.AgentSubtask.parent_run_id == run.id,
+            models.AgentSubtask.task_id == task_id,
+        ).first()
+        if child:
+            _set_subtask_status(child, "cancelled")
         graph = _replace_task(run, task_id, status="cancelled")
         _emit_task_transition(db, run, "task.cancelled", task_id, {"task_graph": graph})
     run.active_task_id = None
@@ -198,6 +320,55 @@ def _apply_task_status(db, run: models.AgentRun, task_id: str, status: str, **ch
     if not run.task_graph:
         return []
     return _replace_task(run, task_id, status=status, **changes)
+
+
+def _subtask_role(task: dict) -> str:
+    title = f"{task.get('task_id', '')} {task.get('title', '')}".casefold()
+    if any(word in title for word in ("inspect", "discover", "schema", "database")):
+        return "discovery_analyst"
+    if any(word in title for word in ("model", "python", "backend")):
+        return "backend_specialist"
+    if any(word in title for word in ("view", "xml", "frontend")):
+        return "frontend_specialist"
+    if any(word in title for word in ("security", "access")):
+        return "security_specialist"
+    if any(word in title for word in ("test", "verify", "validate", "package")):
+        return "verification_specialist"
+    return "implementation_specialist"
+
+
+def _ensure_subtask(db, run: models.AgentRun, task: dict) -> models.AgentSubtask:
+    subtask = db.query(models.AgentSubtask).filter(
+        models.AgentSubtask.parent_run_id == run.id,
+        models.AgentSubtask.task_id == task["task_id"],
+    ).first()
+    if subtask is None:
+        subtask = models.AgentSubtask(
+            parent_run_id=run.id,
+            project_id=run.project_id,
+            task_id=task["task_id"],
+            title=task.get("title", task["task_id"]),
+            role=_subtask_role(task),
+            thread_id=f"{run.thread_id}:subtask:{task['task_id']}",
+            prompt=run.prompt,
+        )
+        db.add(subtask)
+        db.flush()
+    return subtask
+
+
+def _set_subtask_status(subtask: models.AgentSubtask, status: str, *, result: dict | None = None, error: str | None = None) -> None:
+    now = datetime.now(timezone.utc)
+    subtask.status = status
+    subtask.heartbeat_at = now
+    if status == "running":
+        subtask.started_at = subtask.started_at or now
+    if result is not None:
+        subtask.result = result
+    if error is not None:
+        subtask.error_message = error
+    if status in {"succeeded", "failed", "cancelled"}:
+        subtask.finished_at = now
 
 
 # ─── Watchdog / recovery ───────────────────────────────────────────────────────
@@ -280,6 +451,13 @@ def recover_stale_work() -> None:
                 run.active_task_id = None
                 run.subtask_heartbeat_at = None
                 run.status = "queued"
+                child = db.query(models.AgentSubtask).filter(
+                    models.AgentSubtask.parent_run_id == run.id,
+                    models.AgentSubtask.task_id == task_id,
+                ).first()
+                if child:
+                    child.retry_count = current_retries + 1
+                    _set_subtask_status(child, "queued")
                 emit(db, run.id, "task.recovering", {
                     "task_id": task_id,
                     "attempt": current_retries + 1,
@@ -297,6 +475,12 @@ def recover_stale_work() -> None:
                 run.error_message = f"Sub-task '{task_id}' failed after {MAX_TASK_RETRIES} attempts."
                 run.finished_at = now
                 _apply_task_status(db, run, task_id, "failed")
+                child = db.query(models.AgentSubtask).filter(
+                    models.AgentSubtask.parent_run_id == run.id,
+                    models.AgentSubtask.task_id == task_id,
+                ).first()
+                if child:
+                    _set_subtask_status(child, "failed", error=run.error_message)
                 emit(db, run.id, "task.failed", {
                     "task_id": task_id,
                     "retries_exhausted": True,
@@ -365,14 +549,27 @@ async def build_agent(db, run: models.AgentRun, checkpointer):
         models.Instance.project_id == project.id, models.Instance.is_active.is_(True)
     ).first()
     if not instance:
-        raise ValueError("No active Odoo instance is connected")
+        raise ValueError("No active ERP instance is connected")
     if instance.environment != "staging":
         raise ValueError("Agent implementation runs require a staging instance")
-    client = await (
-        connect_odoo_json2(instance.url, instance.db_name or "", decrypt_secret(instance.api_key_encrypted or ""))
-        if instance.auth_method == "json2"
-        else connect_odoo(instance.url, instance.db_name or "", instance.username or "", decrypt_secret(instance.password_encrypted or ""))
-    )
+    if instance.erp_type in ("pri_erp", "pi_erp"):
+        if instance.api_key_encrypted:
+            client = await connect_pri_erp(
+                url=instance.url,
+                api_key=decrypt_secret(instance.api_key_encrypted),
+            )
+        else:
+            client = await connect_pri_erp(
+                url=instance.url,
+                username=instance.username or "",
+                password=decrypt_secret(instance.password_encrypted or ""),
+            )
+    else:
+        client = await (
+            connect_odoo_json2(instance.url, instance.db_name or "", decrypt_secret(instance.api_key_encrypted or ""))
+            if instance.auth_method == "json2"
+            else connect_odoo(instance.url, instance.db_name or "", instance.username or "", decrypt_secret(instance.password_encrypted or ""))
+        )
     model = db.get(models.Setting, "llm_model_name")
     key = db.get(models.Setting, "openrouter_api_key")
     timeout = db.get(models.Setting, "llm_timeout_seconds")
@@ -382,7 +579,7 @@ async def build_agent(db, run: models.AgentRun, checkpointer):
     auto_writes = bool(auto_writes_setting and auto_writes_setting.value and auto_writes_setting.value.lower() in ("true", "1", "yes"))
     return ERPImplementationAgent(
         client,
-        project.workspace_slug,
+        run.workspace_slug or project.workspace_slug,
         checkpointer,
         run.planner_model or (model.value if model else "gpt-4o-mini"),
         decrypt_secret(key.value) if key else None,
@@ -394,6 +591,7 @@ async def build_agent(db, run: models.AgentRun, checkpointer):
         instance.id,
         fallback_model,
         autonomous_workspace_writes=auto_writes,
+        read_only=run.intent == "read_only",
     )
 
 
@@ -406,13 +604,17 @@ def process_run_prepare(run_id: str) -> None:
         project = db.get(models.Project, run.project_id)
         snapshot = db.get(models.SourceSnapshot, run.source_snapshot_id) if run.source_snapshot_id else None
 
-        # 1. Index snapshot
+        read_only = run.intent == "read_only"
+
+        # 1. Index snapshot. Database-only inspection must not create a workspace.
         if snapshot and snapshot.status == "pending_index":
             try:
                 snapshot.status = "indexing"
                 db.commit()
-                ws = Workspace(project.workspace_slug)
-                symbol_count = index_addon_roots([ws.root], snapshot.id, db)
+                symbol_count = 0
+                if not read_only:
+                    ws = Workspace(run.workspace_slug or project.workspace_slug)
+                    symbol_count = index_addon_roots([ws.root], snapshot.id, db)
                 snapshot.status = "indexed"
                 snapshot.symbol_count = symbol_count
                 snapshot.indexed_at = datetime.now(timezone.utc)
@@ -437,8 +639,8 @@ def process_run_prepare(run_id: str) -> None:
             if mod_exists:
                 is_upgrade = True
 
-        # 3. Call compile_specification
-        if not run.specification_id:
+        # 3. Compile implementation specifications only for implementation requests.
+        if not read_only and not run.specification_id:
             symbols = db.query(models.SourceSymbol).filter(models.SourceSymbol.snapshot_id == snapshot.id).all() if snapshot else []
             try:
                 spec = compile_specification(
@@ -461,7 +663,7 @@ def process_run_prepare(run_id: str) -> None:
                 return
 
         # 4 & 5. Build task graph
-        if not run.task_graph:
+        if not run.task_graph and not read_only:
             spec_row = db.get(models.RunSpecification, run.specification_id)
             if spec_row and spec_row.requirements:
                 graph = SupervisorPlanner.build_from_specification(spec_row.requirements)
@@ -476,6 +678,13 @@ def process_run_prepare(run_id: str) -> None:
 
 async def _initialise_task_graph(db, run: models.AgentRun) -> list[dict]:
     """Decompose prompt into task graph and persist — requirement-driven if spec exists."""
+    if run.intent == "read_only":
+        graph = await SupervisorPlanner.decompose(run.prompt)
+        run.task_graph = graph
+        run.task_retries = {}
+        db.flush()
+        return graph
+
     if run.task_graph:
         return run.task_graph
 
@@ -501,7 +710,11 @@ async def _initialise_task_graph(db, run: models.AgentRun) -> list[dict]:
             max_tokens=int(max_tokens.value) if max_tokens else 16000,
         )
 
-    graph = await SupervisorPlanner.decompose(run.prompt, llm)
+    recent_interactions = db.query(models.Interaction).filter(
+        models.Interaction.project_id == run.project_id
+    ).order_by(models.Interaction.created_at.desc()).limit(10).all()[::-1]
+
+    graph = await SupervisorPlanner.decompose(run.prompt, llm, conversation_history=recent_interactions)
     run.task_graph = graph
     run.task_retries = {}
     db.flush()
@@ -522,6 +735,8 @@ async def process_run(
         run = db.get(models.AgentRun, run_id)
         if not run or run.status in {"succeeded", "failed", "cancelled"}:
             return
+        subtask_thread_id = run.thread_id
+        subtask_id = None
         if run.status == "cancelling":
             graph = _cancel_active_task(db, run)
             run.status = "cancelled"
@@ -532,12 +747,14 @@ async def process_run(
         active = db.query(models.AgentRun.id).filter(
             models.AgentRun.project_id == run.project_id,
             models.AgentRun.id != run.id,
+            models.AgentRun.intent == "write",
             models.AgentRun.status.in_(["running", "awaiting_question", "awaiting_approval", "cancelling"]),
         ).first()
         if active:
             raise ProjectBusy("Another project run is active")
         try:
-            db.execute(text("SELECT pg_advisory_xact_lock(:project_id)"), {"project_id": run.project_id})
+            if run.intent == "write":
+                db.execute(text("SELECT pg_advisory_xact_lock(:project_id)"), {"project_id": run.project_id})
             run.status = "running"
             run.started_at = run.started_at or datetime.now(timezone.utc)
             run.heartbeat_at = datetime.now(timezone.utc)
@@ -574,6 +791,16 @@ async def process_run(
                         "progress": SupervisorPlanner.format_progress(task_graph),
                     })
 
+            active_task = next(
+                (task for task in (run.task_graph or []) if task.get("task_id") == run.active_task_id),
+                None,
+            )
+            if active_task:
+                child = _ensure_subtask(db, run, active_task)
+                subtask_id = child.id
+                subtask_thread_id = child.thread_id
+                _set_subtask_status(child, "running")
+
             emit(db, run.id, "run.started", {"attempt": run.attempt})
             db.commit()
         except IntegrityError:
@@ -581,7 +808,7 @@ async def process_run(
             raise RuntimeError("Another project run is active")
 
         agent = await build_agent(db, run, checkpointer)
-        if auto_approve_task:
+        if auto_approve_task and not agent.read_only:
             agent.safe_tools = set(agent.safe_tools) | {"write_file", "patch_file", "create_directory"}
         interactions = db.query(models.Interaction).filter(
             models.Interaction.project_id == run.project_id
@@ -599,17 +826,25 @@ async def process_run(
                     dependency = next((task for task in run.task_graph if task["task_id"] == dependency_id), None)
                     if dependency and dependency.get("context_bundle"):
                         dependency_context.append(f"{dependency_id}: {json.dumps(dependency['context_bundle'])}")
+                request_label = "Original inspection request" if agent.read_only else "Original implementation request"
+                read_only_suffix = "\nDo not modify the workspace or ERP; return findings only." if agent.read_only else ""
+                context_prefix = ""
+                if SupervisorPlanner.is_continuation_request(run.prompt) and interactions:
+                    context_lines = [f"{m.role.upper()}: {m.content[:300]}" for m in interactions[-4:] if getattr(m, "content", "").strip()]
+                    if context_lines:
+                        context_prefix = f"Conversation context:\n" + "\n".join(context_lines) + "\n\n"
                 task_prompt = (
-                    f"Original implementation request:\n{run.prompt}\n\n"
+                    f"{request_label}:\n{context_prefix}{run.prompt}\n\n"
                     f"Execute only supervisor task {active_task['task_id']}: {active_task['title']}.\n"
                     f"Acceptance criteria: {active_task.get('acceptance_criteria', 'Complete and verify this task without doing later tasks.')}\n"
                     f"Dependencies: {', '.join(active_task.get('depends_on', [])) or 'none'}\n"
                     f"Handoff context: {'; '.join(dependency_context) or 'none'}\n"
                     "Verify the result, then call complete_task exactly once."
+                    f"{read_only_suffix}"
                 )
 
         if is_resume:
-            stream = agent.stream(task_prompt, run.thread_id)
+            stream = agent.stream(task_prompt, subtask_thread_id)
         elif action_id:
             action = db.get(models.PendingAction, action_id)
             if not action or action.run_id != run.id:
@@ -627,6 +862,10 @@ async def process_run(
                 if task_id:
                     graph = _apply_task_status(db, run, task_id, "failed", result=report)
                     _emit_task_transition(db, run, "task.failed", task_id, {"task_graph": graph, "error_category": "DependencyRejected"})
+                if subtask_id:
+                    child = db.get(models.AgentSubtask, subtask_id)
+                    if child:
+                        _set_subtask_status(child, "failed", result=report, error=report["errors"])
                 run.active_task_id = None
                 run.status = "failed"
                 run.error_category = "DependencyRejected"
@@ -651,7 +890,11 @@ async def process_run(
                 action.status = "executing"
                 action.execution_started_at = datetime.now(timezone.utc)
                 db.commit()
-            stream = agent.stream(None, run.thread_id, reject=decision != "approve")
+            if subtask_id:
+                child = db.get(models.AgentSubtask, subtask_id)
+                if child:
+                    _set_subtask_status(child, "running")
+            stream = agent.stream(None, subtask_thread_id, reject=decision != "approve")
         else:
             db.add(models.Interaction(project_id=run.project_id, role="user", content=run.prompt))
             db.commit()
@@ -673,7 +916,7 @@ async def process_run(
                             content=f"[A2A Context from previous tasks]\n{combined_handoff}"
                         ))
                         
-            stream = agent.stream(task_prompt, run.thread_id, interactions)
+            stream = agent.stream(task_prompt, subtask_thread_id, interactions)
 
         async for chunk in stream:
             response += chunk
@@ -691,6 +934,10 @@ async def process_run(
                 current.heartbeat_at = now
                 if current.active_task_id:
                     current.subtask_heartbeat_at = now
+                if subtask_id:
+                    child = event_db.get(models.AgentSubtask, subtask_id)
+                    if child and child.status == "running":
+                        child.heartbeat_at = now
 
                 for event_type, payload in agent.drain_activity():
                     payload = _scope_tool_event(event_db, current, event_type, payload)
@@ -710,6 +957,7 @@ async def process_run(
 
         with SessionLocal() as finish_db:
             current = finish_db.get(models.AgentRun, run.id)
+            current_child = finish_db.get(models.AgentSubtask, subtask_id) if subtask_id else None
             for event_type, payload in agent.drain_activity():
                 payload = _scope_tool_event(finish_db, current, event_type, payload)
                 if event_type == "task.report":
@@ -754,6 +1002,8 @@ async def process_run(
                 finish_db.add(question)
                 finish_db.flush()
                 current.status = "awaiting_question"
+                if current_child:
+                    _set_subtask_status(current_child, "awaiting_question")
                 emit(finish_db, run.id, "question.required", {
                     "question_id": question.id,
                     "question": question.question,
@@ -763,27 +1013,44 @@ async def process_run(
                 finish_db.commit()
                 return
 
-            call = await agent.pending_call(run.thread_id)
+            call = await agent.pending_call(subtask_thread_id)
             if call:
+                if subtask_id:
+                    child = finish_db.get(models.AgentSubtask, subtask_id)
+                    if child:
+                        _set_subtask_status(child, "awaiting_approval")
                 preview = agent.preview(call)
+                reg_entry = TOOL_REGISTRY.get(call["name"])
+                risk_class = reg_entry.risk_class if reg_entry else agent.RISK_CLASSES.get(call["name"], 2)
                 action = models.PendingAction(
                     project_id=run.project_id,
                     run_id=run.id,
                     requested_by_id=run.requested_by_id,
-                    thread_id=run.thread_id,
+                    thread_id=subtask_thread_id,
                     tool_call_id=call["id"],
                     tool_name=call["name"],
                     arguments=call["args"],
                     preview=preview,
-                    risk_class=agent.RISK_CLASSES[call["name"]],
+                    risk_class=risk_class,
                     expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.action_expiry_minutes),
                     idempotency_key=f"{run.id}:{call['id']}",
                 )
                 finish_db.add(action)
                 finish_db.flush()
                 
-                is_safe = call["name"] in agent.SAFE_TOOLS
-                if is_safe:
+                active_inst = finish_db.query(models.Instance).filter(
+                    models.Instance.project_id == run.project_id,
+                    models.Instance.is_active.is_(True),
+                ).first()
+                decision = PermissionEngine().check(
+                    db=finish_db,
+                    project_id=run.project_id,
+                    user_id=run.requested_by_id,
+                    tool_name=call["name"],
+                    args=call.get("args") or {},
+                    erp_capabilities=getattr(active_inst, "capabilities", None),
+                )
+                if decision.allowed and not decision.requires_approval:
                     action.status = "executing"
                     action.execution_started_at = datetime.now(timezone.utc)
                     outbox = models.OutboxEvent(
@@ -792,6 +1059,18 @@ async def process_run(
                         payload={"action_id": action.id, "decision": "approve"}
                     )
                     finish_db.add(outbox)
+                elif not decision.allowed:
+                    action.status = "rejected"
+                    current.status = "queued"
+                    emit(finish_db, run.id, "permission.denied", {
+                        "action_id": action.id, "tool": action.tool_name,
+                        "resource": resource_for(call["name"], call.get("args") or {}),
+                        "reason": decision.reason,
+                    })
+                    finish_db.add(models.OutboxEvent(
+                        aggregate_id=run.id, event_type="action.resume",
+                        payload={"action_id": action.id, "decision": "reject"},
+                    ))
                 else:
                     current.status = "awaiting_approval"
                     emit(finish_db, run.id, "approval.required", {
@@ -802,6 +1081,12 @@ async def process_run(
                     })
             else:
                 if not task_report:
+                    if current_child:
+                        _set_subtask_status(
+                            current_child,
+                            "failed",
+                            error="Agent finished without calling complete_task.",
+                        )
                     current.status = "failed"
                     current.error_category = "MissingTaskReport"
                     current.error_message = "Agent finished without calling complete_task."
@@ -827,6 +1112,8 @@ async def process_run(
                             f"AcceptanceCheckFailed: {len(acceptance_failures)} required checks missing, pending, or failed: "
                             f"{', '.join(acceptance_failures)}"
                         )
+                    if current_child and task_succeeded:
+                        _set_subtask_status(current_child, "succeeded", result=task_report)
 
                     handoff = {
                         "handoff_summary": "\n".join(task_report.get("done") or []),
@@ -868,23 +1155,44 @@ async def process_run(
                             # Gather files created/modified in the workspace
                             project = finish_db.get(models.Project, run.project_id)
                             changed_files = []
-                            if project:
+                            diff_warning = None
+                            if project and not agent.read_only:
                                 try:
-                                    ws = Workspace(project.workspace_slug)
+                                    ws = Workspace(run.workspace_slug or project.workspace_slug)
                                     base_rev = run.workspace_base_revision or Workspace.EMPTY_TREE_REVISION
                                     diff_text = ws.diff(base_rev, "HEAD")
                                     diff_files = [line[6:].strip() for line in diff_text.splitlines() if line.startswith("+++ b/")]
                                     changed_files = sorted(set(f for f in diff_files if f and not f.startswith(".git")))
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    diff_warning = f"Workspace diff collection encountered an issue: {str(exc)}"
 
                             done_tasks = [task.get("title", task["task_id"]) for task in graph]
+
+                            # Synthesize task verifications
+                            task_verifications = []
+                            for task in graph:
+                                res = task.get("result") or {}
+                                v = res.get("verification")
+                                title = task.get("title", task.get("task_id", "Task"))
+                                if v:
+                                    task_verifications.append(f"{title}: {v}")
+
+                            if task_verifications:
+                                verification_text = "\n".join(task_verifications)
+                            elif changed_files:
+                                verification_text = f"Verified {len(changed_files)} changed workspace file(s)."
+                            else:
+                                verification_text = "Supervisor tasks completed and verified."
+
+                            if diff_warning:
+                                verification_text += f"\n({diff_warning})"
+
                             run_report = {
                                 "scope": "run",
-                                "outcome": "SUCCESS",
+                                "outcome": "PARTIAL" if diff_warning else "SUCCESS",
                                 "done": done_tasks,
-                                "verification": "All supervisor tasks completed and verified.",
-                                "errors": "",
+                                "verification": verification_text,
+                                "errors": diff_warning or "",
                                 "files": changed_files,
                             }
                             emit(finish_db, run.id, "final_report", run_report)
@@ -892,7 +1200,7 @@ async def process_run(
 
                             # Emit markdown summary of what was built to the chat
                             summary_lines = [
-                                "### 🎉 Implementation Complete\n",
+                                f"### {'⚠️ Implementation Complete with Warnings' if diff_warning else '🎉 Implementation Complete'}\n",
                                 "**Tasks Completed:**",
                                 *(f"- ✅ {t}" for t in done_tasks),
                             ]
@@ -900,7 +1208,11 @@ async def process_run(
                                 summary_lines.append("\n**Files Built & Created in Workspace:**")
                                 for f in changed_files:
                                     summary_lines.append(f"- `{f}`")
-                            summary_lines.append("\nAll module files, schemas, and views are saved and ready in the IDE workspace.")
+                                summary_lines.append("\nAll module files, schemas, and views are saved and ready in the IDE workspace.")
+                            else:
+                                summary_lines.append("\nInspection and task verification completed.")
+                            if diff_warning:
+                                summary_lines.append(f"\n> ⚠️ *Note:* {diff_warning}")
                             summary_message = "\n".join(summary_lines)
 
                             finish_db.add(models.Interaction(project_id=run.project_id, role="agent", content=summary_message))
@@ -922,6 +1234,8 @@ async def process_run(
                         error_text = str(task_report.get("errors") or "Task reported failure")
                         error_category = "DependencyInstallFailed" if "DependencyInstallFailed" in error_text else "TaskFailed"
                         if not requeue_failed_task(finish_db, current, task_id, task_report):
+                            if current_child:
+                                _set_subtask_status(current_child, "failed", result=task_report, error=error_text)
                             _emit_task_transition(finish_db, current, "task.failed", task_id, {
                                 "task_graph": graph, "error_category": error_category,
                             })
@@ -938,6 +1252,9 @@ async def process_run(
                                 "task_id": task_id,
                                 "tool": None,
                             })
+                        elif current_child:
+                            current_child.retry_count += 1
+                            _set_subtask_status(current_child, "queued")
 
                 if action_id:
                     action_rec = finish_db.get(models.PendingAction, action_id)
@@ -985,6 +1302,12 @@ async def handle_event(event, checkpointer):
                 error_category = "TaskExecutionLimitExceeded" if str(exc).startswith("TaskExecutionLimitExceeded") else type(exc).__name__
                 failed_task_id = run.active_task_id
                 if failed_task_id:
+                    child = db.query(models.AgentSubtask).filter(
+                        models.AgentSubtask.parent_run_id == run.id,
+                        models.AgentSubtask.task_id == failed_task_id,
+                    ).first()
+                    if child:
+                        _set_subtask_status(child, "failed", error=str(exc))
                     graph = _apply_task_status(db, run, failed_task_id, "failed")
                     _emit_task_transition(db, run, "task.failed", failed_task_id, {
                         "task_graph": graph,
@@ -1026,6 +1349,10 @@ async def serve():
     
     async def recovery_loop():
         while not shutdown_event.is_set():
+            try:
+                await asyncio.to_thread(dispatch_due_schedules)
+            except Exception:
+                logger.exception("Schedule dispatch failed")
             await asyncio.to_thread(recover_stale_work)
             await asyncio.sleep(10)
             

@@ -98,12 +98,13 @@ export default function SetupPage() {
 
           <div>
             <label htmlFor="setup-password" className="block text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-1">
-              Password
+              Password (min 12 characters)
             </label>
             <input
               id="setup-password"
               type="password"
               required
+              minLength={12}
               autoComplete="new-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
@@ -120,6 +121,7 @@ export default function SetupPage() {
               id="setup-confirm-password"
               type="password"
               required
+              minLength={12}
               autoComplete="new-password"
               value={confirmPassword}
               onChange={(e) => setConfirmPassword(e.target.value)}

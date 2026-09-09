@@ -4,8 +4,9 @@ import { useEffect, useState } from "react";
 import CodeDiffViewer from "./CodeDiffViewer";
 import { PendingAction } from "@/lib/api";
 
-export default function ApprovalCard({ action, busy = false, onDecision }: { action: PendingAction; busy?: boolean; onDecision: (decision: "approve" | "reject", autoApproveTask?: boolean) => void }) {
+export default function ApprovalCard({ action, busy = false, onDecision }: { action: PendingAction; busy?: boolean; onDecision: (decision: "approve" | "reject", autoApproveTask?: boolean, remember?: boolean) => void }) {
   const [expired, setExpired] = useState(false);
+  const [remember, setRemember] = useState(false);
   useEffect(() => {
     if (!action.expires_at) return;
     const timer = window.setTimeout(() => setExpired(true), Math.max(0, new Date(action.expires_at).getTime() - Date.now()));
@@ -31,10 +32,11 @@ export default function ApprovalCard({ action, busy = false, onDecision }: { act
       {action.arguments && Object.keys(action.arguments).length > 0 && <details className="mt-3 text-xs"><summary className="cursor-pointer font-semibold text-gray-300">Tool arguments</summary><dl className="mt-2 grid gap-2 rounded bg-black/40 p-3">{Object.entries(action.arguments).map(([key, value]) => <div key={key} className="grid grid-cols-[8rem_1fr] gap-2"><dt className="text-gray-500">{key.replace(/_/g, " ")}</dt><dd className="break-all font-mono text-gray-300">{typeof value === "string" ? value : JSON.stringify(value)}</dd></div>)}</dl></details>}
       <p className="mt-3 text-xs text-gray-400"><span className="font-semibold text-gray-300">Verification:</span> {verification}</p>
       {action.expires_at && <p className={`mt-2 text-xs ${expired ? "text-red-400" : "text-gray-500"}`}>{expired ? "This approval has expired." : `Expires ${new Date(action.expires_at).toLocaleString()}`}</p>}
+      {Number(action.risk_class) <= 2 && <label className="mt-3 flex items-center gap-2 text-xs text-gray-400"><input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} disabled={disabled} /> Remember this exact resource for this project</label>}
       <div className="mt-4 flex flex-wrap items-center gap-2">
-        <button disabled={disabled} onClick={() => onDecision("approve", false)} className="rounded-lg bg-emerald-600 px-4 py-2 font-medium text-white transition hover:bg-emerald-500 active:scale-95 disabled:opacity-40">{busy ? "Submitting…" : "Approve"}</button>
+        <button disabled={disabled} onClick={() => onDecision("approve", false, remember)} className="rounded-lg bg-emerald-600 px-4 py-2 font-medium text-white transition hover:bg-emerald-500 active:scale-95 disabled:opacity-40">{busy ? "Submitting…" : "Approve"}</button>
         {Number(action.risk_class) <= 2 && (
-          <button disabled={disabled} onClick={() => onDecision("approve", true)} title="Auto-approves remaining file writes for this task" className="rounded-lg border border-emerald-500/40 bg-emerald-950/40 px-3.5 py-2 text-xs font-medium text-emerald-300 transition hover:bg-emerald-900/60 active:scale-95 disabled:opacity-40">
+          <button disabled={disabled} onClick={() => onDecision("approve", true, remember)} title="Auto-approves remaining file writes for this task" className="rounded-lg border border-emerald-500/40 bg-emerald-950/40 px-3.5 py-2 text-xs font-medium text-emerald-300 transition hover:bg-emerald-900/60 active:scale-95 disabled:opacity-40">
             ⚡ Approve All for Task
           </button>
         )}

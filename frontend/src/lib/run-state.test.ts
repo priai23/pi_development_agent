@@ -32,6 +32,44 @@ describe("durable run reducer", () => {
     expect(runReducer(state, { type: "event", event: event(1, "message.delta", { text: "Twice" }) }).transcript[1].content).toBe("Once");
   });
 
+  it("does not let a stale run snapshot erase replayed task progress", () => {
+    const hydrated = hydrateRun({ ...run, status: "running", task_graph: [{ task_id: "t1", title: "Inspect", status: "pending", risk_class: 1, retry_count: 0, heartbeat_at: null }] }, [
+      event(1, "task.started", { task_id: "t1" }),
+    ]);
+    const refreshed = runReducer(hydrated, {
+      type: "run_status",
+      run: { ...run, status: "running", task_graph: [{ task_id: "t1", title: "Inspect", status: "pending", risk_class: 1, retry_count: 0, heartbeat_at: null }] },
+    });
+    expect(refreshed.taskGraph?.[0].status).toBe("in_progress");
+  });
+
+  it("marks in-flight actions cancelled instead of completed", () => {
+    const activeState: RunViewState = {
+      ...emptyRunState,
+      run: { ...run, status: "cancelling" },
+      cursor: 1,
+      steps: [{ tool: "run_command", label: "running command", status: "running", startedAt: Date.now() }],
+    };
+    const cancelled = runReducer(activeState, { type: "event", event: event(2, "run.cancelled", {}) });
+    expect(cancelled.steps[0].status).toBe("cancelled");
+    expect(cancelled.steps[0].outcome).toBe("unknown");
+  });
+
+  it("clears a pending interaction when the run expires", () => {
+    const activeState: RunViewState = {
+      ...emptyRunState,
+      run: { ...run, status: "awaiting_approval" },
+      activeRunId: run.id,
+      pending: { id: "a1", run_id: run.id, tool: "write_file", risk_class: "2", preview: {}, arguments: {}, expires_at: "", status: "pending" },
+      connection: "paused",
+    };
+    const expired = runReducer(activeState, { type: "event", event: event(2, "run.expired", {}) });
+    expect(expired.run?.status).toBe("expired");
+    expect(expired.pending).toBeNull();
+    expect(expired.activeRunId).toBeNull();
+    expect(expired.connection).toBe("idle");
+  });
+
   it("keeps task reports on their task and uses cumulative usage", () => {
     const withGraph = hydrateRun({ ...run, task_graph: [{ task_id: "t1", title: "Inspect", status: "in_progress", risk_class: 1, retry_count: 0, heartbeat_at: null }] }, [
       event(1, "task.report", { task_id: "t1", outcome: "SUCCESS", done: ["Inspected"], verification: "Models found", errors: "" }),
@@ -110,4 +148,39 @@ describe("durable run reducer", () => {
     const interruptedState: RunViewState = { ...emptyRunState, run: { ...run, status: "interrupted" } };
     expect(getWorkspacePhase(interruptedState)).toBe("interrupted");
   });
+
+  it("preserves conversation transcript across multiple turns in the same chat", () => {
+    // Turn 1
+    const run1: AgentRun = { ...run, id: "run-1", thread_id: "thread-123", prompt: "Explain Odoo models" };
+    let state = hydrateRun(run1, [
+      event(1, "message.delta", { text: "Odoo models inherit from models.Model." }),
+    ]);
+    expect(state.transcript.map((m) => m.content)).toEqual([
+      "Explain Odoo models",
+      "Odoo models inherit from models.Model.",
+    ]);
+
+    // Turn 2 in same thread using continue_run
+    const run2: AgentRun = { ...run, id: "run-2", thread_id: "thread-123", prompt: "Add a status field to that" };
+    state = runReducer(state, { type: "continue_run", run: run2 });
+
+    expect(state.activeRunId).toBe("run-2");
+    expect(state.transcript.map((m) => m.content)).toEqual([
+      "Explain Odoo models",
+      "Odoo models inherit from models.Model.",
+      "Add a status field to that",
+    ]);
+
+    // Turn 2 streams agent response
+    const eventRun2: ToolEvent = { id: 1, run_id: "run-2", sequence: 1, event_type: "message.delta", payload: { text: "Here is status = fields.Selection(...)" }, created_at: "2026-01-01T00:01:00Z" };
+    state = runReducer(state, { type: "event", event: eventRun2 });
+
+    expect(state.transcript.map((m) => m.content)).toEqual([
+      "Explain Odoo models",
+      "Odoo models inherit from models.Model.",
+      "Add a status field to that",
+      "Here is status = fields.Selection(...)",
+    ]);
+  });
 });
+

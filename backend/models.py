@@ -90,6 +90,7 @@ class Project(Base):
     instances = relationship("Instance", back_populates="project", cascade="all, delete-orphan")
     interactions = relationship("Interaction", back_populates="project", cascade="all, delete-orphan")
     memories = relationship("AgentMemory", back_populates="project", cascade="all, delete-orphan")
+    schedules = relationship("AgentSchedule", back_populates="project", cascade="all, delete-orphan")
 
 
 
@@ -164,6 +165,40 @@ class PendingAction(Base):
     idempotency_key = Column(String(128), unique=True, nullable=True)
 
 
+class PermissionGrant(Base):
+    """A narrowly scoped allow/deny rule for an agent resource."""
+    __tablename__ = "permission_grants"
+    __table_args__ = (
+        UniqueConstraint("project_id", "user_id", "resource", name="uq_permission_grant_scope"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    resource = Column(String(512), nullable=False)
+    decision = Column(String(8), nullable=False, default="ask")
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_by_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class TerminalSession(Base):
+    """Auditable one-shot terminal execution owned by a project user."""
+    __tablename__ = "terminal_sessions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    requested_by_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    command = Column(Text, nullable=False)
+    cwd = Column(String(512), nullable=False, default=".")
+    status = Column(String(24), nullable=False, default="awaiting_approval")
+    output = Column(Text, nullable=False, default="")
+    exit_code = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
 
@@ -196,10 +231,10 @@ class AgentRun(Base):
     __table_args__ = (
         Index(
             "uq_agent_run_active_project",
-            "project_id",
+            "project_id", "intent",
             unique=True,
-            postgresql_where=text("status IN ('running','awaiting_question','awaiting_approval','cancelling')"),
-            sqlite_where=text("status IN ('running','awaiting_question','awaiting_approval','cancelling')"),
+            postgresql_where=text("status IN ('running','awaiting_question','awaiting_approval','cancelling') AND intent = 'write'"),
+            sqlite_where=text("status IN ('running','awaiting_question','awaiting_approval','cancelling') AND intent = 'write'"),
         ),
     )
 
@@ -207,6 +242,8 @@ class AgentRun(Base):
     project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
     requested_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     status = Column(String(24), nullable=False, default="queued", index=True)
+    # Read-only investigations may run concurrently; write runs remain serialized per project.
+    intent = Column(String(16), nullable=False, default="write", index=True)
     prompt = Column(Text, nullable=False)
     thread_id = Column(String, nullable=False)
     attempt = Column(Integer, nullable=False, default=0)
@@ -231,6 +268,7 @@ class AgentRun(Base):
     planner_model = Column(String(64), nullable=True)     # model to use for planning
     fallback_model = Column(String(64), nullable=True)    # fallback model
     workspace_base_revision = Column(String(40), nullable=True)
+    workspace_slug = Column(String(200), nullable=True, index=True)
     # Pipeline grounding (Phase 1)
     source_snapshot_id = Column(String(36), ForeignKey("source_snapshots.id", ondelete="SET NULL"), nullable=True)
     specification_id = Column(Integer, ForeignKey("run_specifications.id", ondelete="SET NULL"), nullable=True)
@@ -240,6 +278,62 @@ class AgentRun(Base):
     operation_deadline_at = Column(DateTime(timezone=True), nullable=True)
     module_name = Column(String(128), nullable=True)
     question = relationship("AgentQuestion", back_populates="run", uselist=False, cascade="all, delete-orphan")
+    subtasks = relationship("AgentSubtask", back_populates="parent_run", cascade="all, delete-orphan")
+
+
+class AgentSubtask(Base):
+    """A persisted child-agent execution owned by a supervisor run."""
+    __tablename__ = "agent_subtasks"
+    __table_args__ = (
+        UniqueConstraint("parent_run_id", "task_id", name="uq_agent_subtask_parent_task"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    parent_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_id = Column(String(64), nullable=False)
+    title = Column(String(300), nullable=False)
+    role = Column(String(64), nullable=False, default="implementation_specialist")
+    thread_id = Column(String(200), nullable=False, unique=True)
+    status = Column(String(24), nullable=False, default="queued", index=True)
+    prompt = Column(Text, nullable=False, default="")
+    result = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+    retry_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    parent_run = relationship("AgentRun", back_populates="subtasks")
+
+
+class AgentSchedule(Base):
+    """Durable recurring prompt owned by a project."""
+    __tablename__ = "agent_schedules"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    requested_by_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    prompt = Column(Text, nullable=False)
+    interval_seconds = Column(Integer, nullable=False, default=3600)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    next_run_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+    last_run_at = Column(DateTime(timezone=True), nullable=True)
+    last_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True)
+    last_error = Column(Text, nullable=True)
+    # Reliability features (Phase 11)
+    idempotency_key = Column(String(128), nullable=True, unique=True, index=True)  # sha256 stamped at dispatch
+    retry_count = Column(Integer, nullable=False, default=0)
+    max_retries = Column(Integer, nullable=False, default=3)
+    retry_backoff_seconds = Column(Integer, nullable=False, default=300)
+    missed_run_policy = Column(String(16), nullable=False, default="skip")   # skip | run_once | run_all
+    concurrency_policy = Column(String(16), nullable=False, default="skip")  # skip | queue | cancel_prior
+    timeout_seconds = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+    project = relationship("Project", back_populates="schedules")
 
 
 class AgentQuestion(Base):
@@ -362,6 +456,9 @@ class Artifact(Base):
     commit_hash = Column(String(64), nullable=False)
     digest = Column(String(64), nullable=False)
     path = Column(String, nullable=False)
+    # The run-owned workspace that produced this artifact. Nullable keeps
+    # existing artifacts and project-local artifacts backward compatible.
+    workspace_slug = Column(String(200), nullable=True, index=True)
     status = Column(String(24), nullable=False, default="draft")
     created_by_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
@@ -399,6 +496,10 @@ class Deployment(Base):
     rollback_plan = Column(Text, nullable=False, default="")
     logs = Column(Text, nullable=False, default="")
     external_job_id = Column(String(128), nullable=True, index=True)
+    # Post-deploy verification (Phase 10)
+    smoke_test_result = Column(JSON, nullable=True)               # {ok, checks: [{name, ok, detail}]}
+    prior_artifact_id = Column(String(36), ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True)
+    recovery_state = Column(String(24), nullable=True)            # recovering | recovered | unrecoverable
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -540,3 +641,47 @@ class ToolExecution(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Durable attachment storage (Phase 6)
+# ---------------------------------------------------------------------------
+
+
+class RunAttachment(Base):
+    """Durable attachment uploaded to a run — stores original + extracted text."""
+    __tablename__ = "run_attachments"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    uploader_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    # File metadata
+    original_filename = Column(String(512), nullable=False)
+    mime_type = Column(String(128), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    content_hash = Column(String(64), nullable=False, index=True)  # SHA-256 for dedup
+
+    # Storage
+    storage_path = Column(String(1024), nullable=False)
+    storage_backend = Column(String(16), nullable=False, default="local")  # "local" | "s3"
+
+    # Processing pipeline state
+    processing_state = Column(
+        String(24), nullable=False, default="pending",
+    )  # pending | scanning | extracting | indexed | failed
+    scan_result = Column(
+        String(16), nullable=True,
+    )  # clean | malicious | error | skipped
+
+    # Extracted content
+    extracted_text = Column(Text, nullable=True)
+    extraction_error = Column(Text, nullable=True)
+    page_count = Column(Integer, nullable=True)
+
+    # Evidence linkage
+    evidence_refs = Column(JSON, nullable=False, default=list)  # [{run_id, artifact_id, page}]
+
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    processed_at = Column(DateTime(timezone=True), nullable=True)

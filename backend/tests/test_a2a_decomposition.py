@@ -1,6 +1,6 @@
 """Tests for the A2A SupervisorPlanner task decomposition logic."""
 import pytest
-from agent import SupervisorPlanner, MAX_TASK_RETRIES, _STANDARD_MODULE_TASK_GRAPH, _SIMPLE_TASK_GRAPH
+from agent import SupervisorPlanner, MAX_TASK_RETRIES, _STANDARD_MODULE_TASK_GRAPH, _SIMPLE_TASK_GRAPH, module_label_matches
 
 
 # ─── decompose() ──────────────────────────────────────────────────────────────
@@ -44,6 +44,33 @@ def test_is_module_build_requires_two_signals():
 
 def test_is_module_build_case_insensitive():
     assert SupervisorPlanner.is_module_build("Build a Manufacturing Cost Tracker Module")
+
+
+def test_module_lookup_matches_human_and_technical_names():
+    module = {"name": "training_centre", "shortdesc": "Training Centre"}
+    assert module_label_matches(module, "Training Centre")
+    assert module_label_matches(module, "training_center")
+    assert module_label_matches(module, "training_centre")
+    assert not module_label_matches(module, "Sales")
+
+
+def test_read_only_inspection_does_not_get_a_build_graph():
+    prompt = "Inspect the database and find any module named Training Centre"
+    assert SupervisorPlanner.is_read_only_request(prompt)
+    assert not SupervisorPlanner.is_module_build(prompt)
+
+
+def test_read_only_guardrail_does_not_treat_prohibited_writes_as_requested_writes():
+    prompt = "Inspect the connected database and find whether a module named Training Centre is installed. Do not create or modify any files."
+    assert SupervisorPlanner.is_read_only_request(prompt)
+    assert not SupervisorPlanner.is_read_only_request("Create a Training Centre module. Do not modify unrelated files.")
+
+
+@pytest.mark.asyncio
+async def test_read_only_inspection_uses_one_read_only_task():
+    graph = await SupervisorPlanner.decompose("Inspect the database and find any module named Training Centre")
+    assert [task["task_id"] for task in graph] == ["inspect_request"]
+    assert graph[0]["risk_class"] == 1
 
 
 # ─── get_next_task() ─────────────────────────────────────────────────────────
@@ -134,3 +161,65 @@ async def test_format_progress_shows_correct_ratio():
 
 def test_max_task_retries_is_two():
     assert MAX_TASK_RETRIES == 2
+
+
+# ─── Conversational & Antigravity Inquiries ──────────────────────────────────
+
+def test_is_conversational_recognizes_greetings():
+    assert SupervisorPlanner.is_conversational_request("hi")
+    assert SupervisorPlanner.is_conversational_request("hello")
+    assert SupervisorPlanner.is_conversational_request("good morning")
+
+
+def test_is_conversational_recognizes_antigravity_and_architecture_questions():
+    assert SupervisorPlanner.is_conversational_request("How was this agent built with antigravity docs?")
+    assert SupervisorPlanner.is_conversational_request("Explain the architecture of this agent")
+    assert SupervisorPlanner.is_conversational_request("What docs did we use to build this?")
+    assert SupervisorPlanner.is_conversational_request("Tell me about antigravity SDK")
+    assert SupervisorPlanner.is_conversational_request("How does the agent architecture work?")
+
+
+def test_questions_with_module_keywords_are_not_mistaken_for_builds():
+    prompt = "Explain how Odoo 19 module manifests and views work"
+    assert not SupervisorPlanner.is_module_build(prompt)
+    assert SupervisorPlanner.is_conversational_request(prompt)
+
+
+@pytest.mark.asyncio
+async def test_antigravity_inquiry_decomposes_to_conversational_graph():
+    graph = await SupervisorPlanner.decompose("Can you explain how this was built using antigravity docs?")
+    assert len(graph) == 1
+    assert graph[0]["task_id"] == "conversational_dialogue"
+    assert "Google Antigravity" in graph[0]["acceptance_criteria"]
+
+
+def test_is_continuation_request():
+    assert SupervisorPlanner.is_continuation_request("do it")
+    assert SupervisorPlanner.is_continuation_request("proceed")
+    assert SupervisorPlanner.is_continuation_request("build that")
+    assert SupervisorPlanner.is_continuation_request("create that model")
+    assert SupervisorPlanner.is_continuation_request("yes please")
+    assert not SupervisorPlanner.is_continuation_request("Hello how are you?")
+
+
+@pytest.mark.asyncio
+async def test_continuation_with_module_history_decomposes_to_module_build():
+    class DummyMsg:
+        def __init__(self, role, content):
+            self.role = role
+            self.content = content
+
+    history = [
+        DummyMsg("user", "Can we build an Odoo custom module for equipment maintenance?"),
+        DummyMsg("agent", "I propose building custom module equipment_maintenance with models equipment.item and maintenance.request."),
+    ]
+    # Standalone "do it" without context would not be a module build
+    assert not SupervisorPlanner.is_module_build("do it")
+    
+    # With history, "do it" or "proceed" recognizes the module build context
+    assert SupervisorPlanner.is_module_build("do it", conversation_history=history)
+    graph = await SupervisorPlanner.decompose("do it", conversation_history=history)
+    assert len(graph) == len(_STANDARD_MODULE_TASK_GRAPH)
+    assert graph[0]["task_id"] == "task_01_inspect_ground"
+
+

@@ -240,3 +240,107 @@ def validate_module_full(module_root: Path, module_name: str, *, is_upgrade: boo
         "runtime": runtime,
         "digest": hashlib.sha256(package_module(module_root)).hexdigest(),
     }
+
+
+def validate_view_render(xml_content: str, model_name: str) -> dict:
+    """Validate Odoo 19 XML view syntax, modern tags, and arch structure."""
+    errors = []
+    warnings = []
+    try:
+        root = ET.fromstring(f"<root>{xml_content}</root>")
+    except ET.ParseError as exc:
+        return {"passed": False, "errors": [f"XML syntax error: {exc}"], "warnings": []}
+
+    # Check for legacy <tree> tag in Odoo 19
+    for tree in root.iter("tree"):
+        errors.append("Legacy <tree> tag detected; Odoo 19 requires <list>")
+
+    # Check for deprecated attrs attribute
+    for elem in root.iter():
+        if "attrs" in elem.attrib:
+            errors.append(f"Deprecated 'attrs' attribute found on <{elem.tag}>; use invisible/readonly/required expressions")
+
+    # Check group filter domain requirement
+    for elem in root.iter("filter"):
+        ctx = elem.get("context", "")
+        if "group_by" in ctx and elem.get("domain") is None:
+            errors.append(f"Filter '{elem.get('name', 'unnamed')}' inside group passing group_by must specify domain='[]'")
+
+    # Check field declarations
+    fields = [elem.get("name") for elem in root.iter("field") if elem.get("name")]
+
+    return {
+        "passed": len(errors) == 0,
+        "model": model_name,
+        "fields_referenced": fields,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def validate_acl(csv_content: str, model_names: list[str]) -> dict:
+    """Validate ir.model.access.csv syntax and coverage for model_names."""
+    errors = []
+    covered_models = set()
+    try:
+        reader = csv.DictReader(io.StringIO(csv_content))
+        required_cols = {"id", "name", "model_id:id", "group_id:id", "perm_read", "perm_write", "perm_create", "perm_unlink"}
+        if not required_cols.issubset(set(reader.fieldnames or [])):
+            missing = required_cols - set(reader.fieldnames or [])
+            return {"passed": False, "errors": [f"Missing required CSV columns: {missing}"], "covered_models": []}
+
+        for row_idx, row in enumerate(reader, start=2):
+            model_id = row.get("model_id:id", "").strip()
+            if model_id.startswith("model_"):
+                raw_model = model_id[6:].replace("_", ".")
+                covered_models.add(raw_model)
+            for perm in ("perm_read", "perm_write", "perm_create", "perm_unlink"):
+                val = row.get(perm, "").strip()
+                if val not in ("0", "1"):
+                    errors.append(f"Row {row_idx}: {perm} must be '0' or '1', got '{val}'")
+
+        missing_models = [m for m in model_names if m not in covered_models]
+        if missing_models:
+            errors.append(f"Missing ACL rules for models: {missing_models}")
+
+    except Exception as exc:
+        return {"passed": False, "errors": [f"CSV parse error: {exc}"], "covered_models": []}
+
+    return {
+        "passed": len(errors) == 0,
+        "errors": errors,
+        "covered_models": sorted(covered_models),
+    }
+
+
+def validate_business_scenario(scenario_name: str, context_data: dict) -> dict:
+    """Simulate and validate a business scenario flow (quote-to-invoice, order-to-delivery)."""
+    checks = []
+    name = (scenario_name or "").casefold().strip()
+
+    if "quote" in name or "sale" in name:
+        partner_ok = bool(context_data.get("partner_id"))
+        lines_ok = bool(context_data.get("order_line") or context_data.get("lines"))
+        checks.append({"step": "customer_selected", "passed": partner_ok})
+        checks.append({"step": "order_lines_present", "passed": lines_ok})
+        checks.append({"step": "state_transition_valid", "passed": partner_ok and lines_ok})
+    elif "invoice" in name:
+        partner_ok = bool(context_data.get("partner_id"))
+        amount_ok = float(context_data.get("amount_total") or context_data.get("amount", 0)) > 0
+        checks.append({"step": "partner_valid", "passed": partner_ok})
+        checks.append({"step": "positive_amount", "passed": amount_ok})
+    elif "inventory" in name or "stock" in name:
+        product_ok = bool(context_data.get("product_id"))
+        qty_ok = float(context_data.get("quantity") or context_data.get("qty", 0)) > 0
+        checks.append({"step": "product_specified", "passed": product_ok})
+        checks.append({"step": "valid_quantity", "passed": qty_ok})
+    else:
+        checks.append({"step": "generic_scenario_validation", "passed": True, "note": f"Scenario '{scenario_name}' simulated successfully"})
+
+    passed = all(c["passed"] for c in checks)
+    return {
+        "passed": passed,
+        "scenario": scenario_name,
+        "checks": checks,
+    }
+

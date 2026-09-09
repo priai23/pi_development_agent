@@ -40,6 +40,7 @@ interface ActivityStepperProps {
   onOpenDiff?: () => void;
   onOpenFile?: (path: string) => void;
   planItems?: Array<{ title: string; status: string }>;
+  inspectionOnly?: boolean;
 }
 
 export default function ActivityStepper({
@@ -51,6 +52,7 @@ export default function ActivityStepper({
   onOpenDiff,
   onOpenFile,
   planItems: durablePlanItems = [],
+  inspectionOnly = false,
 }: ActivityStepperProps) {
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({});
 
@@ -68,6 +70,8 @@ export default function ActivityStepper({
   const totalTime = cleanSteps.reduce((acc, s) => acc + (s.elapsed || 0), 0);
 
   const viewSteps = cleanSteps.filter((s) => s.category === "inspect" || (!s.category && (s.tool.includes("view") || s.tool.includes("read") || s.tool.includes("inspect") || s.tool.includes("list"))));
+  const workspaceSteps = viewSteps.filter((s) => s.tool === "read_file" || s.tool === "list_directory" || s.tool === "view_file");
+  const databaseSteps = viewSteps.filter((s) => !workspaceSteps.includes(s));
   const editSteps = cleanSteps.filter((s) => s.tool === "write_file" || s.tool === "patch_file" || (s.category === "edit" && !s.tool.includes("directory") && !s.tool.includes("mkdir")));
   const verifySteps = cleanSteps.filter((s) => s.category === "verify" || (!s.category && s.tool.includes("verify")));
   const runSteps = cleanSteps.filter((s) => !viewSteps.includes(s) && !editSteps.includes(s) && !verifySteps.includes(s));
@@ -97,7 +101,7 @@ export default function ActivityStepper({
     >
       {/* ── A2A Supervisor Task Graph Card ─────────────────────────────────── */}
       <AnimatePresence>
-        {supervisorTaskGraph && supervisorTaskGraph.length > 0 && (
+        {!inspectionOnly && supervisorTaskGraph && supervisorTaskGraph.length > 0 && (
           <motion.div
             key="supervisor-graph"
             initial={{ opacity: 0, y: -6 }}
@@ -200,7 +204,7 @@ export default function ActivityStepper({
       </AnimatePresence>
 
       {/* Persistent Agent Plan Checklist Card */}
-      {planItems.length > 0 && (
+      {!inspectionOnly && planItems.length > 0 && (
         <div className="rounded-xl border border-purple-500/30 bg-purple-950/20 p-3.5 text-xs space-y-2.5 backdrop-blur-md shadow-lg shadow-purple-950/20">
           <div className="flex items-center justify-between font-semibold text-purple-200">
             <div className="flex items-center gap-2">
@@ -280,7 +284,7 @@ export default function ActivityStepper({
             <span>Worked for {totalTime > 0 ? `${totalTime.toFixed(1)}s` : "0.4s"}</span>
             <span className="text-gray-500 font-mono text-[10px]">({cleanSteps.length} actions)</span>
           </button>
-          {onOpenDiff && (
+          {onOpenDiff && editSteps.length > 0 && (
             <button
               onClick={onOpenDiff}
               className="flex items-center gap-1 rounded bg-white/10 px-2.5 py-1 text-[11px] font-medium text-gray-200 transition hover:bg-white/20 hover:text-white active:scale-95"
@@ -295,7 +299,7 @@ export default function ActivityStepper({
       {/* Detailed Action Steps */}
       <div className="space-y-1.5 pl-1">
         {/* Grouped Explored Files */}
-        {viewSteps.length > 0 && (
+        {workspaceSteps.length > 0 && (
           <div className="rounded-lg border border-white/5 bg-zinc-950/60 p-2 text-xs">
             <button
               onClick={() => toggleExpand("explored")}
@@ -307,7 +311,7 @@ export default function ActivityStepper({
                 <ChevronRight className="h-3.5 w-3.5 text-gray-400" />
               )}
               <FileSearch className="h-3.5 w-3.5 text-purple-400" />
-              <span>Explored {viewSteps.length} file{viewSteps.length > 1 ? "s" : ""}</span>
+              <span>Explored {workspaceSteps.length} workspace item{workspaceSteps.length > 1 ? "s" : ""}</span>
             </button>
             <AnimatePresence>
               {expandedItems["explored"] && (
@@ -317,7 +321,37 @@ export default function ActivityStepper({
                   exit={{ height: 0, opacity: 0 }}
                   className="mt-2 space-y-1 pl-5 border-l border-white/10"
                 >
-                  {viewSteps.map((step, idx) => (
+                  {workspaceSteps.map((step, idx) => (
+                    <div key={idx} className="flex items-center justify-between text-[11px] text-gray-400 font-mono">
+                      <span className="truncate">{step.label}</span>
+                      {step.elapsed != null && <span className="text-[10px] text-gray-600">{step.elapsed.toFixed(1)}s</span>}
+                    </div>
+                  ))}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        )}
+
+        {databaseSteps.length > 0 && (
+          <div className="rounded-lg border border-white/5 bg-zinc-950/60 p-2 text-xs">
+            <button
+              onClick={() => toggleExpand("database")}
+              className="flex items-center gap-2 w-full text-left font-medium text-gray-300 hover:text-white"
+            >
+              {expandedItems["database"] ? <ChevronDown className="h-3.5 w-3.5 text-gray-400" /> : <ChevronRight className="h-3.5 w-3.5 text-gray-400" />}
+              <Network className="h-3.5 w-3.5 text-cyan-400" />
+              <span>Queried {databaseSteps.length} database item{databaseSteps.length > 1 ? "s" : ""}</span>
+            </button>
+            <AnimatePresence>
+              {expandedItems["database"] && (
+                <motion.div
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  className="mt-2 space-y-1 pl-5 border-l border-white/10"
+                >
+                  {databaseSteps.map((step, idx) => (
                     <div key={idx} className="flex items-center justify-between text-[11px] text-gray-400 font-mono">
                       <span className="truncate">{step.label}</span>
                       {step.elapsed != null && <span className="text-[10px] text-gray-600">{step.elapsed.toFixed(1)}s</span>}
@@ -378,6 +412,8 @@ export default function ActivityStepper({
                     <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
                   ) : step.status === "failed" ? (
                     <XCircle className="h-3.5 w-3.5 text-red-400 shrink-0" />
+                  ) : step.status === "cancelled" ? (
+                    <XCircle className="h-3.5 w-3.5 text-gray-500 shrink-0" />
                   ) : (
                     <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-400 shrink-0" />
                   )}

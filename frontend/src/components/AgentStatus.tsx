@@ -43,6 +43,8 @@ const actionConfig: Record<string, { label: string; icon: LucideIcon }> = {
   installed_modules: { label: "Reading installed modules", icon: Boxes },
   list_directory: { label: "Exploring workspace directory", icon: FolderSearch },
   read_file: { label: "Reading workspace file", icon: FileText },
+  inspect_url: { label: "Inspecting connected ERP page", icon: Globe },
+  browser_snapshot: { label: "Inspecting ERP UI in browser", icon: Globe },
   write_file: { label: "Writing module code", icon: FileCode },
   create_directory: { label: "Creating directory", icon: FolderPlus },
   package_module: { label: "Packaging Odoo module", icon: Boxes },

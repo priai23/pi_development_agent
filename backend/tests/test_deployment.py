@@ -82,3 +82,67 @@ def test_shared_deployment_policy_requires_runtime_validation_and_production_evi
             deployment.request_deployment(db, project, production, artifact, user.id, "restore backup")
     finally:
         db.close()
+
+
+def test_run_smoke_tests(monkeypatch):
+    class MockResp:
+        def __init__(self, status):
+            self.status_code = status
+
+    def mock_get(url, timeout):
+        if "health" in url:
+            return MockResp(200)
+        if "version_info" in url:
+            return MockResp(200)
+        return MockResp(404)
+
+    monkeypatch.setattr("httpx.get", mock_get)
+    inst = models.Instance(url="https://odoo.example.com")
+    dep = models.Deployment(id="dep-123")
+    res = deployment.run_smoke_tests(dep, inst)
+    assert res["ok"] is True
+    assert len(res["checks"]) == 2
+    assert all(c["ok"] for c in res["checks"])
+
+
+def test_execute_rollback_with_prior_artifact():
+    engine = create_engine("sqlite:///:memory:")
+    models.Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        user = models.User(email="admin@example.com", password_hash="hash", role="admin")
+        org = models.Organization(name="Org")
+        db.add_all([user, org]); db.flush()
+        project = models.Project(name="ERP", organization_id=org.id, created_by_id=user.id, workspace_slug="erp")
+        db.add(project); db.flush()
+        art1 = models.Artifact(
+            project_id=project.id, artifact_type="odoo_module", name="sample", version="19.0.1.0.0",
+            commit_hash="1" * 40, digest="1" * 64, path="sample", status="validated", created_by_id=user.id,
+        )
+        art2 = models.Artifact(
+            project_id=project.id, artifact_type="odoo_module", name="sample", version="19.0.1.0.1",
+            commit_hash="2" * 40, digest="2" * 64, path="sample", status="validated", created_by_id=user.id,
+        )
+        db.add_all([art1, art2]); db.flush()
+        val = models.ValidationRun(project_id=project.id, artifact_id=art2.id, status="passed", report={})
+        db.add(val); db.flush()
+
+        inst = models.Instance(
+            project_id=project.id, erp_type="odoo", url="https://staging.example", environment="staging",
+            deployment_config_encrypted=None,
+        )
+        db.add(inst); db.flush()
+
+        dep = models.Deployment(
+            project_id=project.id, instance_id=inst.id, artifact_id=art2.id, validation_id=val.id,
+            environment="staging", requested_by_id=user.id, prior_artifact_id=art1.id, status="failed",
+        )
+        db.add(dep); db.flush()
+
+        # When deployment_config_encrypted is None/empty, rollback gracefully marks unrecoverable
+        ok = deployment.execute_rollback(dep, db)
+        assert ok is False
+        assert dep.recovery_state == "unrecoverable"
+    finally:
+        db.close()
+

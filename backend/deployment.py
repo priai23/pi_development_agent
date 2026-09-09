@@ -44,6 +44,13 @@ def request_deployment(db, project: models.Project, instance: models.Instance, a
             raise ValueError("Production requires the exact artifact to pass staging and have UAT evidence")
         if not rollback_plan.strip():
             raise ValueError("Production deployment requires a rollback plan")
+
+    prior = db.query(models.Deployment).filter(
+        models.Deployment.instance_id == instance.id,
+        models.Deployment.environment == instance.environment,
+        models.Deployment.status == "succeeded",
+    ).order_by(models.Deployment.created_at.desc()).first()
+
     deployment = models.Deployment(
         project_id=project.id,
         instance_id=instance.id,
@@ -52,6 +59,7 @@ def request_deployment(db, project: models.Project, instance: models.Instance, a
         environment=instance.environment,
         requested_by_id=requested_by_id,
         rollback_plan=rollback_plan,
+        prior_artifact_id=prior.artifact_id if prior else None,
         status="pending_approval",
     )
     db.add(deployment)
@@ -142,12 +150,81 @@ def execute_deployment(deployment_id: str) -> None:
             raise
 
 
+def run_smoke_tests(deployment: models.Deployment, instance: models.Instance) -> dict:
+    """Run post-deployment smoke tests against the target instance."""
+    checks = []
+    # 1. HTTP ping
+    try:
+        r = httpx.get(f"{instance.url.rstrip('/')}/web/health", timeout=10)
+        passed = r.status_code in (200, 404)
+        checks.append({"name": "http_ping", "ok": passed, "detail": f"Status {r.status_code}"})
+    except Exception as exc:
+        checks.append({"name": "http_ping", "ok": False, "detail": str(exc)})
+
+    # 2. Version endpoint check
+    try:
+        r = httpx.get(f"{instance.url.rstrip('/')}/web/webclient/version_info", timeout=10)
+        passed = r.status_code == 200
+        checks.append({"name": "version_info", "ok": passed, "detail": f"Status {r.status_code}"})
+    except Exception as exc:
+        checks.append({"name": "version_info", "ok": False, "detail": str(exc)})
+
+    overall_ok = all(c["ok"] for c in checks)
+    return {
+        "ok": overall_ok,
+        "checks": checks,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def execute_rollback(deployment: models.Deployment, db) -> bool:
+    """Attempt automatic rollback to prior_artifact_id if available."""
+    if not deployment.prior_artifact_id:
+        deployment.recovery_state = "unrecoverable"
+        db.commit()
+        return False
+
+    prior_artifact = db.get(models.Artifact, deployment.prior_artifact_id)
+    if not prior_artifact:
+        deployment.recovery_state = "unrecoverable"
+        db.commit()
+        return False
+
+    instance = db.get(models.Instance, deployment.instance_id)
+    deployment.recovery_state = "recovering"
+    db.commit()
+
+    try:
+        config = json.loads(decrypt_secret(instance.deployment_config_encrypted or ""))
+        if instance.hosting_type == "odoo_sh":
+            project = db.get(models.Project, deployment.project_id)
+            execute_odoo_sh(deployment, project, prior_artifact, config)
+        else:
+            execute_bridge(deployment, instance, prior_artifact, config, db)
+        deployment.recovery_state = "recovered"
+        deployment.status = "rolled_back"
+        db.commit()
+        return True
+    except Exception as exc:
+        deployment.recovery_state = "unrecoverable"
+        deployment.logs += f"\nRollback failed: {exc}"
+        db.commit()
+        return False
+
+
 def refresh_bridge_deployment(deployment: models.Deployment, instance: models.Instance) -> None:
     config = json.loads(decrypt_secret(instance.deployment_config_encrypted or ""))
     result = rpc(config["bridge_url"], config["bridge_token"], "/primacy/bridge/v1/jobs/status", {"job_uuid": deployment.external_job_id})
     mapping = {"queued": "deploying", "running": "deploying", "succeeded": "succeeded", "failed": "failed", "rolled_back": "rolled_back"}
     deployment.status = mapping[result["state"]]
     deployment.logs = result.get("logs", "")[-100_000:]
+    if deployment.status == "succeeded":
+        smoke_result = run_smoke_tests(deployment, instance)
+        deployment.smoke_test_result = smoke_result
+        if not smoke_result["ok"]:
+            deployment.logs += "\n[ALERT] Smoke tests failed post-deployment. Triggering rollback..."
+            with SessionLocal() as db:
+                execute_rollback(deployment, db)
     if deployment.status in {"succeeded", "failed", "rolled_back"}:
         deployment.finished_at = datetime.now(timezone.utc)
 

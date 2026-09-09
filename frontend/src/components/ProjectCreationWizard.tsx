@@ -26,11 +26,12 @@ export default function ProjectCreationWizard({
   // Step 1: ERP Type & Project Info
   const [erpType, setErpType] = useState<ERPType>("odoo");
   const [projectName, setProjectName] = useState("");
-  const [organizationId, setOrganizationId] = useState<number>(0);
+  const [organizationId, setOrganizationId] = useState<number | "">("");
 
   // Step 2: Server & Credentials
   const [url, setUrl] = useState("");
   const [dbName, setDbName] = useState("");
+  const [customDb, setCustomDb] = useState("");
   const [detectedDatabases, setDetectedDatabases] = useState<string[]>([]);
   const [detectingDatabases, setDetectingDatabases] = useState(false);
   const [discoveryMessage, setDiscoveryMessage] = useState("");
@@ -44,15 +45,20 @@ export default function ProjectCreationWizard({
   const [error, setError] = useState("");
 
   const discoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const effectiveOrgId = organizationId || organizations[0]?.id || 0;
+  // Do not silently assign the first organization (often a development/test org).
+  // The user must explicitly choose the organization for the new project.
+  const effectiveOrgId = organizationId || 0;
 
   // Auto-discover databases when URL changes
   useEffect(() => {
     if (discoveryTimer.current) clearTimeout(discoveryTimer.current);
     const trimmed = url.trim();
-    if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+    if (!trimmed || trimmed.length < 3) {
       return;
     }
+    const normalizedUrl = (trimmed.startsWith("http://") || trimmed.startsWith("https://"))
+      ? trimmed
+      : (trimmed.includes("localhost") || trimmed.includes("127.0.0.1") ? `http://${trimmed}` : `https://${trimmed}`);
 
     discoveryTimer.current = setTimeout(async () => {
       setDetectingDatabases(true);
@@ -62,24 +68,30 @@ export default function ProjectCreationWizard({
         const res = await apiFetch<{
           status: string;
           databases: string[];
+          suggested_db?: string;
           suggested_username?: string;
+          server_version?: string;
           message?: string;
         }>("/instances/detect", {
           method: "POST",
-          body: JSON.stringify({ url: trimmed, erp_type: erpType }),
+          body: JSON.stringify({ url: normalizedUrl, erp_type: erpType }),
         });
 
         if (res.databases && res.databases.length > 0) {
           setDetectedDatabases(res.databases);
-          setDbName((current) => current || res.databases[0]);
-          setDiscoveryMessage(`Found ${res.databases.length} database(s)`);
+          setDbName((current) => current || res.suggested_db || res.databases[0]);
+          setDiscoveryMessage(`Found ${res.databases.length} database(s)${res.server_version ? ` (Odoo ${res.server_version})` : ""}`);
+        } else if (res.suggested_db) {
+          setDetectedDatabases([res.suggested_db]);
+          setDbName((current) => current || res.suggested_db || "");
+          setDiscoveryMessage(res.message || `Suggested database: ${res.suggested_db}`);
         } else {
           setDetectedDatabases([]);
           setDiscoveryMessage(res.message || "Enter database name manually");
         }
-      } catch {
+      } catch (err) {
         setDetectedDatabases([]);
-        setDiscoveryMessage("Could not auto-list databases; enter manually");
+        setDiscoveryMessage(err instanceof Error ? err.message : "Could not auto-list databases; enter manually");
       } finally {
         setDetectingDatabases(false);
       }
@@ -95,12 +107,32 @@ export default function ProjectCreationWizard({
     setVerifying(true);
     setVerifyError("");
     setVerifySuccess(false);
+    const trimmed = url.trim();
+    const normalizedUrl = (trimmed.startsWith("http://") || trimmed.startsWith("https://"))
+      ? trimmed
+      : (trimmed.includes("localhost") || trimmed.includes("127.0.0.1") ? `http://${trimmed}` : `https://${trimmed}`);
     try {
-      const res = await apiFetch<{ status: string; databases: string[] }>("/instances/detect", {
+      const res = await apiFetch<{
+        status: string;
+        databases: string[];
+        suggested_db?: string;
+        suggested_username?: string;
+        server_version?: string;
+        message?: string;
+      }>("/instances/detect", {
         method: "POST",
-        body: JSON.stringify({ url: url.trim(), erp_type: erpType }),
+        body: JSON.stringify({ url: normalizedUrl, erp_type: erpType }),
       });
       if (res) {
+        if (res.databases && res.databases.length > 0) {
+          setDetectedDatabases(res.databases);
+          setDbName((current) => current || res.suggested_db || res.databases[0]);
+          setDiscoveryMessage(`Found ${res.databases.length} database(s)${res.server_version ? ` (Odoo ${res.server_version})` : ""}`);
+        } else if (res.suggested_db) {
+          setDetectedDatabases([res.suggested_db]);
+          setDbName((current) => current || res.suggested_db || "");
+          setDiscoveryMessage(res.message || `Suggested database: ${res.suggested_db}`);
+        }
         setVerifySuccess(true);
       }
     } catch (caught) {
@@ -121,7 +153,12 @@ export default function ProjectCreationWizard({
       setError("Please select or create an organization");
       return;
     }
-    if (!url.trim() || !dbName.trim()) {
+    const effectiveDb = (dbName === "__custom__" ? customDb : dbName).trim();
+    const trimmed = url.trim();
+    const normalizedUrl = (trimmed.startsWith("http://") || trimmed.startsWith("https://"))
+      ? trimmed
+      : (trimmed.includes("localhost") || trimmed.includes("127.0.0.1") ? `http://${trimmed}` : `https://${trimmed}`);
+    if (!normalizedUrl || !effectiveDb) {
       setError("ERP Server URL and database name are required");
       return;
     }
@@ -144,8 +181,8 @@ export default function ProjectCreationWizard({
         method: "POST",
         body: JSON.stringify({
           erp_type: erpType,
-          url: url.trim(),
-          db_name: dbName.trim(),
+          url: normalizedUrl,
+          db_name: effectiveDb,
           username: username.trim(),
           password: password,
           auth_method: "xmlrpc",
@@ -282,10 +319,14 @@ export default function ProjectCreationWizard({
                 <div className="space-y-1">
                   <label className="text-xs font-medium text-slate-300">Organization</label>
                   <select
-                    value={effectiveOrgId}
-                    onChange={(e) => setOrganizationId(Number(e.target.value))}
+                    required
+                    value={effectiveOrgId || ""}
+                    onChange={(e) => setOrganizationId(e.target.value ? Number(e.target.value) : "")}
                     className="w-full rounded-lg border border-white/10 bg-slate-800/80 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none"
                   >
+                    <option value="" disabled>
+                      Select an organization
+                    </option>
                     {organizations.map((org) => (
                       <option key={org.id} value={org.id}>
                         {org.name}
@@ -344,17 +385,30 @@ export default function ProjectCreationWizard({
                 </div>
 
                 {detectedDatabases.length > 0 ? (
-                  <select
-                    value={dbName}
-                    onChange={(e) => setDbName(e.target.value)}
-                    className="w-full rounded-lg border border-white/10 bg-slate-800/80 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none"
-                  >
-                    {detectedDatabases.map((db) => (
-                      <option key={db} value={db}>
-                        {db}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="space-y-2">
+                    <select
+                      value={dbName}
+                      onChange={(e) => setDbName(e.target.value)}
+                      className="w-full rounded-lg border border-white/10 bg-slate-800/80 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none"
+                    >
+                      {detectedDatabases.map((db) => (
+                        <option key={db} value={db}>
+                          {db}
+                        </option>
+                      ))}
+                      <option value="__custom__">+ Enter different database name...</option>
+                    </select>
+                    {dbName === "__custom__" && (
+                      <input
+                        type="text"
+                        required
+                        value={customDb}
+                        onChange={(e) => setCustomDb(e.target.value)}
+                        placeholder="Enter database name"
+                        className="w-full rounded-lg border border-white/10 bg-slate-800/80 px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-blue-500 focus:outline-none"
+                      />
+                    )}
+                  </div>
                 ) : (
                   <input
                     type="text"
@@ -442,6 +496,10 @@ export default function ProjectCreationWizard({
               onClick={() => {
                 if (!projectName.trim()) {
                   setError("Please enter a project name");
+                  return;
+                }
+                if (!effectiveOrgId) {
+                  setError("Please select an organization before continuing");
                   return;
                 }
                 setError("");

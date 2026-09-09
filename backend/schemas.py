@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, EmailStr, Field
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class ORMModel(BaseModel):
@@ -153,6 +153,7 @@ class ChatRequest(BaseModel):
 class ActionDecision(BaseModel):
     decision: Literal["approve", "reject"]
     auto_approve_task: bool = False
+    remember: bool = False
 
 
 class QuestionAnswer(BaseModel):
@@ -182,6 +183,49 @@ class PendingActionOut(ORMModel):
     expires_at: datetime
 
 
+class PermissionGrantCreate(BaseModel):
+    resource: str = Field(min_length=3, max_length=512)
+    decision: Literal["allow", "deny"]
+    expires_at: datetime | None = None
+
+
+class PermissionGrantOut(ORMModel):
+    id: str
+    project_id: int | None
+    user_id: int | None
+    resource: str
+    decision: str
+    expires_at: datetime | None
+    created_by_id: int
+    created_at: datetime
+
+
+class TerminalStart(BaseModel):
+    command: str = Field(min_length=1, max_length=2_000)
+    cwd: str = Field(default=".", max_length=512)
+    timeout_seconds: int = Field(default=120, ge=1, le=600)
+    run_id: str | None = None
+
+
+class TerminalSessionOut(ORMModel):
+    id: str
+    project_id: int
+    run_id: str | None
+    requested_by_id: int
+    command: str
+    cwd: str
+    status: str
+    output: str
+    exit_code: int | None
+    created_at: datetime
+    finished_at: datetime | None
+
+
+class TerminalStartOut(BaseModel):
+    session: TerminalSessionOut
+    action: PendingActionOut
+
+
 class LLMSettingsOut(BaseModel):
     model_name: str
     api_key_configured: bool
@@ -198,10 +242,60 @@ class LLMSettingsUpdate(BaseModel):
     max_output_tokens: int = Field(default=2048, ge=256, le=100_000)
 
 
+class RunAttachment(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    type: str = Field(min_length=1, max_length=128)
+    content: str = Field(min_length=1, max_length=14_000_000)
+    text: str | None = Field(default=None, max_length=200_000)
+
+    @field_validator("content")
+    @classmethod
+    def data_url_only(cls, value: str) -> str:
+        if not value.startswith("data:"):
+            raise ValueError("attachment content must be a data URL")
+        return value
+
+
 class RunCreate(BaseModel):
     message: str = Field(min_length=1, max_length=20_000)
     queue_if_busy: bool = False
+    workspace_mode: Literal["local", "isolated"] = "local"
     module_name: str | None = Field(default=None, pattern="^[a-z][a-z0-9_]{0,127}$")
+    thread_id: str | None = None
+    attachments: list[RunAttachment] = Field(default_factory=list, max_length=10)
+
+
+class ScheduleCreate(BaseModel):
+    prompt: str = Field(min_length=1, max_length=20_000)
+    interval_seconds: int = Field(default=3600, ge=60, le=2_592_000)
+    enabled: bool = True
+
+
+class ScheduleUpdate(BaseModel):
+    interval_seconds: int | None = Field(default=None, ge=60, le=2_592_000)
+    enabled: bool | None = None
+
+
+class ScheduleOut(ORMModel):
+    id: str
+    project_id: int
+    requested_by_id: int
+    prompt: str
+    interval_seconds: int
+    enabled: bool
+    next_run_at: datetime
+    last_run_at: datetime | None
+    last_run_id: str | None
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatMessageOut(BaseModel):
+    id: str
+    role: Literal["user", "agent", "system"]
+    content: str
+    created_at: str | None = None
 
 
 class RunOut(ORMModel):
@@ -209,6 +303,7 @@ class RunOut(ORMModel):
     project_id: int
     requested_by_id: int
     status: str
+    intent: Literal["read_only", "write"]
     prompt: str
     support_id: str
     error_category: str | None
@@ -225,6 +320,7 @@ class RunOut(ORMModel):
     planner_model: str | None = None
     fallback_model: str | None = None
     workspace_base_revision: str | None = None
+    workspace_slug: str | None = None
     module_name: str | None = None
     stage: str
     question: AgentQuestionOut | None = None
@@ -244,6 +340,25 @@ class TaskGraphItem(BaseModel):
     context_bundle: dict[str, Any] = {}                        # scoped context slice passed to worker
     result: dict[str, Any] | None = None                      # result reported back to supervisor
     heartbeat_at: str | None = None                           # ISO timestamp of last sub-task heartbeat
+
+
+class AgentSubtaskOut(ORMModel):
+    id: str
+    parent_run_id: str
+    project_id: int
+    task_id: str
+    title: str
+    role: str
+    thread_id: str
+    status: str
+    prompt: str
+    result: dict | None
+    error_message: str | None
+    retry_count: int
+    created_at: datetime
+    started_at: datetime | None
+    heartbeat_at: datetime | None
+    finished_at: datetime | None
 
 
 class HandoffMessage(BaseModel):
@@ -387,6 +502,7 @@ class ArtifactOut(ORMModel):
     commit_hash: str
     digest: str
     path: str
+    workspace_slug: str | None = None
     status: str
     created_by_id: int
     created_at: datetime

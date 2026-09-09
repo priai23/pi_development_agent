@@ -75,13 +75,13 @@ export default function ProjectsPage() {
         </button>
       </div>
 
-      {user?.role === "admin" && organizations.length === 0 && (
+      {user?.role === "admin" && (
         <form onSubmit={createOrganization} className="mb-6 flex max-w-lg gap-2 rounded-xl border p-4 dark:border-white/10">
           <input
             required
             value={newOrganization}
             onChange={(event) => setNewOrganization(event.target.value)}
-            placeholder="Create first organization (e.g. Primacy Infotech)"
+            placeholder="Create organization (e.g. Primacy Infotech)"
             className="min-w-0 flex-1 rounded-lg border px-3 py-2 dark:border-white/10 dark:bg-black"
           />
           <button className="rounded-lg bg-gray-900 px-4 text-white dark:bg-white dark:text-black font-medium">Create</button>

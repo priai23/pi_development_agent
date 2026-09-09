@@ -6,9 +6,12 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import socket
+import shlex
 import ssl
+import subprocess
 import xmlrpc.client
 import httpx
 from contextlib import asynccontextmanager
@@ -25,16 +28,24 @@ from sqlalchemy.orm import Session
 
 import models
 import schemas
-from agent import ERPImplementationAgent, connect_odoo, connect_odoo_json2, xmlrpc_transport
+from agent import ERPImplementationAgent, SupervisorPlanner, connect_odoo, connect_odoo_json2, xmlrpc_transport
 from auth import CSRF_COOKIE, SESSION_COOKIE, admin_user, current_user, organization_ids, require_project
 from config import settings
 from database import SessionLocal, get_db
 from deployment import execute_deployment, generate_signing_config, refresh_bridge_deployment, request_deployment
 from security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, verify_password
-from worker import emit, enqueue
+from worker import build_agent, emit, enqueue
 from workspace import Workspace
 from validation import package_module, validate_module, validate_module_full
 from specification import get_specification_summary
+from permissions import resource_for, invalidate_permission_cache
+from pri_erp_adapter import PriERPAdapter, connect_pri_erp
+from telemetry import telemetry
+from tool_registry import TOOL_REGISTRY
+from attachment import (
+    process_attachment, get_citation, get_extracted_text_for_agent,
+    link_evidence, AttachmentValidationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,20 +156,32 @@ async def csrf_protection(request: Request, call_next):
 
 
 def validate_erp_url(value: str, db: Session | None = None) -> str:
-    parsed = urlparse(value.rstrip("/"))
+    cleaned = (value or "").strip().rstrip("/")
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="ERP URL is required")
+    if not cleaned.startswith("http://") and not cleaned.startswith("https://"):
+        cleaned = f"https://{cleaned}"
+    parsed = urlparse(cleaned)
     host = (parsed.hostname or "").lower()
     if not host or parsed.username or parsed.password:
         raise HTTPException(status_code=400, detail="Invalid ERP URL format. Please enter e.g. http://your-ip:8069 or https://yourcompany.odoo.com")
+    is_ip = host.replace(".", "").isdigit() or ":" in host
+    is_ip_or_local = host in {"localhost", "127.0.0.1"} or is_ip
     policies = db.query(models.HostPolicy).filter(models.HostPolicy.is_active.is_(True)).all() if db else []
     policy = next((item for item in policies if host == item.hostname_pattern or (item.hostname_pattern.startswith(".") and host.endswith(item.hostname_pattern))), None)
-    bootstrap_allowed = any(entry == "*" or host == entry or (entry.startswith(".") and host.endswith(entry)) for entry in settings.allowed_hosts)
-    if not bootstrap_allowed and not policy:
+    allow_any = any(entry == "*" for entry in settings.allowed_hosts)
+    bootstrap_allowed = allow_any or any(host == entry or (entry.startswith(".") and host.endswith(entry)) for entry in settings.allowed_hosts)
+    if not bootstrap_allowed and not policy and not is_ip_or_local:
         raise HTTPException(status_code=400, detail=f"ERP host '{host}' is not allowed")
-    is_ip_or_local = host in {"localhost", "127.0.0.1"} or host.replace(".", "").isdigit()
-    require_https = policy.require_https if policy else not is_ip_or_local
+    if policy:
+        require_https = policy.require_https
+    elif allow_any or is_ip_or_local:
+        require_https = False
+    else:
+        require_https = True
     if require_https and parsed.scheme != "https":
         raise HTTPException(status_code=400, detail="Hosted ERP URLs must use HTTPS (e.g. https://your-company.odoo.com)")
-    return value.rstrip("/")
+    return cleaned
 
 
 def audit(db: Session, event_type: str, user_id: int | None, project_id: int | None, details: dict, **metadata):
@@ -172,10 +195,20 @@ def audit(db: Session, event_type: str, user_id: int | None, project_id: int | N
     ))
 
 
+def configured_llm_key(db: Session) -> str | None:
+    key = db.get(models.Setting, "openrouter_api_key")
+    if not key:
+        return None
+    try:
+        value = decrypt_secret(key.value).strip()
+    except ValueError:
+        return None
+    return value or None
+
+
 def llm_config(db: Session) -> tuple[str, str | None]:
     model = db.get(models.Setting, "llm_model_name")
-    key = db.get(models.Setting, "openrouter_api_key")
-    return (model.value if model else "gpt-4o-mini", decrypt_secret(key.value) if key else None)
+    return (model.value if model else "gpt-4o-mini", configured_llm_key(db))
 
 
 def normalized_odoo_environment(version_info: dict | None) -> tuple[str, str]:
@@ -191,13 +224,34 @@ async def project_agent(request: Request, db: Session, project: models.Project) 
     instance = db.query(models.Instance).filter(models.Instance.project_id == project.id).first()
     if not instance:
         raise HTTPException(status_code=400, detail="No connected ERP instance for this project")
-    if instance.erp_type != "odoo":
-        raise HTTPException(status_code=400, detail="Pi ERP connectivity is not implemented")
-    client = await (
-        connect_odoo_json2(instance.url, instance.db_name or "", decrypt_secret(instance.api_key_encrypted or ""))
-        if instance.auth_method == "json2"
-        else connect_odoo(instance.url, instance.db_name or "", instance.username or "", decrypt_secret(instance.password_encrypted or ""))
-    )
+    if instance.erp_type == "odoo":
+        client = await (
+            connect_odoo_json2(instance.url, instance.db_name or "", decrypt_secret(instance.api_key_encrypted or ""))
+            if instance.auth_method == "json2"
+            else connect_odoo(instance.url, instance.db_name or "", instance.username or "", decrypt_secret(instance.password_encrypted or ""))
+        )
+    elif instance.erp_type in ("pri_erp", "pi_erp"):
+        # Pri ERP adapter — connect to platform, then use the Odoo XML-RPC client
+        # for the managed instance if credentials are available.
+        try:
+            if instance.api_key_encrypted:
+                pri_client = await connect_pri_erp(
+                    url=instance.url,
+                    api_key=decrypt_secret(instance.api_key_encrypted),
+                )
+            else:
+                pri_client = await connect_pri_erp(
+                    url=instance.url,
+                    username=instance.username or "",
+                    password=decrypt_secret(instance.password_encrypted or ""),
+                )
+            # Use the Pri ERP adapter as the client (read-only ORM ops not supported;
+            # the agent will use Pri ERP tools instead of Odoo ORM tools)
+            client = pri_client
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Pri ERP connection failed: {exc}") from exc
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported ERP type: {instance.erp_type}")
     model, key = llm_config(db)
     fallback = db.get(models.Setting, "llm_fallback_model_name")
     return ERPImplementationAgent(
@@ -1086,6 +1140,32 @@ def platform_health(_: models.User = Depends(admin_user), db: Session = Depends(
     }
 
 
+@app.get("/admin/telemetry")
+def admin_telemetry(_: models.User = Depends(admin_user), db: Session = Depends(get_db)):
+    return telemetry.get_system_snapshot(db)
+
+
+@app.get("/admin/tools")
+def admin_tools(_: models.User = Depends(admin_user)):
+    return {
+        "count": len(TOOL_REGISTRY),
+        "tools": [
+            {
+                "name": e.name,
+                "description": e.description,
+                "risk_class": e.risk_class,
+                "is_write": e.is_write,
+                "requires_approval": e.requires_approval,
+                "supports_rollback": e.supports_rollback,
+                "is_idempotent": e.is_idempotent,
+                "erp_compat": sorted(e.erp_compat),
+            }
+            for e in TOOL_REGISTRY.values()
+        ],
+        "metrics": telemetry.get_tool_metrics(),
+    }
+
+
 @app.post("/organizations", response_model=schemas.OrganizationOut, status_code=201)
 def create_organization(payload: schemas.OrganizationCreate, _: models.User = Depends(admin_user), db: Session = Depends(get_db)):
     organization = models.Organization(name=payload.name.strip())
@@ -1164,43 +1244,240 @@ def delete_project(project_id: int, user: models.User = Depends(current_user), d
 @app.post("/instances/detect")
 async def detect_instance(payload: schemas.DetectRequest, _: models.User = Depends(current_user), db: Session = Depends(get_db)):
     url = validate_erp_url(str(payload.url), db)
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    inferred_db = None
+    if host.endswith(".odoo.com"):
+        inferred_db = host[:-len(".odoo.com")].split(".")[-1]
+    elif host.endswith(".odoo.sh"):
+        inferred_db = host[:-len(".odoo.sh")].replace(".", "-")
 
-    def list_databases():
-        proxy = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/db", transport=xmlrpc_transport(url), allow_none=True)
-        return proxy.list()
+    async def list_databases_multi() -> list[str]:
+        # 1. XML-RPC /xmlrpc/2/db
+        def _xmlrpc_list():
+            proxy = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/db", transport=xmlrpc_transport(url), allow_none=True)
+            return proxy.list()
 
-    def get_server_version():
-        common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", transport=xmlrpc_transport(url), allow_none=True)
-        return common.version()
+        try:
+            dbs = await asyncio.wait_for(asyncio.to_thread(_xmlrpc_list), timeout=6)
+            if isinstance(dbs, list) and dbs:
+                return [str(d) for d in dbs]
+        except (socket.gaierror, httpx.ConnectError):
+            raise socket.gaierror(f"Hostname '{host}' could not be resolved")
+        except ssl.SSLError:
+            raise ssl.SSLError(f"TLS error for '{host}'")
+        except Exception:
+            pass
+
+        # 2. JSON-RPC /jsonrpc
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                res = await client.post(
+                    f"{url}/jsonrpc",
+                    json={"jsonrpc": "2.0", "method": "call", "params": {"service": "db", "method": "list", "args": []}},
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    res_list = data.get("result")
+                    if isinstance(res_list, list) and res_list:
+                        return [str(d) for d in res_list]
+        except (socket.gaierror, httpx.ConnectError):
+            raise socket.gaierror(f"Hostname '{host}' could not be resolved")
+        except ssl.SSLError:
+            raise ssl.SSLError(f"TLS error for '{host}'")
+        except Exception:
+            pass
+
+        # 3. Web controller /web/database/list
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                res = await client.post(
+                    f"{url}/web/database/list",
+                    json={"jsonrpc": "2.0", "method": "call", "params": {}},
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    res_list = data.get("result")
+                    if isinstance(res_list, list) and res_list:
+                        return [str(d) for d in res_list]
+        except (socket.gaierror, httpx.ConnectError):
+            raise socket.gaierror(f"Hostname '{host}' could not be resolved")
+        except ssl.SSLError:
+            raise ssl.SSLError(f"TLS error for '{host}'")
+        except Exception:
+            pass
+
+        return []
+
+    async def get_server_version_multi() -> str | None:
+        # 1. XML-RPC /xmlrpc/2/common
+        def _xmlrpc_ver():
+            common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", transport=xmlrpc_transport(url), allow_none=True)
+            return common.version()
+
+        try:
+            info = await asyncio.wait_for(asyncio.to_thread(_xmlrpc_ver), timeout=5)
+            if isinstance(info, dict) and "server_version" in info:
+                return str(info["server_version"])
+        except (socket.gaierror, httpx.ConnectError):
+            raise socket.gaierror(f"Hostname '{host}' could not be resolved")
+        except ssl.SSLError:
+            raise ssl.SSLError(f"TLS error for '{host}'")
+        except Exception:
+            pass
+
+        # 2. Web controller /web/webclient/version_info
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.post(
+                    f"{url}/web/webclient/version_info",
+                    json={"jsonrpc": "2.0", "method": "call", "params": {}},
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    res_obj = data.get("result")
+                    if isinstance(res_obj, dict) and "server_version" in res_obj:
+                        return str(res_obj["server_version"])
+        except (socket.gaierror, httpx.ConnectError):
+            raise socket.gaierror(f"Hostname '{host}' could not be resolved")
+        except ssl.SSLError:
+            raise ssl.SSLError(f"TLS error for '{host}'")
+        except Exception:
+            pass
+
+        return None
+
+    async def discover_candidate_databases() -> list[str]:
+        if host and host.endswith(".odoo.com"):
+            return []
+        found: list[str] = []
+        # A. HTML selector extraction (/web/database/selector and /odoo)
+        try:
+            async with httpx.AsyncClient(timeout=4.0, verify=False, follow_redirects=True) as client:
+                res = await client.get(f"{url}/web/database/selector")
+                if res.status_code == 200:
+                    dbs = re.findall(r'(?:href|data-db)=["\'][^"\']*[?&]db=([a-zA-Z0-9_\-\.]+)', res.text)
+                    for d in dbs:
+                        clean_d = d.strip()
+                        if clean_d and clean_d not in found and clean_d.lower() not in {"master_pwd", "create", "duplicate", "drop", "backup"}:
+                            found.append(clean_d)
+        except Exception:
+            pass
+
+        # B. Hostname / subdomain candidate probe via XML-RPC authenticate
+        candidates: list[str] = []
+        if inferred_db and inferred_db not in candidates:
+            candidates.append(inferred_db)
+        subdomain = host.split(".")[0] if host else ""
+        if subdomain and subdomain not in candidates and subdomain not in {"www", "localhost", "127", "odoo"}:
+            candidates.append(subdomain)
+
+        def _probe_candidate(candidate_name: str) -> bool:
+            try:
+                proxy = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", transport=xmlrpc_transport(url), allow_none=True)
+                proxy.authenticate(candidate_name, "", "", {})
+                return True
+            except Exception:
+                return False
+
+        for candidate in candidates:
+            if candidate not in found:
+                exists = await asyncio.to_thread(_probe_candidate, candidate)
+                if exists:
+                    found.append(candidate)
+
+        return found
 
     try:
-        databases = await asyncio.wait_for(asyncio.to_thread(list_databases), timeout=10)
-        return {"status": "success" if databases else "manual_required", "databases": databases, "suggested_username": "admin"}
-    except asyncio.TimeoutError:
-        return {"status": "timeout", "databases": [], "message": "Database discovery timed out"}
-    except socket.gaierror:
-        return {"status": "dns_error", "databases": [], "message": "ERP hostname could not be resolved"}
-    except ssl.SSLError:
-        return {"status": "tls_error", "databases": [], "message": "TLS certificate validation failed"}
-    except Exception:
-        # Check if server is active via /xmlrpc/2/common version endpoint
-        try:
-            ver_info = await asyncio.wait_for(asyncio.to_thread(get_server_version), timeout=5)
-            version_str = ver_info.get("server_version", "Active") if isinstance(ver_info, dict) else "Active"
+        databases = await list_databases_multi()
+        if not databases:
+            databases = await discover_candidate_databases()
+        version_str = await get_server_version_multi()
+
+        if databases:
+            suggested = inferred_db if (inferred_db and inferred_db in databases) else databases[0]
+            return {
+                "status": "success",
+                "databases": databases,
+                "suggested_db": suggested,
+                "server_version": version_str,
+                "suggested_username": "admin",
+            }
+
+        # If database list could not be retrieved, check server liveness
+        if version_str:
+            msg = f"Odoo {version_str} active (list_db is disabled on this server)."
+            if inferred_db:
+                msg += f" Suggested database: '{inferred_db}'."
+            else:
+                msg += " Enter database name manually."
             return {
                 "status": "manual_required",
-                "databases": [],
+                "databases": [inferred_db] if inferred_db else [],
+                "suggested_db": inferred_db or "",
                 "server_version": version_str,
-                "message": f"Odoo {version_str} active (list_db disabled on server; enter database name manually)",
+                "suggested_username": "admin",
+                "message": msg,
             }
-        except Exception:
-            return {"status": "manual_required", "databases": [], "message": "Database listing is disabled; enter the name manually"}
+
+        msg = "Database listing is disabled; enter the database name manually."
+        if inferred_db:
+            msg = f"Suggested database: '{inferred_db}' (or enter manually)."
+        return {
+            "status": "manual_required",
+            "databases": [inferred_db] if inferred_db else [],
+            "suggested_db": inferred_db or "",
+            "suggested_username": "admin",
+            "message": msg,
+        }
+    except socket.gaierror:
+        return {"status": "dns_error", "databases": [], "suggested_db": "", "message": f"ERP hostname '{host}' could not be resolved. Please verify domain name."}
+    except ssl.SSLError:
+        return {"status": "tls_error", "databases": [], "suggested_db": "", "message": f"TLS certificate validation failed for '{host}'"}
+    except Exception as exc:
+        return {"status": "manual_required", "databases": [inferred_db] if inferred_db else [], "suggested_db": inferred_db or "", "message": f"Could not auto-list databases: {exc}"}
 
 
 @app.post("/instances", response_model=schemas.InstanceOut, status_code=201)
 async def create_instance(payload: schemas.InstanceCreate, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, payload.project_id)
     url = validate_erp_url(str(payload.url), db)
+    if payload.erp_type in ("pri_erp", "pi_erp"):
+        # Pri ERP instance — validate connectivity
+        if not payload.api_key and not (payload.username and payload.password):
+            raise HTTPException(status_code=400, detail="API key or username+password is required for Pri ERP")
+        try:
+            pri_adapter = await connect_pri_erp(
+                url=url,
+                api_key=payload.api_key or None,
+                username=payload.username or None,
+                password=payload.password or None,
+            )
+            health = await pri_adapter.health_check()
+            ver = await pri_adapter.get_version_async()
+            await pri_adapter.aclose()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Pri ERP connection failed: {exc}") from exc
+        instance = models.Instance(
+            project_id=project.id,
+            erp_type="pri_erp",
+            url=url,
+            db_name=payload.db_name,
+            username=payload.username,
+            api_key_encrypted=encrypt_secret(payload.api_key) if payload.api_key else None,
+            password_encrypted=encrypt_secret(payload.password) if payload.password else None,
+            environment=payload.environment,
+            hosting_type=payload.hosting_type,
+            auth_method="json2" if payload.api_key else "xmlrpc",
+            status="connected",
+            version_info={"erp_type": "pri_erp", **ver},
+            capabilities={"erp_type": "pri_erp", "write_enabled": False},
+        )
+        db.add(instance)
+        db.commit()
+        db.refresh(instance)
+        return instance
+    # Odoo instance
     if not payload.db_name:
         raise HTTPException(status_code=400, detail="Database name is required")
     if payload.auth_method == "xmlrpc" and (not payload.username or not payload.password):
@@ -1214,13 +1491,17 @@ async def create_instance(payload: schemas.InstanceCreate, user: models.User = D
             else connect_odoo(url, payload.db_name, payload.username or "", payload.password or "")
         )
     except asyncio.TimeoutError as exc:
-        raise HTTPException(status_code=400, detail="ERP server timed out") from exc
+        raise HTTPException(status_code=400, detail=f"ERP server timed out connecting to {url}") from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Authentication failed. Check the database, username, and password") from exc
+        raise HTTPException(status_code=400, detail=f"Authentication failed for database '{payload.db_name}' and user '{payload.username or 'API Key'}'. Check credentials.") from exc
+    except socket.gaierror as exc:
+        raise HTTPException(status_code=400, detail=f"Hostname could not be resolved for URL: {url}") from exc
+    except ssl.SSLError as exc:
+        raise HTTPException(status_code=400, detail=f"TLS/SSL certificate validation failed for URL: {url}") from exc
     except (OSError, xmlrpc.client.Error) as exc:
-        raise HTTPException(status_code=400, detail="Could not reach the ERP endpoint. Check the URL and server availability") from exc
+        raise HTTPException(status_code=400, detail=f"Could not reach Odoo endpoint at {url}. Check URL and server availability.") from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="ERP connection failed. Check the URL, database, and credentials") from exc
+        raise HTTPException(status_code=400, detail=f"ERP connection failed: {str(exc)}") from exc
     version_info = client.version()
     try:
         enterprise = client.search_read("ir.module.module", [("name", "=", "web_enterprise"), ("state", "=", "installed")], ["id"], 1)
@@ -1467,6 +1748,11 @@ def enforce_budget(db: Session, project_id: int) -> models.Project:
 def create_run(project_id: int, payload: schemas.RunCreate, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     require_project(db, user, project_id)
     project = enforce_budget(db, project_id)
+    if any(not item.content.startswith("data:") for item in payload.attachments):
+        raise HTTPException(status_code=400, detail="Attachments must use a data URL")
+    attachment_note = "" if not payload.attachments else "\n\nAttached files:\n" + "\n".join(
+        f"- {item.name} ({item.type})\n{item.text or 'Binary attachment supplied.'}" for item in payload.attachments
+    )
     
     instance = db.query(models.Instance).filter(
         models.Instance.project_id == project_id,
@@ -1475,12 +1761,32 @@ def create_run(project_id: int, payload: schemas.RunCreate, user: models.User = 
     if not instance or instance.status not in {"ready", "connected"}:
         raise HTTPException(status_code=409, detail="No active staging instance")
 
-    key = db.get(models.Setting, "openrouter_api_key")
-    if not key or not decrypt_secret(key.value).strip():
+    if not configured_llm_key(db):
         raise HTTPException(status_code=400, detail="No API key configured. Please configure an OpenRouter API key in the Administration settings before running the agent.")
+
+    odoo_version, odoo_edition = normalized_odoo_environment(instance.version_info)
+    if odoo_version != "19.0" or odoo_edition == "unknown":
+        raise HTTPException(status_code=409, detail="The staging Odoo 19 version and edition must be verified before starting the agent")
     
+    recent_interactions = db.query(models.Interaction).filter(
+        models.Interaction.project_id == project_id
+    ).order_by(models.Interaction.created_at.desc()).limit(6).all()[::-1]
+
+    if SupervisorPlanner.is_continuation_request(payload.message) and recent_interactions:
+        was_build_context = any(
+            SupervisorPlanner.is_module_build(m.content) or any(k in m.content.lower() for k in ["create", "build", "scaffold", "implement", "modify", "write", "patch"])
+            for m in recent_interactions[-3:]
+        )
+        is_read_only = not was_build_context
+    else:
+        is_read_only = (
+            SupervisorPlanner.is_read_only_request(payload.message)
+            or (SupervisorPlanner.is_conversational_request(payload.message) and not SupervisorPlanner.is_continuation_request(payload.message))
+        )
+    intent = "read_only" if is_read_only else "write"
     active = db.query(models.AgentRun).filter(
         models.AgentRun.project_id == project_id,
+        models.AgentRun.intent == "write",
         models.AgentRun.status.in_(ACTIVE_RUN_STATUSES),
     ).first()
     if active and not payload.queue_if_busy:
@@ -1488,10 +1794,15 @@ def create_run(project_id: int, payload: schemas.RunCreate, user: models.User = 
     configured_model = db.get(models.Setting, "llm_model_name")
     configured_fallback = db.get(models.Setting, "llm_fallback_model_name")
     
-    workspace = Workspace(project.workspace_slug)
+    workspace_slug = project.workspace_slug
+    if intent != "read_only" and payload.workspace_mode == "isolated":
+        workspace_slug = f"{project.workspace_slug}__run_{uuid4().hex[:12]}"
+        workspace = Workspace(project.workspace_slug).create_worktree(workspace_slug)
+    else:
+        workspace = Workspace(project.workspace_slug, create=intent != "read_only")
     module_name = payload.module_name
     ambiguous = False
-    if not module_name:
+    if intent != "read_only" and not module_name:
         tree = workspace.tree()
         modules = []
         for item in tree:
@@ -1506,15 +1817,19 @@ def create_run(project_id: int, payload: schemas.RunCreate, user: models.User = 
         elif len(modules) > 1:
             ambiguous = True
 
+    thread_id = payload.thread_id.strip() if payload.thread_id and payload.thread_id.strip() else f"project:{project_id}:thread:{uuid4()}"
+
     run = models.AgentRun(
         project_id=project_id,
         requested_by_id=user.id,
-        prompt=payload.message,
-        thread_id=f"project:{project_id}:run:{uuid4()}",
+        prompt=payload.message + attachment_note,
+        thread_id=thread_id,
         planner_model=configured_model.value if configured_model else None,
         fallback_model=configured_fallback.value if configured_fallback and configured_fallback.value else None,
-        workspace_base_revision=workspace.head(),
+        workspace_base_revision=workspace.head() if intent != "read_only" else None,
         module_name=module_name,
+        intent=intent,
+        workspace_slug=workspace_slug if intent != "read_only" else None,
         status="awaiting_question" if ambiguous else "queued"
     )
     db.add(run)
@@ -1533,9 +1848,6 @@ def create_run(project_id: int, payload: schemas.RunCreate, user: models.User = 
         db.add(question)
         db.flush()
 
-    odoo_version, odoo_edition = normalized_odoo_environment(instance.version_info)
-    if odoo_version != "19.0" or odoo_edition == "unknown":
-        raise HTTPException(status_code=409, detail="The staging Odoo 19 version and edition must be verified before starting the agent")
     snapshot = models.SourceSnapshot(
         instance_id=instance.id,
         odoo_version=odoo_version,
@@ -1560,6 +1872,69 @@ def create_run(project_id: int, payload: schemas.RunCreate, user: models.User = 
 def list_runs(project_id: int, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     require_project(db, user, project_id)
     return db.query(models.AgentRun).filter(models.AgentRun.project_id == project_id).order_by(models.AgentRun.created_at.desc()).limit(100).all()
+
+
+@app.get("/projects/{project_id}/schedules", response_model=list[schemas.ScheduleOut])
+def list_schedules(project_id: int, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    return db.query(models.AgentSchedule).filter(
+        models.AgentSchedule.project_id == project_id,
+    ).order_by(models.AgentSchedule.created_at.desc()).all()
+
+
+@app.post("/projects/{project_id}/schedules", response_model=schemas.ScheduleOut, status_code=201)
+def create_schedule(project_id: int, payload: schemas.ScheduleCreate, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    schedule = models.AgentSchedule(
+        project_id=project_id,
+        requested_by_id=user.id,
+        prompt=payload.prompt,
+        interval_seconds=payload.interval_seconds,
+        enabled=payload.enabled,
+        next_run_at=datetime.now(timezone.utc) + timedelta(seconds=payload.interval_seconds),
+    )
+    db.add(schedule)
+    db.flush()
+    audit(db, "schedule.created", user.id, project_id, {
+        "schedule_id": schedule.id,
+        "interval_seconds": schedule.interval_seconds,
+        "enabled": schedule.enabled,
+    })
+    db.commit()
+    db.refresh(schedule)
+    return schedule
+
+
+@app.patch("/schedules/{schedule_id}", response_model=schemas.ScheduleOut)
+def update_schedule(schedule_id: str, payload: schemas.ScheduleUpdate, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    schedule = db.get(models.AgentSchedule, schedule_id)
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    require_project(db, user, schedule.project_id)
+    if payload.interval_seconds is not None:
+        schedule.interval_seconds = payload.interval_seconds
+        schedule.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=payload.interval_seconds)
+    if payload.enabled is not None:
+        schedule.enabled = payload.enabled
+    audit(db, "schedule.updated", user.id, schedule.project_id, {
+        "schedule_id": schedule.id,
+        "interval_seconds": schedule.interval_seconds,
+        "enabled": schedule.enabled,
+    })
+    db.commit()
+    db.refresh(schedule)
+    return schedule
+
+
+@app.delete("/schedules/{schedule_id}", status_code=204)
+def delete_schedule(schedule_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    schedule = db.get(models.AgentSchedule, schedule_id)
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    require_project(db, user, schedule.project_id)
+    db.delete(schedule)
+    audit(db, "schedule.deleted", user.id, schedule.project_id, {"schedule_id": schedule.id})
+    db.commit()
 
 
 @app.get("/runs/{run_id}", response_model=schemas.RunOut)
@@ -1628,13 +2003,14 @@ def retry_run(run_id: str, user: models.User = Depends(current_user), db: Sessio
         raise HTTPException(status_code=409, detail="Run is not retryable")
     active = db.query(models.AgentRun).filter(
         models.AgentRun.project_id == failed.project_id,
+        models.AgentRun.intent == "write",
         models.AgentRun.status.in_(ACTIVE_RUN_STATUSES),
     ).first()
     if active:
         raise HTTPException(status_code=409, detail={"message": "A project run is already active", "active_run_id": active.id})
     enforce_budget(db, failed.project_id)
     preserved_graph = None
-    if failed.task_graph:
+    if failed.task_graph and failed.intent != "read_only":
         preserved_graph = []
         for task in failed.task_graph:
             task_copy = dict(task)
@@ -1652,6 +2028,8 @@ def retry_run(run_id: str, user: models.User = Depends(current_user), db: Sessio
         planner_model=failed.planner_model,
         fallback_model=failed.fallback_model,
         workspace_base_revision=failed.workspace_base_revision,
+        workspace_slug=failed.workspace_slug,
+        intent=failed.intent,
         task_graph=preserved_graph,
     )
     db.add(run)
@@ -1698,7 +2076,122 @@ def run_events(run_id: str, after: int = 0, user: models.User = Depends(current_
     ).order_by(models.ToolEvent.sequence).all()
 
 
+@app.get("/runs/{run_id}/subtasks", response_model=list[schemas.AgentSubtaskOut])
+def run_subtasks(run_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    run = db.get(models.AgentRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    require_project(db, user, run.project_id)
+    return db.query(models.AgentSubtask).filter(
+        models.AgentSubtask.parent_run_id == run_id,
+    ).order_by(models.AgentSubtask.created_at).all()
+
+
+# ---------------------------------------------------------------------------
+# Attachment endpoints (Phase 6)
+# ---------------------------------------------------------------------------
+
+from fastapi import UploadFile, File
+
+
+@app.post("/runs/{run_id}/attachments", status_code=201)
+async def upload_attachment(
+    run_id: str,
+    file: UploadFile = File(...),
+    user: models.User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload an attachment to a run (max 25 MB).
+
+    Returns the RunAttachment record with extracted text state.
+    """
+    run = db.get(models.AgentRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    project = require_project(db, user, run.project_id)
+
+    data = await file.read()
+    if len(data) > settings.max_attachment_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds the {settings.max_attachment_bytes // 1_000_000} MB limit",
+        )
+
+    try:
+        attachment = process_attachment(
+            db=db,
+            run_id=run_id,
+            project_id=project.id,
+            uploader_id=user.id,
+            filename=file.filename or "upload",
+            content_type=file.content_type or "",
+            data=data,
+        )
+    except AttachmentValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return {
+        "id": attachment.id,
+        "filename": attachment.original_filename,
+        "mime_type": attachment.mime_type,
+        "size_bytes": attachment.size_bytes,
+        "processing_state": attachment.processing_state,
+        "page_count": attachment.page_count,
+        "content_hash": attachment.content_hash,
+        "created_at": attachment.created_at.isoformat(),
+    }
+
+
+@app.get("/runs/{run_id}/attachments")
+async def list_attachments(
+    run_id: str,
+    user: models.User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """List all attachments for a run."""
+    run = db.get(models.AgentRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    require_project(db, user, run.project_id)
+    attachments = db.query(models.RunAttachment).filter(
+        models.RunAttachment.run_id == run_id
+    ).order_by(models.RunAttachment.created_at).all()
+    return [
+        {
+            "id": a.id,
+            "filename": a.original_filename,
+            "mime_type": a.mime_type,
+            "size_bytes": a.size_bytes,
+            "processing_state": a.processing_state,
+            "scan_result": a.scan_result,
+            "page_count": a.page_count,
+            "extraction_error": a.extraction_error,
+            "content_hash": a.content_hash,
+            "citation": get_citation(db, a.id),
+            "created_at": a.created_at.isoformat(),
+            "processed_at": a.processed_at.isoformat() if a.processed_at else None,
+        }
+        for a in attachments
+    ]
+
+
+@app.get("/attachments/{attachment_id}/content")
+async def get_attachment_content(
+    attachment_id: str,
+    max_chars: int = 50000,
+    user: models.User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the extracted text from an attachment (agent-ready with citation header)."""
+    attachment = db.get(models.RunAttachment, attachment_id)
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    require_project(db, user, attachment.project_id)
+    return {"content": get_extracted_text_for_agent(db, attachment_id, max_chars=min(max_chars, 200_000))}
+
+
 @app.get("/runs/{run_id}/stream")
+
 async def stream_run_events(run_id: str, request: Request, after: int = 0, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     run = db.get(models.AgentRun, run_id)
     if not run:
@@ -1710,6 +2203,8 @@ async def stream_run_events(run_id: str, request: Request, after: int = 0, user:
         sequence = max(after, int(header_sequence) if header_sequence and header_sequence.isdigit() else 0)
         heartbeat_at = datetime.now(timezone.utc)
         while True:
+            if await request.is_disconnected():
+                break
             with SessionLocal() as event_db:
                 rows = event_db.query(models.ToolEvent).filter(
                     models.ToolEvent.run_id == run_id, models.ToolEvent.sequence > sequence
@@ -1740,6 +2235,15 @@ async def stream_run_events(run_id: str, request: Request, after: int = 0, user:
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+def is_expired(expires_at: datetime | None) -> bool:
+    if not expires_at:
+        return True
+    now = datetime.now(timezone.utc)
+    if expires_at.tzinfo is None:
+        return expires_at <= datetime.utcnow()
+    return expires_at <= now
+
+
 def can_approve(db: Session, user: models.User, action: models.PendingAction) -> bool:
     if action.risk_class in {"D", "E"}:
         project = db.get(models.Project, action.project_id)
@@ -1761,6 +2265,111 @@ def pending_approvals(user: models.User = Depends(current_user), db: Session = D
     return [action for action in actions if can_approve(db, user, action)]
 
 
+@app.get("/projects/{project_id}/permissions", response_model=list[schemas.PermissionGrantOut])
+def list_permissions(project_id: int, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    return db.query(models.PermissionGrant).filter(
+        models.PermissionGrant.project_id == project_id,
+        models.PermissionGrant.user_id == user.id,
+    ).order_by(models.PermissionGrant.created_at.desc()).all()
+
+
+@app.post("/projects/{project_id}/permissions", response_model=schemas.PermissionGrantOut, status_code=201)
+def create_permission(project_id: int, payload: schemas.PermissionGrantCreate, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    if payload.expires_at and is_expired(payload.expires_at):
+        raise HTTPException(status_code=400, detail="Permission expiry must be in the future")
+    if not any(payload.resource.startswith(prefix) for prefix in ("workspace:", "command:", "erp:")):
+        raise HTTPException(status_code=400, detail="Permission resource must start with workspace:, command:, or erp:")
+    grant = db.query(models.PermissionGrant).filter(
+        models.PermissionGrant.project_id == project_id,
+        models.PermissionGrant.user_id == user.id,
+        models.PermissionGrant.resource == payload.resource,
+    ).first()
+    if not grant:
+        grant = models.PermissionGrant(project_id=project_id, user_id=user.id, created_by_id=user.id, resource=payload.resource)
+    grant.decision = payload.decision
+    grant.expires_at = payload.expires_at
+    db.add(grant)
+    audit(db, "permission.updated", user.id, project_id, {"resource": grant.resource, "decision": grant.decision})
+    db.commit(); db.refresh(grant)
+    return grant
+
+
+@app.delete("/projects/{project_id}/permissions/{grant_id}", status_code=204)
+def delete_permission(project_id: int, grant_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    grant = db.query(models.PermissionGrant).filter(
+        models.PermissionGrant.id == grant_id,
+        models.PermissionGrant.project_id == project_id,
+        models.PermissionGrant.user_id == user.id,
+    ).first()
+    if not grant:
+        raise HTTPException(status_code=404, detail="Permission grant not found")
+    db.delete(grant); db.commit()
+
+
+@app.patch("/projects/{project_id}/permissions/{grant_id}", response_model=schemas.PermissionGrantOut)
+def expire_permission(project_id: int, grant_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    grant = db.query(models.PermissionGrant).filter(models.PermissionGrant.id == grant_id, models.PermissionGrant.project_id == project_id, models.PermissionGrant.user_id == user.id).first()
+    if not grant:
+        raise HTTPException(status_code=404, detail="Permission grant not found")
+    grant.expires_at = datetime.now(timezone.utc)
+    audit(db, "permission.expired", user.id, project_id, {"resource": grant.resource})
+    db.commit(); db.refresh(grant)
+    return grant
+
+
+@app.post("/projects/{project_id}/terminal", status_code=202)
+def start_terminal(project_id: int, payload: schemas.TerminalStart, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    project = require_project(db, user, project_id)
+    if payload.run_id:
+        project_workspace(project, payload.run_id, db)
+    try:
+        command = shlex.split(payload.command)
+        if not command:
+            raise ValueError("Command cannot be empty")
+        project_workspace(project, payload.run_id, db).resolve(payload.cwd, must_exist=True)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session = models.TerminalSession(
+        project_id=project_id, run_id=payload.run_id, requested_by_id=user.id, command=payload.command,
+        cwd=payload.cwd, status="awaiting_approval",
+    )
+    db.add(session); db.flush()
+    action = models.PendingAction(
+        project_id=project_id, requested_by_id=user.id, thread_id=f"terminal:{session.id}",
+        tool_call_id=f"terminal:{session.id}", tool_name="terminal_command",
+        arguments={"session_id": session.id, "command": payload.command, "cwd": payload.cwd, "timeout_seconds": payload.timeout_seconds},
+        preview={"operation": "run terminal command", "command": payload.command, "cwd": payload.cwd, "verification": "Review the exit code and captured output."},
+        risk_class="2", expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.action_expiry_minutes),
+        idempotency_key=f"terminal:{session.id}",
+    )
+    db.add(action)
+    audit(db, "terminal.requested", user.id, project_id, {"session_id": session.id, "command": payload.command})
+    db.commit(); db.refresh(session); db.refresh(action)
+    return {"session": session, "action": action}
+
+
+@app.get("/projects/{project_id}/terminal", response_model=list[schemas.TerminalSessionOut])
+def list_terminal_sessions(project_id: int, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    return db.query(models.TerminalSession).filter(
+        models.TerminalSession.project_id == project_id,
+        models.TerminalSession.requested_by_id == user.id,
+    ).order_by(models.TerminalSession.created_at.desc()).limit(50).all()
+
+
+@app.get("/terminal/{session_id}", response_model=schemas.TerminalSessionOut)
+def get_terminal_session(session_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    session = db.get(models.TerminalSession, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal session not found")
+    require_project(db, user, session.project_id)
+    return session
+
+
 @app.post("/actions/{action_id}/decision")
 def decide_run_action(action_id: str, payload: schemas.ActionDecision, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     action = db.query(models.PendingAction).filter(models.PendingAction.id == action_id).with_for_update().first()
@@ -1769,13 +2378,61 @@ def decide_run_action(action_id: str, payload: schemas.ActionDecision, user: mod
     require_project(db, user, action.project_id)
     if not can_approve(db, user, action):
         raise HTTPException(status_code=403, detail="A permitted approver must decide this action")
-    if action.status != "pending" or action.expires_at <= datetime.now(timezone.utc):
+    if action.status != "pending" or is_expired(action.expires_at):
         raise HTTPException(status_code=409, detail="Action is no longer pending")
     if payload.decision == "approve":
         enforce_budget(db, action.project_id)
     action.status = "approved" if payload.decision == "approve" else "rejected"
     action.decided_by_id = user.id
     action.decided_at = datetime.now(timezone.utc)
+    if payload.decision == "approve" and payload.remember:
+        resource = resource_for(action.tool_name, action.arguments)
+        grant = db.query(models.PermissionGrant).filter(
+            models.PermissionGrant.project_id == action.project_id,
+            models.PermissionGrant.user_id == user.id,
+            models.PermissionGrant.resource == resource,
+        ).first() or models.PermissionGrant(
+            project_id=action.project_id, user_id=user.id, created_by_id=user.id, resource=resource,
+        )
+        grant.decision = "allow"
+        grant.expires_at = action.expires_at
+        db.add(grant)
+    if not action.run_id and action.tool_name == "terminal_command":
+        session = db.get(models.TerminalSession, action.arguments.get("session_id"))
+        if not session or session.project_id != action.project_id:
+            raise HTTPException(status_code=409, detail="Terminal session no longer exists")
+        if payload.decision == "reject":
+            session.status = "rejected"
+            action.status = "rejected"
+        else:
+            session.status = "running"
+            try:
+                project = db.get(models.Project, action.project_id)
+                workspace = project_workspace(project, session.run_id, db)
+                cwd = workspace.resolve(session.cwd, must_exist=True)
+                completed = subprocess.run(
+                    shlex.split(session.command), cwd=cwd, capture_output=True, text=True,
+                    timeout=int(action.arguments.get("timeout_seconds", 120)), check=False,
+                    env={"PATH": os.environ.get("PATH", ""), "HOME": str(workspace.root)},
+                )
+                session.output = (completed.stdout + completed.stderr)[-50_000:]
+                session.exit_code = completed.returncode
+                session.status = "succeeded" if completed.returncode == 0 else "failed"
+                action.status = "succeeded" if completed.returncode == 0 else "failed"
+            except subprocess.TimeoutExpired as exc:
+                session.output = ((exc.stdout or "") + (exc.stderr or ""))[-50_000:]
+                session.status = "failed"
+                action.status = "failed"
+                session.exit_code = None
+            except (OSError, ValueError) as exc:
+                session.output = str(exc)
+                session.status = "failed"
+                action.status = "failed"
+                session.exit_code = None
+        session.finished_at = datetime.now(timezone.utc)
+        audit(db, f"terminal.{session.status}", user.id, action.project_id, {"session_id": session.id, "command": session.command}, result=session.status)
+        db.commit(); db.refresh(session); db.refresh(action)
+        return {"session": session, "action": action}
     if not action.run_id and action.tool_name == "workspace_restore":
         if payload.decision == "approve":
             project = db.get(models.Project, action.project_id)
@@ -1790,6 +2447,7 @@ def decide_run_action(action_id: str, payload: schemas.ActionDecision, user: mod
     if not action.run_id:
         raise HTTPException(status_code=409, detail="Unsupported standalone action")
     run = db.get(models.AgentRun, action.run_id)
+    run.status = "queued"
     enqueue(db, "action.resume", run.id, {
         "action_id": action.id,
         "decision": payload.decision,
@@ -1798,6 +2456,10 @@ def decide_run_action(action_id: str, payload: schemas.ActionDecision, user: mod
     emit(db, run.id, "approval.decided", {
         "action_id": action.id, "decision": payload.decision,
         "status": action.status, "decided_by": user.id,
+    })
+    emit(db, run.id, "run.queued", {
+        "task_id": run.active_task_id,
+        "support_id": run.support_id,
     })
     audit(db, f"action.{action.status}", user.id, action.project_id, {"action_id": action.id}, risk_class=action.risk_class, support_id=run.support_id, result=action.status)
     db.commit(); db.refresh(run)
@@ -1844,11 +2506,23 @@ async def answer_run_question(run_id: str, payload: schemas.QuestionAnswer, requ
         models.AgentQuestion.run_id == run.id,
         models.AgentQuestion.status == "pending",
     ).first()
-    if not question or question.expires_at <= datetime.now(timezone.utc):
+    if not question or is_expired(question.expires_at):
         raise HTTPException(status_code=409, detail="This question has expired")
     project = require_project(db, user, run.project_id)
-    agent = await project_agent(request, db, project)
-    await agent.answer_question(run.thread_id, payload.answer)
+    if db.query(models.Instance).filter(
+        models.Instance.project_id == project.id,
+        models.Instance.is_active.is_(True),
+    ).first():
+        agent = await build_agent(db, run, request.app.state.checkpointer)
+    else:
+        # Preserve answers for legacy/test runs created before instance
+        # persistence existed; normal runs always use the durable worker agent.
+        agent = await project_agent(request, db, project)
+    child = db.query(models.AgentSubtask).filter(
+        models.AgentSubtask.parent_run_id == run.id,
+        models.AgentSubtask.status.in_(["awaiting_question", "running"]),
+    ).order_by(models.AgentSubtask.created_at.desc()).first()
+    await agent.answer_question(child.thread_id if child else run.thread_id, payload.answer)
     question.answer = payload.answer
     question.status = "answered"
     question.answered_at = datetime.now(timezone.utc)
@@ -1865,55 +2539,16 @@ async def answer_run_question(run_id: str, payload: schemas.QuestionAnswer, requ
 
 @app.post("/projects/{project_id}/actions/{action_id}/decision")
 async def decide_action(project_id: int, action_id: str, payload: schemas.ActionDecision, request: Request, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
-    project = require_project(db, user, project_id)
-    action = db.query(models.PendingAction).filter(
-        models.PendingAction.id == action_id,
-        models.PendingAction.project_id == project_id,
-    ).with_for_update().first()
-    if not action:
+    """Compatibility route that uses the same durable worker path as the canonical endpoint."""
+    action = db.get(models.PendingAction, action_id)
+    if not action or action.project_id != project_id:
         raise HTTPException(status_code=404, detail="Pending action not found")
-    if action.requested_by_id != user.id:
-        raise HTTPException(status_code=403, detail="Only the requesting user can decide this action")
-    now = datetime.now(timezone.utc)
-    if action.status != "pending" or action.expires_at <= now:
-        raise HTTPException(status_code=409, detail="This action has expired. Please stop the agent and request a new one.")
-    agent = await project_agent(request, db, project)
-    call = await agent.pending_call(action.thread_id)
-    if not call or call["id"] != action.tool_call_id or call["name"] != action.tool_name or call["args"] != action.arguments:
-        raise HTTPException(status_code=409, detail="Checkpoint does not match the approved action")
-    action.status = "approved" if payload.decision == "approve" else "rejected"
-    action.decided_by_id = user.id
-    action.decided_at = now
-    audit(db, f"agent.action_{action.status}", user.id, project_id, {"action_id": action.id, "tool": action.tool_name})
-    db.commit()
-
-    async def events():
-        response_text = ""
-        succeeded = False
-        try:
-            async for chunk in agent.stream(None, action.thread_id, reject=payload.decision == "reject"):
-                response_text += chunk
-                yield chunk
-            succeeded = True
-        except Exception:
-            yield "The approved action could not be completed."
-        finally:
-            with SessionLocal() as save_db:
-                stored = save_db.get(models.PendingAction, action_id)
-                if stored and payload.decision == "approve":
-                    stored.status = "executed" if succeeded else "failed"
-                save_db.add(models.Interaction(project_id=project_id, role="agent", content=response_text))
-                audit(save_db, "agent.action_result", user.id, project_id, {"action_id": action_id, "succeeded": succeeded})
-                save_db.commit()
-
-    return StreamingResponse(events(), media_type="text/plain")
+    return decide_run_action(action_id, payload, user, db)
 
 
 @app.post("/projects/{project_id}/actions/answer")
 async def answer_question_endpoint(project_id: int, payload: schemas.QuestionAnswer, request: Request, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     """Resume the agent after an ask_question pause by supplying the user's answer."""
-    project = require_project(db, user, project_id)
-    agent = await project_agent(request, db, project)
     run = db.query(models.AgentRun).filter(
         models.AgentRun.project_id == project_id,
         models.AgentRun.status == "awaiting_question",
@@ -1924,21 +2559,9 @@ async def answer_question_endpoint(project_id: int, payload: schemas.QuestionAns
         models.AgentQuestion.run_id == run.id,
         models.AgentQuestion.status == "pending",
     ).first()
-    if not question or question.expires_at <= datetime.now(timezone.utc):
+    if not question or is_expired(question.expires_at):
         raise HTTPException(status_code=409, detail="This question has expired")
-    await agent.answer_question(run.thread_id, payload.answer)
-    question.answer = payload.answer
-    question.status = "answered"
-    question.answered_at = datetime.now(timezone.utc)
-    run.status = "queued"
-    emit(db, run.id, "question.answered", {
-        "question_id": question.id, "answer": payload.answer, "answered_by": user.id,
-    })
-    enqueue(db, "run.resume", run.id)
-    audit(db, "agent.question_answered", user.id, project_id, {"run_id": run.id, "question_id": question.id})
-    db.commit()
-    db.refresh(run)
-    return run
+    return await answer_run_question(run.id, payload, request, user, db)
 
 
 @app.get("/projects/{project_id}/actions/pending", response_model=schemas.PendingActionOut | None)
@@ -1970,38 +2593,117 @@ def clear_chat_history(project_id: int, user: models.User = Depends(current_user
     db.commit()
 
 
+@app.get("/projects/{project_id}/threads/{thread_id}/transcript", response_model=list[schemas.ChatMessageOut])
+def thread_transcript(project_id: int, thread_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    runs = db.query(models.AgentRun).filter(
+        models.AgentRun.project_id == project_id,
+        models.AgentRun.thread_id == thread_id,
+    ).order_by(models.AgentRun.created_at.asc()).all()
+    if not runs:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    transcript: list[schemas.ChatMessageOut] = []
+    for r in runs:
+        # 1. User message
+        transcript.append(schemas.ChatMessageOut(
+            id=f"{r.id}-user",
+            role="user",
+            content=r.prompt,
+            created_at=r.created_at.isoformat() if r.created_at else None,
+        ))
+        # 2. Assistant message reconstructed from durable tool events
+        events = db.query(models.ToolEvent).filter(
+            models.ToolEvent.run_id == r.id,
+            models.ToolEvent.event_type == "message.delta",
+        ).order_by(models.ToolEvent.sequence.asc()).all()
+        chunks = []
+        for e in events:
+            if isinstance(e.payload, dict) and "text" in e.payload:
+                chunks.append(str(e.payload["text"]))
+        agent_text = "".join(chunks).strip()
+        if agent_text:
+            transcript.append(schemas.ChatMessageOut(
+                id=f"{r.id}-agent",
+                role="agent",
+                content=agent_text,
+                created_at=events[-1].created_at.isoformat() if events and events[-1].created_at else r.created_at.isoformat(),
+            ))
+    return transcript
+
+
+@app.delete("/projects/{project_id}/threads/{thread_id}", status_code=204)
+def delete_thread(project_id: int, thread_id: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    require_project(db, user, project_id)
+    runs = db.query(models.AgentRun).filter(
+        models.AgentRun.project_id == project_id,
+        models.AgentRun.thread_id == thread_id,
+    ).all()
+    for r in runs:
+        db.delete(r)
+    db.commit()
+
+
+def project_workspace(project: models.Project, run_id: str | None, db: Session) -> Workspace:
+    """Resolve the workspace shown in the IDE, including an isolated run tree."""
+    if not run_id:
+        return Workspace(project.workspace_slug)
+    run = db.get(models.AgentRun, run_id)
+    if not run or run.project_id != project.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return Workspace(run.workspace_slug or project.workspace_slug, create=False)
+
+
 @app.get("/projects/{project_id}/workspace/tree")
-def workspace_tree(project_id: int, path: str = "", user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+def workspace_tree(project_id: int, path: str = "", run_id: str | None = None, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, project_id)
-    return Workspace(project.workspace_slug).tree(path)
+    return project_workspace(project, run_id, db).tree(path)
+
+
+@app.get("/projects/{project_id}/workspace/search")
+def workspace_search(project_id: int, query: str, path: str = "", limit: int = 100, run_id: str | None = None, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    project = require_project(db, user, project_id)
+    if not query.strip():
+        return []
+    if not 1 <= limit <= 200:
+        raise HTTPException(status_code=400, detail="Search limit must be between 1 and 200")
+    try:
+        return project_workspace(project, run_id, db).search(query, path, limit)
+    except (FileNotFoundError, ValueError):
+        raise HTTPException(status_code=404, detail="Search path not found in workspace")
 
 
 @app.get("/projects/{project_id}/workspace/files")
-def workspace_file(project_id: int, path: str, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+def workspace_file(project_id: int, path: str, run_id: str | None = None, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, project_id)
     try:
-        return {"path": path, "content": Workspace(project.workspace_slug).read_file(path)}
+        return {"path": path, "content": project_workspace(project, run_id, db).read_file(path)}
     except (FileNotFoundError, ValueError):
         raise HTTPException(status_code=404, detail="File not found in workspace")
 
 
 @app.get("/projects/{project_id}/workspace/commits")
-def workspace_commits(project_id: int, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+def workspace_commits(project_id: int, run_id: str | None = None, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, project_id)
-    return Workspace(project.workspace_slug).history()
+    return project_workspace(project, run_id, db).history()
+
+
+@app.get("/projects/{project_id}/workspace/status")
+def workspace_status(project_id: int, run_id: str | None = None, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    project = require_project(db, user, project_id)
+    workspace = project_workspace(project, run_id, db)
+    return {**workspace.status(), "head_revision": workspace.head(), "branches": workspace.branches()}
 
 
 @app.get("/projects/{project_id}/workspace/diff")
 def workspace_diff(project_id: int, old: str | None = None, new: str = "HEAD", run_id: str | None = None, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, project_id)
-    workspace = Workspace(project.workspace_slug)
-    head_revision = workspace.head()
+    workspace = project_workspace(project, run_id, db)
     base_revision = old
     if run_id:
         run = db.get(models.AgentRun, run_id)
-        if not run or run.project_id != project_id:
-            raise HTTPException(status_code=404, detail="Run not found")
         base_revision = run.workspace_base_revision
+    head_revision = workspace.head()
     if not head_revision or (not run_id and not base_revision):
         return {"diff": "", "base_revision": base_revision, "head_revision": head_revision, "truncated": False}
     comparison_base = base_revision or Workspace.EMPTY_TREE_REVISION
@@ -2010,10 +2712,10 @@ def workspace_diff(project_id: int, old: str | None = None, new: str = "HEAD", r
 
 
 @app.get("/projects/{project_id}/workspace/archive")
-def workspace_archive(project_id: int, path: str = "", user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+def workspace_archive(project_id: int, path: str = "", run_id: str | None = None, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     project = require_project(db, user, project_id)
     return Response(
-        content=Workspace(project.workspace_slug).archive(path), media_type="application/zip",
+        content=project_workspace(project, run_id, db).archive(path), media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={project.workspace_slug}.zip"},
     )
 
@@ -2192,7 +2894,7 @@ def create_artifact(project_id: int, payload: schemas.ArtifactCreate, user: mode
     artifact = models.Artifact(
         project_id=project_id, requirement_id=payload.requirement_id, artifact_type="odoo_module",
         name=payload.name, version=payload.version, commit_hash=commit_hash,
-        digest=archive_digest, path=payload.path,
+        digest=archive_digest, path=payload.path, workspace_slug=workspace.root.name,
         status="validated" if report["passed"] else "failed_validation", created_by_id=user.id,
     )
     db.add(artifact); db.flush()
@@ -2274,6 +2976,7 @@ def quick_deploy_module(project_id: int, user: models.User = Depends(current_use
         commit_hash=commit_hash,
         digest=archive_digest,
         path=rel_path,
+        workspace_slug=workspace.root.name,
         status="validated" if report["passed"] else "failed_validation",
         created_by_id=user.id,
     )
@@ -2406,7 +3109,8 @@ def deployment_artifact(deployment_id: str, request: Request, db: Session = Depe
         raise HTTPException(status_code=401, detail="Invalid bridge credential")
     artifact = db.get(models.Artifact, deployment.artifact_id)
     project = db.get(models.Project, deployment.project_id)
-    module_path = Workspace(project.workspace_slug).resolve(artifact.path, must_exist=True)
+    workspace = Workspace(artifact.workspace_slug or project.workspace_slug, create=False)
+    module_path = workspace.resolve(artifact.path, must_exist=True)
     bundle = package_module(module_path)
     if hashlib.sha256(bundle).hexdigest() != artifact.digest:
         raise HTTPException(status_code=409, detail="Artifact changed after validation")

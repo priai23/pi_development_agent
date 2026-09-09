@@ -15,6 +15,7 @@ async function baseRoutes(page: Page, handler: (path: string, method: string) =>
     if (path === "/projects/1") return route.fulfill({ json: project });
     if (path === "/projects/1/instances") return route.fulfill({ json: [instance] });
     if (path === "/projects/1/workspace/tree") return route.fulfill({ json: [] });
+    if (path === "/projects/1/workspace/status") return route.fulfill({ json: { branch: "main", clean: true, changes: [], head_revision: null, branches: ["main"] } });
     if (path === "/projects/1/workspace/diff") return route.fulfill({ json: { diff: "" } });
     if (path === "/projects/1/artifacts" || path === "/projects/1/deployments") return route.fulfill({ json: [] });
     return route.fulfill({ status: 404, json: { detail: `Unhandled ${path}` } });
@@ -26,15 +27,15 @@ test("streams a run and preserves it when starting a new chat", async ({ page })
   await baseRoutes(page, (path, method) => {
     if (path === "/projects/1/runs" && method === "GET") return { json: created ? [run("succeeded")] : [] };
     if (path === "/projects/1/runs" && method === "POST") { created = true; return { status: 201, json: run("queued") }; }
-    if (path === "/runs/run-1/stream") return { contentType: "text/event-stream", body: envelope(1, "message.delta", { text: "ERP inspected." }) + envelope(2, "run.completed", { status: "succeeded" }) };
+    if (path === "/runs/run-1/stream") return { contentType: "text/event-stream", body: envelope(1, "message.delta", { text: "### ERP inspected\n\n- Database checked." }) + envelope(2, "run.completed", { status: "succeeded" }) };
     if (path === "/runs/run-1") return { json: run("succeeded") };
   });
   await page.goto("/projects/1");
   await page.getByPlaceholder(/Ask the agent/).fill("Inspect ERP");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("ERP inspected.")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "ERP inspected" })).toBeVisible();
   await page.getByRole("button", { name: /New Chat/ }).click();
-  await expect(page.getByText("ERP inspected.")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "ERP inspected" })).toHaveCount(0);
   await page.getByRole("button", { name: /History/ }).click();
   await expect(page.getByText("Inspect ERP")).toBeVisible();
 });

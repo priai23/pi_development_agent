@@ -552,3 +552,102 @@ def index_addon_roots(
 
     db.flush()
     return total
+
+
+def search_symbols(db, snapshot_id: str, query: str, kind: str | None = None, limit: int = 25) -> list[dict]:
+    """Search indexed symbols by name or model matching the query."""
+    from models import SourceSymbol
+    needle = f"%{query.strip()}%"
+    q = db.query(SourceSymbol).filter(
+        SourceSymbol.snapshot_id == snapshot_id,
+        (SourceSymbol.name.ilike(needle) | SourceSymbol.model.ilike(needle)),
+    )
+    if kind:
+        q = q.filter(SourceSymbol.kind == kind)
+    rows = q.limit(limit).all()
+    return [
+        {
+            "module": r.module,
+            "model": r.model,
+            "kind": r.kind,
+            "name": r.name,
+            "path": r.path,
+            "line_start": r.line_start,
+            "line_end": r.line_end,
+            "payload": r.payload,
+        }
+        for r in rows
+    ]
+
+
+def dependency_graph(db, snapshot_id: str) -> dict[str, list[str]]:
+    """Build a map of module dependencies from indexed manifest records."""
+    from models import SourceSymbol
+    manifests = db.query(SourceSymbol).filter(
+        SourceSymbol.snapshot_id == snapshot_id,
+        SourceSymbol.kind == "manifest",
+    ).all()
+    graph = {}
+    for m in manifests:
+        deps = (m.payload or {}).get("depends", [])
+        graph[m.module] = deps
+    return graph
+
+
+def model_to_views(db, snapshot_id: str, model_name: str) -> list[dict]:
+    """Find all views associated with a given model in the snapshot."""
+    from models import SourceSymbol
+    views = db.query(SourceSymbol).filter(
+        SourceSymbol.snapshot_id == snapshot_id,
+        SourceSymbol.kind == "view",
+        SourceSymbol.model == model_name,
+    ).all()
+    return [
+        {"name": v.name, "path": v.path, "line_start": v.line_start, "payload": v.payload}
+        for v in views
+    ]
+
+
+def security_to_models(db, snapshot_id: str, model_name: str) -> dict:
+    """Find all ACL entries and record rules for a given model."""
+    from models import SourceSymbol
+    acls = db.query(SourceSymbol).filter(
+        SourceSymbol.snapshot_id == snapshot_id,
+        SourceSymbol.kind == "acl",
+        SourceSymbol.model == model_name,
+    ).all()
+    rules = db.query(SourceSymbol).filter(
+        SourceSymbol.snapshot_id == snapshot_id,
+        SourceSymbol.kind == "rule",
+        SourceSymbol.model == model_name,
+    ).all()
+    return {
+        "model": model_name,
+        "acls": [{"name": a.name, "path": a.path, "payload": a.payload} for a in acls],
+        "rules": [{"name": r.name, "path": r.path, "payload": r.payload} for r in rules],
+    }
+
+
+def change_impact(db, snapshot_id: str, changed_files: list[str]) -> dict:
+    """Analyze which symbols, models, and views are impacted by changed files."""
+    from models import SourceSymbol
+    impacted_symbols = []
+    impacted_models = set()
+    for f in changed_files:
+        clean_path = f.lstrip("./")
+        syms = db.query(SourceSymbol).filter(
+            SourceSymbol.snapshot_id == snapshot_id,
+            SourceSymbol.path.ilike(f"%{clean_path}%"),
+        ).all()
+        for s in syms:
+            impacted_symbols.append({"kind": s.kind, "name": s.name, "model": s.model, "path": s.path})
+            if s.model:
+                impacted_models.add(s.model)
+
+    return {
+        "changed_files": changed_files,
+        "impacted_symbol_count": len(impacted_symbols),
+        "impacted_symbols": impacted_symbols[:50],
+        "impacted_models": sorted(impacted_models),
+    }
+

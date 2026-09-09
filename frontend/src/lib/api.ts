@@ -6,22 +6,27 @@ export type SetupStatus = { needs_setup: boolean; user_count: number };
 export type Organization = { id: number; name: string; created_at: string; monthly_budget_usd: number | null; budget_warning_percent: number };
 export type Instance = { id: number; project_id: number; erp_type: string; url: string; db_name: string | null; username: string | null; environment: "staging" | "production"; hosting_type: "on_premise" | "odoo_sh"; auth_method: "json2" | "xmlrpc"; status: string; is_active: boolean; version_info: Record<string, unknown>; capabilities: Record<string, unknown>; bridge_status: string; last_tested_at: string | null; last_error: string | null; created_at: string };
 export type Project = { id: number; name: string; organization_id: number; created_by_id: number; workspace_slug: string; phase: string; created_at: string; instances: Instance[] };
-export type ChatMessage = { id?: number; role: "user" | "agent"; content: string; created_at?: string };
+export type ChatMessage = { id?: number | string; role: "user" | "agent" | "system"; content: string; created_at?: string };
 export type PendingAction = { id: string; run_id?: string; tool: string; risk_class: string; preview: Record<string, unknown>; arguments?: Record<string, unknown>; expires_at?: string; status?: string };
 export type HostPolicy = { id: number; hostname_pattern: string; allow_private_network: boolean; require_https: boolean; is_active: boolean; created_at: string };
 export type AuditEvent = { id: number; event_type: string; project_id: number | null; user_id: number | null; risk_class: string | null; result: string | null; support_id: string | null; created_at: string };
 export type AgentQuestion = { id: string; run_id: string; question: string; options: string[]; answer: string | null; status: string; created_at: string; expires_at: string };
 export type TaskReport = { task_id?: string; outcome: "SUCCESS" | "PARTIAL" | "FAILED"; done: string[]; verification: string; errors: string };
 export type TaskGraphNode = { task_id: string; title: string; status: string; risk_class: number; retry_count: number; max_retries?: number; heartbeat_at: string | null; result?: TaskReport | null };
-export type AgentRun = { id: string; project_id: number; status: string; prompt: string; support_id: string; error_category?: string | null; error_message: string | null; retryable: boolean; input_tokens?: number; output_tokens?: number; cost_usd: number; created_at: string; started_at?: string | null; finished_at?: string | null; task_graph?: TaskGraphNode[] | null; active_task_id?: string | null; question?: AgentQuestion | null; planner_model?: string | null; fallback_model?: string | null; workspace_base_revision?: string | null };
+export type AgentRun = { id: string; project_id: number; status: string; intent?: "read_only" | "write"; prompt: string; thread_id?: string; support_id: string; error_category?: string | null; error_message: string | null; retryable: boolean; input_tokens?: number; output_tokens?: number; cost_usd: number; created_at: string; started_at?: string | null; finished_at?: string | null; task_graph?: TaskGraphNode[] | null; active_task_id?: string | null; question?: AgentQuestion | null; planner_model?: string | null; fallback_model?: string | null; workspace_base_revision?: string | null };
+export type AgentSubtask = { id: string; parent_run_id: string; project_id: number; task_id: string; title: string; role: string; thread_id: string; status: string; prompt: string; result: TaskReport | null; error_message: string | null; retry_count: number; created_at: string; started_at: string | null; heartbeat_at: string | null; finished_at: string | null };
+export type AgentSchedule = { id: string; project_id: number; requested_by_id: number; prompt: string; interval_seconds: number; enabled: boolean; next_run_at: string; last_run_at: string | null; last_run_id: string | null; last_error: string | null; created_at: string; updated_at: string };
 export type ToolEvent = { id: number; run_id: string; sequence: number; event_type: string; payload: Record<string, unknown>; created_at: string };
-export type Step = { tool: string; label: string; status: "running" | "done" | "failed"; outcome?: "succeeded" | "failed" | "unknown"; result?: string; startedAt: number; elapsed?: number; category?: "inspect" | "edit" | "verify" | "run" };
+export type Step = { tool: string; label: string; status: "running" | "done" | "failed" | "cancelled"; outcome?: "succeeded" | "failed" | "unknown"; result?: string; startedAt: number; elapsed?: number; category?: "inspect" | "edit" | "verify" | "run" };
 export type FinalReport = { scope?: "task" | "run"; outcome: "SUCCESS" | "PARTIAL" | "FAILED"; done: string[]; verification: string; errors: string; pending_approvals: string };
 export type ConnectionState = "connecting" | "connected" | "retrying" | "paused" | "disconnected";
 export type WorkspaceEntry = { path: string; type: "file" | "directory"; size?: number };
+export type WorkspaceSearchResult = { path: string; line: number; text: string };
+export type WorkspaceStatus = { branch: string; clean: boolean; changes: Array<{ index: string; worktree: string; path: string }>; head_revision: string | null; branches: string[] };
 export type Requirement = { id: number; title: string; description: string; acceptance_criteria: string; status: string };
-export type Artifact = { id: string; name: string; version: string; digest: string; path: string; status: string; created_at: string };
+export type Artifact = { id: string; name: string; version: string; digest: string; path: string; workspace_slug?: string | null; status: string; created_at: string };
 export type Deployment = { id: string; instance_id: number; artifact_id: string; environment: string; status: string; requested_by_id: number; approved_by_id: number | null; rollback_plan: string; logs: string; external_job_id: string | null; created_at: string };
+export type TerminalSession = { id: string; project_id: number; run_id?: string | null; requested_by_id: number; command: string; cwd: string; status: string; output: string; exit_code: number | null; created_at: string; finished_at: string | null };
 export type AcceptanceCheck = {
   id: string;
   kind: string;
@@ -47,6 +52,7 @@ export type RunSpecification = {
 };
 
 export type AgentMemory = { id: number; project_id: number | null; category: string; key: string; content: string; confidence: number; usage_count: number; created_at: string; updated_at: string; evidence_type?: string | null; evidence_ref_id?: string | null; verified_at?: string | null };
+export type PermissionGrant = { id: string; project_id: number | null; user_id: number | null; resource: string; decision: string; expires_at: string | null; created_by_id: number; created_at: string };
 
 let csrfToken = "";
 export function setCsrfToken(value: string) { csrfToken = value; }
@@ -253,4 +259,15 @@ export async function followRun(
       await waitToRetry(Math.min(1000 * 2 ** (retries - 1), 8000) + Math.floor(Math.random() * 250), options.signal);
     }
   }
+}
+
+export async function fetchThreadTranscript(
+  projectId: number,
+  threadId: string
+): Promise<ChatMessage[]> {
+  return apiFetch(`/projects/${projectId}/threads/${encodeURIComponent(threadId)}/transcript`);
+}
+
+export async function deleteThread(projectId: number, threadId: string): Promise<void> {
+  return apiFetch(`/projects/${projectId}/threads/${encodeURIComponent(threadId)}`, { method: "DELETE" });
 }

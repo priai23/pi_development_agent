@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Bot, Brain, ChevronDown, ChevronUp, Code2, Database, GitBranch, History, Layers, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, Rocket, RotateCcw, Send, Square } from "lucide-react";
+import { AlertTriangle, Bot, Brain, ChevronDown, ChevronUp, Code2, Database, FileText, GitBranch, HelpCircle, History, Image as ImageIcon, Layers, Lightbulb, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, Rocket, RotateCcw, Search, Send, Server, Shield, SlidersHorizontal, Sparkles, Square, Terminal } from "lucide-react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
@@ -13,17 +13,20 @@ import CodeDiffViewer from "@/components/CodeDiffViewer";
 import ApprovalCard from "@/components/ApprovalCard";
 import WorkspaceFileTree from "@/components/WorkspaceFileTree";
 import RunHistoryDialog from "@/components/RunHistoryDialog";
-import { apiFetch, AgentRun, Artifact, ChatMessage, deleteRun, Deployment, followRun, Instance, Project, ToolEvent, WorkspaceEntry } from "@/lib/api";
+import { apiFetch, AgentRun, AgentSchedule, AgentSubtask, Artifact, ChatMessage, deleteRun, deleteThread, Deployment, fetchThreadTranscript, followRun, Instance, Project, TerminalSession, ToolEvent, WorkspaceEntry, WorkspaceSearchResult, WorkspaceStatus } from "@/lib/api";
 import { ACTIVE_RUN_STATUSES, getWorkspacePhase, WorkspacePhase } from "@/lib/run-state";
 import { useRunController } from "@/hooks/useRunController";
 
 export default function ProjectWorkspace() {
   const params = useParams<{ id: string }>();
   const projectId = Number(params.id);
-  const { state: runState, hydrate: hydrateRun, receive: receiveRunEvent, setConnection, setRun, setError: setRunError, clear: clearRun } = useRunController();
+  const { state: runState, hydrate: hydrateRun, continueRun, receive: receiveRunEvent, setConnection, setRun, setError: setRunError, clear: clearRun } = useRunController();
   const [project, setProject] = useState<Project | null>(null);
   const [instances, setInstances] = useState<Instance[]>([]);
   const [message, setMessage] = useState("");
+  const [attachments, setAttachments] = useState<{ name: string; type: string; content: string; text?: string }[]>([]);
+  const [draggingFiles, setDraggingFiles] = useState(false);
+  const attachmentInput = useRef<HTMLInputElement>(null);
   const [bootLoading, setBootLoading] = useState(true);
   const [connectingInstance, setConnectingInstance] = useState(false);
   const [submittingRun, setSubmittingRun] = useState(false);
@@ -46,24 +49,49 @@ export default function ProjectWorkspace() {
   const [showLeftSidebar, setShowLeftSidebar] = useState(false);
   const [showRightPanel, setShowRightPanel] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(520);
+  const [leftPanelWidth, setLeftPanelWidth] = useState(256);
+  const [isResizingLeft, setIsResizingLeft] = useState(false);
   const [isResizingRight, setIsResizingRight] = useState(false);
-  const [rightPanelTab, setRightPanelTab] = useState<"code" | "diff" | "memory" | "evidence">("code");
+  const [rightPanelTab, setRightPanelTab] = useState<"code" | "diff" | "terminal" | "memory" | "evidence">("code");
   const [entries, setEntries] = useState<WorkspaceEntry[]>([]);
+  const [workspaceSearchQuery, setWorkspaceSearchQuery] = useState("");
+  const [workspaceSearchResults, setWorkspaceSearchResults] = useState<WorkspaceSearchResult[]>([]);
   const [selectedFile, setSelectedFile] = useState("");
   const [fileContent, setFileContent] = useState("");
   const [diffContent, setDiffContent] = useState("");
+  const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus | null>(null);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [terminalSessions, setTerminalSessions] = useState<TerminalSession[]>([]);
+  const [terminalCommand, setTerminalCommand] = useState("");
+  const [terminalCwd, setTerminalCwd] = useState(".");
+  const [terminalSubmitting, setTerminalSubmitting] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<"local" | "isolated">("local");
   const [runs, setRuns] = useState<AgentRun[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [subtasks, setSubtasks] = useState<AgentSubtask[]>([]);
+  const [schedules, setSchedules] = useState<AgentSchedule[]>([]);
+  const [schedulePrompt, setSchedulePrompt] = useState("");
+  const [scheduleInterval, setScheduleInterval] = useState("3600");
+  const [scheduleSubmitting, setScheduleSubmitting] = useState(false);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [deploying, setDeploying] = useState(false);
   const [deployMsg, setDeployMsg] = useState<string | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const discoveryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const discoverySequence = useRef(0);
   const streamAbortRef = useRef<AbortController | null>(null);
   const streamCursorRef = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
+
+  const loadSubtasks = useCallback(async (runId: string) => {
+    try { setSubtasks(await apiFetch<AgentSubtask[]>(`/runs/${runId}/subtasks`)); } catch { /* child-agent telemetry is best effort */ }
+  }, []);
+
+  const loadSchedules = useCallback(async () => {
+    try { setSchedules(await apiFetch<AgentSchedule[]>(`/projects/${projectId}/schedules`)); } catch { /* scheduling is optional for older deployments */ }
+  }, [projectId]);
 
   const phase: WorkspacePhase = getWorkspacePhase(runState, submittingRun);
   const chat = runState.transcript;
@@ -87,6 +115,7 @@ export default function ProjectWorkspace() {
   const activeTaskId = runState.activeTaskId;
   const recoveringTaskId = runState.recoveringTaskId;
   const runStatus = runState.run?.status;
+  const compactIdePanel = rightPanelWidth < 430;
 
   useEffect(() => { streamCursorRef.current = runState.cursor; }, [runState.cursor]);
   useEffect(() => { selectedRunIdRef.current = runState.selectedRunId; }, [runState.selectedRunId]);
@@ -103,6 +132,8 @@ export default function ProjectWorkspace() {
       const parsed = Number(savedWidth);
       if (parsed >= 320 && parsed <= window.innerWidth * 0.75) setRightPanelWidth(parsed);
     }
+    const savedLeftWidth = localStorage.getItem("workspace:leftPanelWidth");
+    if (savedLeftWidth !== null) setLeftPanelWidth(Math.min(360, Math.max(64, Number(savedLeftWidth))));
   }, []);
 
   const toggleLeftSidebar = () => {
@@ -112,6 +143,17 @@ export default function ProjectWorkspace() {
       return next;
     });
   };
+
+  useEffect(() => {
+    if (!isResizingLeft) return;
+    const move = (event: PointerEvent) => {
+      const width = Math.min(360, Math.max(64, event.clientX));
+      setLeftPanelWidth(width); localStorage.setItem("workspace:leftPanelWidth", String(width));
+    };
+    const stop = () => setIsResizingLeft(false);
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", stop);
+    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); };
+  }, [isResizingLeft]);
 
   // Mouse drag handler for dynamic right panel width resizing
   useEffect(() => {
@@ -138,24 +180,90 @@ export default function ProjectWorkspace() {
     setWorkspaceError("");
     const runQuery = selectedRunIdRef.current ? `?run_id=${encodeURIComponent(selectedRunIdRef.current)}` : "";
     const results = await Promise.allSettled([
-      apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree`),
+      apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree${runQuery}`),
       apiFetch<{ diff: string }>(`/projects/${projectId}/workspace/diff${runQuery}`),
+      apiFetch<WorkspaceStatus>(`/projects/${projectId}/workspace/status${runQuery}`),
       apiFetch<Artifact[]>(`/projects/${projectId}/artifacts`),
       apiFetch<Deployment[]>(`/projects/${projectId}/deployments`),
     ]);
-    const [treeResult, diffResult, artifactResult, deploymentResult] = results;
+    const [treeResult, diffResult, statusResult, artifactResult, deploymentResult] = results;
     if (treeResult.status === "fulfilled") setEntries(treeResult.value);
     if (diffResult.status === "fulfilled") setDiffContent(diffResult.value.diff);
+    if (statusResult.status === "fulfilled") setWorkspaceStatus(statusResult.value);
     if (artifactResult.status === "fulfilled") setArtifacts(artifactResult.value);
     if (deploymentResult.status === "fulfilled") setDeployments(deploymentResult.value);
-    const labels = ["Files", "Diff", "Artifacts", "Deployments"];
+    const labels = ["Files", "Diff", "Git status", "Artifacts", "Deployments"];
     const failures = results.flatMap((result, index) => result.status === "rejected" ? [`${labels[index]}: ${result.reason instanceof Error ? result.reason.message : "request failed"}`] : []);
     setWorkspaceError(failures.join(" · "));
+    try { setTerminalSessions(await apiFetch<TerminalSession[]>(`/projects/${projectId}/terminal`)); } catch { /* terminal is optional */ }
   }, [projectId]);
+
+  const runTerminalCommand = useCallback(async (event: FormEvent) => {
+    event.preventDefault();
+    if (!terminalCommand.trim() || terminalSubmitting) return;
+    setTerminalSubmitting(true); setWorkspaceError("");
+    try {
+      const result = await apiFetch<{ session: TerminalSession }>(`/projects/${projectId}/terminal`, {
+        method: "POST", body: JSON.stringify({ command: terminalCommand.trim(), cwd: terminalCwd || ".", run_id: selectedRunIdRef.current }),
+      });
+      setTerminalSessions((current) => [result.session, ...current.filter((item) => item.id !== result.session.id)]);
+      setTerminalCommand("");
+    } catch (caught) { setWorkspaceError(caught instanceof Error ? caught.message : "Could not start terminal command"); }
+    finally { setTerminalSubmitting(false); }
+  }, [projectId, terminalCommand, terminalCwd, terminalSubmitting]);
+
+  useEffect(() => {
+    if (!showRightPanel || rightPanelTab !== "terminal") return;
+    const refresh = () => void apiFetch<TerminalSession[]>(`/projects/${projectId}/terminal`).then(setTerminalSessions).catch(() => undefined);
+    const timer = window.setInterval(refresh, 1500);
+    return () => window.clearInterval(timer);
+  }, [projectId, rightPanelTab, showRightPanel]);
+
+  const searchWorkspace = useCallback(async (event: FormEvent) => {
+    event.preventDefault();
+    const query = workspaceSearchQuery.trim();
+    if (!query) { setWorkspaceSearchResults([]); return; }
+    try {
+      const runQuery = selectedRunIdRef.current ? `&run_id=${encodeURIComponent(selectedRunIdRef.current)}` : "";
+      setWorkspaceSearchResults(await apiFetch<WorkspaceSearchResult[]>(`/projects/${projectId}/workspace/search?query=${encodeURIComponent(query)}${runQuery}`));
+    } catch (caught) {
+      setWorkspaceError(caught instanceof Error ? caught.message : "Could not search workspace");
+    }
+  }, [projectId, workspaceSearchQuery]);
+
+  const createSchedule = useCallback(async (event: FormEvent) => {
+    event.preventDefault();
+    if (!schedulePrompt.trim() || scheduleSubmitting) return;
+    setScheduleSubmitting(true);
+    try {
+      await apiFetch<AgentSchedule>(`/projects/${projectId}/schedules`, {
+        method: "POST",
+        body: JSON.stringify({ prompt: schedulePrompt.trim(), interval_seconds: Number(scheduleInterval), enabled: true }),
+      });
+      setSchedulePrompt("");
+      await loadSchedules();
+    } catch (caught) { setWorkspaceError(caught instanceof Error ? caught.message : "Could not create schedule"); }
+    finally { setScheduleSubmitting(false); }
+  }, [projectId, scheduleInterval, schedulePrompt, scheduleSubmitting, loadSchedules]);
+
+  const toggleSchedule = useCallback(async (schedule: AgentSchedule) => {
+    try {
+      await apiFetch<AgentSchedule>(`/schedules/${schedule.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !schedule.enabled }) });
+      await loadSchedules();
+    } catch (caught) { setWorkspaceError(caught instanceof Error ? caught.message : "Could not update schedule"); }
+  }, [loadSchedules]);
+
+  const removeSchedule = useCallback(async (schedule: AgentSchedule) => {
+    try {
+      await apiFetch<void>(`/schedules/${schedule.id}`, { method: "DELETE" });
+      await loadSchedules();
+    } catch (caught) { setWorkspaceError(caught instanceof Error ? caught.message : "Could not delete schedule"); }
+  }, [loadSchedules]);
 
   const openFile = useCallback(async (path: string) => {
     try {
-      const file = await apiFetch<{ content: string }>(`/projects/${projectId}/workspace/files?path=${encodeURIComponent(path)}`);
+      const runQuery = selectedRunIdRef.current ? `&run_id=${encodeURIComponent(selectedRunIdRef.current)}` : "";
+      const file = await apiFetch<{ content: string }>(`/projects/${projectId}/workspace/files?path=${encodeURIComponent(path)}${runQuery}`);
       setSelectedFile(path);
       setFileContent(file.content);
     } catch (caught) { setWorkspaceError(caught instanceof Error ? caught.message : "Could not read file"); }
@@ -170,16 +278,29 @@ export default function ProjectWorkspace() {
       ]);
       setProject(projectData); setInstances(instanceData);
       setRuns(runsData);
+      void loadSchedules();
       if (runsData.length > 0) {
         const selected = runsData.find((run) => ACTIVE_RUN_STATUSES.has(run.status)) || runsData[0];
-        const events = await apiFetch<ToolEvent[]>(`/runs/${selected.id}/events`);
+        setActiveThreadId(selected.thread_id || null);
         selectedRunIdRef.current = selected.id;
-        hydrateRun(selected, events);
+        void loadSubtasks(selected.id);
+        const events = await apiFetch<ToolEvent[]>(`/runs/${selected.id}/events`);
+        if (selected.thread_id) {
+          try {
+            const threadTranscript = await fetchThreadTranscript(projectId, selected.thread_id);
+            const priorTranscript = threadTranscript.filter((m) => !String(m.id).startsWith(`${selected.id}-`));
+            hydrateRun(selected, events, priorTranscript);
+          } catch {
+            hydrateRun(selected, events);
+          }
+        } else {
+          hydrateRun(selected, events);
+        }
       }
       void loadWorkspaceDetails();
     } catch (caught) { setPageError(caught instanceof Error ? caught.message : "Could not load project"); }
     finally { setBootLoading(false); }
-  }, [projectId, loadWorkspaceDetails, hydrateRun]);
+  }, [projectId, loadWorkspaceDetails, hydrateRun, loadSubtasks, loadSchedules]);
 
   useEffect(() => {
     // State changes occur after the API promises resolve.
@@ -203,7 +324,7 @@ export default function ProjectWorkspace() {
     const sequence = ++discoverySequence.current;
     setDetectingDatabases(true); setDiscoveryMessage(""); setDetectedDatabases([]); setDbName("");
     try {
-      const result = await apiFetch<{ status: string; databases: string[]; suggested_username: string; message?: string }>("/instances/detect", {
+      const result = await apiFetch<{ status: string; databases: string[]; suggested_db?: string; suggested_username: string; message?: string }>("/instances/detect", {
         method: "POST",
         body: JSON.stringify({ url: normalizedUrl, erp_type: "odoo" }),
       });
@@ -213,6 +334,9 @@ export default function ProjectWorkspace() {
       if (databases.length === 1) {
         setDbName(databases[0]);
         setDiscoveryMessage(`Database “${databases[0]}” selected automatically.`);
+      } else if (result.suggested_db) {
+        setDbName(result.suggested_db);
+        setDiscoveryMessage(result.message || `Database “${result.suggested_db}” suggested from URL.`);
       } else if (databases.length > 1) {
         setDiscoveryMessage(`${databases.length} databases found. Select one to continue.`);
       } else {
@@ -249,8 +373,8 @@ export default function ProjectWorkspace() {
 
   const autoSelectFirstFile = useCallback(async () => {
     try {
-      const treeData = await apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree`);
       const runQuery = selectedRunIdRef.current ? `?run_id=${encodeURIComponent(selectedRunIdRef.current)}` : "";
+      const treeData = await apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree${runQuery}`);
       const diffData = await apiFetch<{ diff: string }>(`/projects/${projectId}/workspace/diff${runQuery}`);
       setEntries(treeData);
       setDiffContent(diffData.diff);
@@ -269,46 +393,112 @@ export default function ProjectWorkspace() {
     streamAbortRef.current?.abort();
     const controller = new AbortController();
     streamAbortRef.current = controller;
+    let isActive = true;
+
     void followRun(activeRunId, (runEvent) => {
+      if (runEvent.sequence > streamCursorRef.current) {
+        streamCursorRef.current = runEvent.sequence;
+      }
       receiveRunEvent(runEvent);
       if (runEvent.event_type === "final_report") void autoSelectFirstFile();
     }, { after: streamCursorRef.current, signal: controller.signal, onConnectionState: setConnection })
       .then((run) => {
+        if (!isActive) return;
         setRun(run);
         setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+        if (ACTIVE_RUN_STATUSES.has(run.status) && !run.status.startsWith("awaiting_")) {
+          setStreamAttempt((v) => v + 1);
+        }
       })
       .catch((caught) => {
-        if (!controller.signal.aborted) setRunError(caught instanceof Error ? caught.message : "Agent stream failed");
+        if (isActive && !controller.signal.aborted) {
+          setRunError(caught instanceof Error ? caught.message : "Agent stream failed");
+        }
       });
-    return () => controller.abort();
+    return () => {
+      isActive = false;
+      controller.abort();
+    };
   }, [activeRunId, autoSelectFirstFile, receiveRunEvent, runStatus, setConnection, setRun, setRunError, streamAttempt]);
+
+  // Background status reconciliation loop for active runs
+  useEffect(() => {
+    if (!activeRunId || !runStatus || !ACTIVE_RUN_STATUSES.has(runStatus)) return;
+    const interval = setInterval(async () => {
+      try {
+        const current = await apiFetch<AgentRun>(`/runs/${activeRunId}`);
+        if (current.status !== runStatus) {
+          setRun(current);
+          setRuns((prev) => prev.map((item) => item.id === current.id ? current : item));
+        }
+      } catch {
+        // silent background poll
+      }
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [activeRunId, runStatus, setRun]);
+
+  useEffect(() => {
+    const selected = runState.selectedRunId;
+    if (!selected) return;
+    const initial = window.setTimeout(() => void loadSubtasks(selected), 0);
+    if (!activeRunId) return () => window.clearTimeout(initial);
+    const interval = window.setInterval(() => void loadSubtasks(selected), 1500);
+    return () => { window.clearTimeout(initial); window.clearInterval(interval); };
+  }, [activeRunId, loadSubtasks, runState.selectedRunId]);
 
   const send = async (event: FormEvent) => {
     event.preventDefault();
     const text = message.trim(); if (!text || pending || activeRunId) return;
     setMessage(""); setPageError(""); setSubmittingRun(true);
+    const targetThreadId = activeThreadId || runState.run?.thread_id || undefined;
     try {
       const run = await apiFetch<AgentRun>(`/projects/${projectId}/runs`, {
         method: "POST",
-        body: JSON.stringify({ message: text })
+        body: JSON.stringify({
+          message: text,
+          workspace_mode: workspaceMode,
+          thread_id: targetThreadId,
+          attachments,
+        })
       });
+      setActiveThreadId(run.thread_id || null);
+      selectedRunIdRef.current = run.id;
       setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
-      hydrateRun(run, []);
+      setSubtasks([]);
+      if (targetThreadId && run.thread_id === targetThreadId && runState.transcript.length > 0) {
+        continueRun(run);
+      } else {
+        hydrateRun(run, []);
+      }
+      setAttachments([]);
     } catch (caught) {
       setPageError(caught instanceof Error ? caught.message : "Agent request failed");
     } finally { setSubmittingRun(false); }
   };
 
-  const decide = async (decision: "approve" | "reject", autoApproveTask = false) => {
+  const addFiles = async (files: FileList | File[]) => {
+    const selectedFiles = Array.from(files);
+    const incoming = selectedFiles.filter((file) => file.size <= 25 * 1024 * 1024).slice(0, 10 - attachments.length);
+    if (incoming.length !== selectedFiles.length) setPageError("Attachments must be 25 MB or smaller, with a maximum of 10 files.");
+    const loaded = await Promise.all(incoming.map(async (file) => ({
+      name: file.name, type: file.type || "application/octet-stream", content: await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result || "")); reader.onerror = () => reject(reader.error); reader.readAsDataURL(file); }),
+      text: file.type.startsWith("text/") ? await file.text() : undefined,
+    })));
+    setAttachments((current) => [...current, ...loaded]);
+  };
+
+  const decide = async (decision: "approve" | "reject", autoApproveTask = false, remember = false) => {
     if (!pending) return;
     const action = pending; setDeciding(true); setPageError("");
     try {
       const run = await apiFetch<AgentRun>(`/actions/${action.id}/decision`, {
         method: "POST",
-        body: JSON.stringify({ decision, auto_approve_task: autoApproveTask }),
+        body: JSON.stringify({ decision, auto_approve_task: autoApproveTask, remember }),
       });
       setRun(run);
       setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+      setStreamAttempt((v) => v + 1);
     } catch (caught) {
       setPageError(caught instanceof Error ? caught.message : "Decision failed");
     } finally { setDeciding(false); }
@@ -327,6 +517,7 @@ export default function ProjectWorkspace() {
       setQuestionAnswer("");
       setRun(run);
       setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+      setStreamAttempt((v) => v + 1);
     } catch (caught) {
       setPageError(caught instanceof Error ? caught.message : "Failed to submit answer");
     } finally { setSubmittingAnswer(false); }
@@ -357,10 +548,20 @@ export default function ProjectWorkspace() {
 
   const handleDeleteRun = async (runId: string) => {
     if (runId === activeRunId) return;
+    const targetRun = runs.find((r) => r.id === runId);
     try {
-      await deleteRun(runId);
-      setRuns((prev) => prev.filter((r) => r.id !== runId));
-      if (runState.selectedRunId === runId) clearRun();
+      if (targetRun?.thread_id) {
+        await deleteThread(projectId, targetRun.thread_id).catch(() => deleteRun(runId));
+        setRuns((prev) => prev.filter((r) => r.thread_id ? r.thread_id !== targetRun.thread_id : r.id !== runId));
+        if (runState.run?.thread_id === targetRun.thread_id || runState.selectedRunId === runId) {
+          setActiveThreadId(null);
+          clearRun();
+        }
+      } else {
+        await deleteRun(runId);
+        setRuns((prev) => prev.filter((r) => r.id !== runId));
+        if (runState.selectedRunId === runId) clearRun();
+      }
     } catch (caught) {
       setPageError(caught instanceof Error ? caught.message : "Failed to delete run");
     }
@@ -372,27 +573,51 @@ export default function ProjectWorkspace() {
     setPageError("");
     try {
       const newRun = await apiFetch<AgentRun>(`/runs/${targetId}/retry`, { method: "POST" });
+      selectedRunIdRef.current = newRun.id;
       setRun(newRun);
       setRuns((prev) => [newRun, ...prev.filter((r) => r.id !== newRun.id)]);
       setStreamAttempt((v) => v + 1);
+      void loadWorkspaceDetails();
     } catch (err) {
       setPageError(err instanceof Error ? err.message : "Failed to retry run");
     }
   };
 
   const openRun = async (run: AgentRun) => {
-    if (activeRunId && run.id !== activeRunId) return;
+    streamAbortRef.current?.abort();
     try {
-      const events = await apiFetch<ToolEvent[]>(`/runs/${run.id}/events`);
-      hydrateRun(run, events);
+      setActiveThreadId(run.thread_id || null);
+      selectedRunIdRef.current = run.id;
+      void loadSubtasks(run.id);
+      void loadWorkspaceDetails();
       setShowHistoryModal(false);
+
+      const events = await apiFetch<ToolEvent[]>(`/runs/${run.id}/events`);
+      if (run.thread_id) {
+        try {
+          const threadTranscript = await fetchThreadTranscript(projectId, run.thread_id);
+          const priorTranscript = threadTranscript.filter((m) => !String(m.id).startsWith(`${run.id}-`));
+          hydrateRun(run, events, priorTranscript);
+          return;
+        } catch {
+          // fallback to single run events if thread fetch fails
+        }
+      }
+      hydrateRun(run, events);
     } catch (caught) { setPageError(caught instanceof Error ? caught.message : "Failed to open run"); }
   };
 
   const startNewChat = () => {
-    if (activeRunId || deciding) return;
+    // Read-only runs are safe to leave running in the background while a new
+    // conversation is opened. Write runs remain project-serialized.
+    if ((activeRunId && runState.run?.intent !== "read_only") || deciding) return;
+    streamAbortRef.current?.abort();
+    selectedRunIdRef.current = null;
+    setActiveThreadId(null);
     clearRun();
+    setSubtasks([]);
     setMessage(""); setQuestionAnswer(""); setPageError("");
+    void loadWorkspaceDetails();
   };
 
   const handleStopRun = async () => {
@@ -461,23 +686,38 @@ export default function ProjectWorkspace() {
   );
 
   return (
-    <div className={`flex h-[100dvh] overflow-hidden ${isResizingRight ? "select-none" : ""}`}>
+    <div className={`flex h-[100dvh] overflow-hidden ${isResizingRight || isResizingLeft ? "select-none" : ""}`}>
       {/* Collapsible Left Sub-Sidebar */}
       {showLeftSidebar && <button className="fixed inset-0 z-20 bg-black/60 xl:hidden" onClick={toggleLeftSidebar} aria-label="Close project navigation overlay" />}
       {showLeftSidebar && (
-        <aside className="fixed inset-y-0 left-0 z-30 w-64 shrink-0 border-r bg-black p-5 dark:border-white/10 xl:static">
-          <h1 className="text-xl font-bold truncate">{project.name}</h1>
-          <div className="mt-4 rounded-xl border p-3.5 dark:border-white/10">
+        <aside style={{ width: `${leftPanelWidth}px` }} className="project-navigation-panel relative inset-y-0 left-0 z-30 flex shrink-0 flex-col border-r bg-black p-3 dark:border-white/10 xl:w-auto">
+          <div className={leftPanelWidth < 180 ? "flex flex-col items-center gap-3 pt-2" : ""}>
+          {leftPanelWidth >= 180 && <h1 className="px-2 text-xl font-bold truncate">{project.name}</h1>}
+          <div className={leftPanelWidth < 180 ? "flex flex-col items-center gap-3" : "mt-4 rounded-xl border p-3.5 dark:border-white/10"} title={instances[0].url}>
             <Database className="mb-1.5 h-4 w-4 text-blue-600" />
-            <p className="truncate text-xs font-mono">{instances[0].url}</p>
-            <p className="mt-1 text-[10px] uppercase font-semibold text-gray-500">{instances[0].environment} · {instances[0].status}</p>
+            {leftPanelWidth >= 180 && <><p className="truncate text-xs font-mono">{instances[0].url}</p><p className="mt-1 text-[10px] uppercase font-semibold text-gray-500">{instances[0].environment} · {instances[0].status}</p></>}
           </div>
-          <Link href={`/projects/${projectId}/workspace`} className="mt-4 block rounded-xl border p-2.5 text-xs hover:bg-black/5 dark:border-white/10">
-            Workspace & lifecycle
-          </Link>
-          <Link href={`/projects/${projectId}/instances`} className="mt-2 block rounded-xl border p-2.5 text-xs hover:bg-black/5 dark:border-white/10">
-            Odoo connections
-          </Link>
+          <nav className={leftPanelWidth < 180 ? "mt-4 flex flex-col items-center gap-4" : "mt-4 space-y-2"}>
+            <Link title="Workspace & lifecycle" href={`/projects/${projectId}/workspace`} className="block rounded-xl border p-2.5 text-xs hover:bg-white/10 dark:border-white/10">{leftPanelWidth < 180 ? <Server className="h-4 w-4" /> : "Workspace & lifecycle"}</Link>
+            <Link title="Project settings & permissions" href={`/projects/${projectId}/settings`} className="block rounded-xl border p-2.5 text-xs hover:bg-white/10 dark:border-white/10">{leftPanelWidth < 180 ? <SlidersHorizontal className="h-4 w-4" /> : "Project settings & permissions"}</Link>
+            <Link title="Odoo connections" href={`/projects/${projectId}/instances`} className="block rounded-xl border p-2.5 text-xs hover:bg-white/10 dark:border-white/10">{leftPanelWidth < 180 ? <Database className="h-4 w-4" /> : "Odoo connections"}</Link>
+          </nav>
+          </div>
+          <div
+            onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); setIsResizingLeft(true); }}
+            onPointerMove={(event) => {
+              if (!isResizingLeft) return;
+              const panelLeft = event.currentTarget.parentElement?.getBoundingClientRect().left ?? 0;
+              const next = Math.min(360, Math.max(64, event.clientX - panelLeft));
+              setLeftPanelWidth(next);
+              localStorage.setItem("workspace:leftPanelWidth", String(next));
+            }}
+            onPointerUp={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); setIsResizingLeft(false); }}
+            onPointerCancel={() => setIsResizingLeft(false)}
+            onKeyDown={(event) => { if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return; event.preventDefault(); setLeftPanelWidth((width) => { const next = Math.min(360, Math.max(64, width + (event.key === "ArrowRight" ? 16 : -16))); localStorage.setItem("workspace:leftPanelWidth", String(next)); return next; }); }}
+            role="separator" aria-label="Resize project navigation" aria-orientation="vertical" aria-valuemin={64} aria-valuemax={360} aria-valuenow={Math.round(leftPanelWidth)} tabIndex={0}
+            className={`absolute inset-y-0 -right-2 z-30 hidden w-4 cursor-col-resize touch-none xl:block ${isResizingLeft ? "bg-blue-600/70" : "bg-transparent hover:bg-blue-500/60"}`}
+          />
         </aside>
       )}
 
@@ -500,7 +740,7 @@ export default function ProjectWorkspace() {
             <span className="text-xs font-semibold text-white">ERP Implementation Agent</span>
             <button
               onClick={() => void startNewChat()}
-              disabled={Boolean(activeRunId) || loading || deciding}
+              disabled={Boolean(activeRunId && runState.run?.intent !== "read_only") || loading && runState.run?.intent !== "read_only" || deciding}
               className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] font-medium text-gray-400 transition hover:bg-white/10 hover:text-white active:scale-95 disabled:opacity-40"
             >
               <Plus className="h-3 w-3" />
@@ -511,8 +751,12 @@ export default function ProjectWorkspace() {
               className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] font-medium text-gray-400 transition hover:bg-white/10 hover:text-white active:scale-95"
             >
               <History className="h-3 w-3 text-purple-400" />
-              History ({runs.length})
+              History ({new Set(runs.map((r) => r.thread_id || r.id)).size})
             </button>
+            <label className="hidden items-center gap-1.5 text-[10px] text-gray-500 sm:flex" title="Run implementation work in an isolated Git worktree">
+              <input type="checkbox" checked={workspaceMode === "isolated"} onChange={(event) => setWorkspaceMode(event.target.checked ? "isolated" : "local")} disabled={loading || Boolean(activeRunId)} />
+              Isolated worktree
+            </label>
           </div>
           <div className="flex items-center gap-4">
             {tokenInputs > 0 && <span className="font-mono text-[10px] text-gray-500">{tokenInputs.toLocaleString()} input tokens</span>}
@@ -564,144 +808,340 @@ export default function ProjectWorkspace() {
         )}
 
         <div className="flex-1 space-y-4 overflow-y-auto p-6">
-          <AnimatePresence initial={false}>
-            {chat.filter((item: ChatMessage) => item.role !== "agent" || item.content.trim()).map((item: ChatMessage, index: number, arr: ChatMessage[]) => {
-              const isCurrentStreaming = loading && index === arr.length - 1 && item.role === "agent";
-              const prevRole = index > 0 ? arr[index - 1].role : null;
-              const isFirstInGroup = item.role !== prevRole;
-              return (
-                <motion.div
-                  key={`${item.id || "new"}-${index}`}
-                  initial={{ opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
-                  className={`flex ${item.role === "user" ? "justify-end" : "justify-start"}`}
-                >
-                  {item.role === "agent" ? (
-                    <div className="flex min-w-0 max-w-[82%] items-start gap-3">
-                      {/* Bot avatar — only on first message in a sequence */}
-                      <div className={`mt-0.5 shrink-0 transition-opacity ${isFirstInGroup ? "opacity-100" : "opacity-0"}`}>
-                        <div className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-600/15">
-                          <Bot className="h-3.5 w-3.5 text-blue-400" />
+          {/* Welcome & Context Awareness Card (Empty State) */}
+          {chat.length === 0 && !loading && !activeRunId && (
+            <motion.div
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+              className="mx-auto max-w-2xl py-6 space-y-5"
+            >
+              {/* Header */}
+              <div className="text-center space-y-2">
+                <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-600 shadow-lg shadow-blue-500/20 mb-1">
+                  <Sparkles className="h-6 w-6 text-white" />
+                </div>
+                <h2 className="text-xl font-bold text-white tracking-tight">
+                  Welcome to {project?.name || "ERP Implementation Agent"}
+                </h2>
+                <p className="text-xs text-slate-400 max-w-md mx-auto leading-relaxed">
+                  Your AI engineering partner for {instances[0]?.erp_type === "pri_erp" ? "PRI ERP" : "Odoo 19"}.
+                  I inspect real schemas, formulate plans, and ask for confirmation before modifying code.
+                </p>
+              </div>
+
+              {/* Connected ERP Awareness Card */}
+              {instances[0] && (
+                <div className="rounded-2xl border border-white/10 bg-slate-900/80 p-4 shadow-sm backdrop-blur-sm space-y-3">
+                  <div className="flex items-center justify-between border-b border-white/5 pb-2.5">
+                    <span className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                      <Server className="h-3.5 w-3.5 text-blue-400" />
+                      Connected ERP Environment
+                    </span>
+                    <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-400 bg-emerald-500/10 px-2.5 py-0.5 rounded-full border border-emerald-500/20">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                      Active & Connected
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 text-xs">
+                    <div className="space-y-0.5">
+                      <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Server URL</span>
+                      <p className="font-mono text-slate-200 truncate">{instances[0].url}</p>
+                    </div>
+                    <div className="space-y-0.5">
+                      <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Active Database</span>
+                      <p className="font-mono font-semibold text-blue-400">{instances[0].db_name || "Default"}</p>
+                    </div>
+                    <div className="space-y-0.5">
+                      <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Engine / Version</span>
+                      <p className="text-slate-300">
+                        {instances[0].version_info?.server_version ? `Odoo ${String(instances[0].version_info.server_version)}` : "Odoo 19.0"}
+                        {instances[0].version_info?.server_edition ? ` (${String(instances[0].version_info.server_edition)})` : ""}
+                      </p>
+                    </div>
+                    <div className="space-y-0.5">
+                      <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Environment & Auth</span>
+                      <p className="text-slate-300 capitalize">{instances[0].environment} · {instances[0].auth_method?.toUpperCase()}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Safety & Grounding Callout */}
+              <div className="flex items-start gap-3 rounded-xl border border-blue-500/20 bg-blue-950/20 p-3.5 text-xs text-blue-300">
+                <Shield className="h-4 w-4 shrink-0 text-blue-400 mt-0.5" />
+                <p className="leading-relaxed">
+                  <strong className="text-blue-200">Safety & Grounding Guarantee:</strong> I will never modify files or write code randomly. For general chats, I will explain and clarify. When building, I inspect your schema first, propose a structured plan, and require your confirmation before any changes.
+                </p>
+              </div>
+
+              {/* Starter Prompts */}
+              <div className="space-y-2">
+                <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Suggested Starters</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {[
+                    {
+                      icon: Search,
+                      title: "Inspect Database & Apps",
+                      desc: "List installed modules, models, and current settings",
+                      prompt: "Inspect the connected database and show installed modules and system status.",
+                    },
+                    {
+                      icon: Database,
+                      title: "Review Existing Models",
+                      desc: "Inspect models and fields before planning customizations",
+                      prompt: "Inspect existing Odoo models and fields to understand current capabilities.",
+                    },
+                    {
+                      icon: Lightbulb,
+                      title: "Plan a Custom Feature",
+                      desc: "Design a new workflow (I will propose a plan first)",
+                      prompt: "Help me plan a custom module for my business workflow. Inspect what we have first.",
+                    },
+                    {
+                      icon: HelpCircle,
+                      title: "Ask a Question",
+                      desc: "Learn about Odoo 19 architecture, OWL, or deployment",
+                      prompt: "How does the Odoo 19 module build and deployment workflow work in this workspace?",
+                    },
+                  ].map((starter, i) => {
+                    const Icon = starter.icon;
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => {
+                          setMessage(starter.prompt);
+                          inputRef.current?.focus();
+                        }}
+                        className="group flex items-start gap-3 rounded-xl border border-white/5 bg-slate-900/60 p-3 text-left transition hover:border-blue-500/40 hover:bg-slate-800/80 active:scale-[0.98]"
+                      >
+                        <div className="rounded-lg bg-blue-500/10 p-2 text-blue-400 group-hover:bg-blue-500/20 group-hover:text-blue-300 transition">
+                          <Icon className="h-4 w-4" />
                         </div>
-                      </div>
-                      {/* Message content — flat, no bubble */}
-                      <div className="min-w-0 flex-1 pb-1">
-                        <MessageContent
-                          content={item.content}
-                          projectId={projectId}
-                          isStreaming={isCurrentStreaming}
-                        />
+                        <div className="space-y-0.5">
+                          <p className="text-xs font-semibold text-slate-200 group-hover:text-white transition">{starter.title}</p>
+                          <p className="text-[11px] text-slate-400 leading-snug">{starter.desc}</p>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {/* Messages & Turn Structure (Antigravity flow: Prompt -> Tool Execution Steps -> Generated Summary Below) */}
+          {(() => {
+            const validMessages = chat.filter((item: ChatMessage) => item.role !== "agent" || item.content.trim());
+            const lastUserIndex = validMessages.map((m) => m.role).lastIndexOf("user");
+
+            const renderSingleMessage = (item: ChatMessage, index: number, isCurrentStreaming: boolean, isFirstInGroup: boolean) => (
+              <motion.div
+                key={`${item.id || "msg"}-${index}`}
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+                className={`flex ${item.role === "user" ? "justify-end" : "justify-start"}`}
+              >
+                {item.role === "agent" ? (
+                  <div className="flex min-w-0 max-w-[82%] items-start gap-3">
+                    {/* Bot avatar — only on first message in a sequence */}
+                    <div className={`mt-0.5 shrink-0 transition-opacity ${isFirstInGroup ? "opacity-100" : "opacity-0"}`}>
+                      <div className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-600/15">
+                        <Bot className="h-3.5 w-3.5 text-blue-400" />
                       </div>
                     </div>
-                  ) : (
-                    <div className="max-w-[75%] rounded-2xl bg-blue-600 px-4 py-3 text-sm text-white shadow-xs">
+                    {/* Message content — flat, no bubble */}
+                    <div className="min-w-0 flex-1 pb-1">
                       <MessageContent
                         content={item.content}
                         projectId={projectId}
-                        isStreaming={false}
+                        isStreaming={isCurrentStreaming}
                       />
                     </div>
-                  )}
-                </motion.div>
-              );
-            })}
-          </AnimatePresence>
-
-          {/* Activity Stepper */}
-          <ActivityStepper
-            steps={steps}
-            usage={usage}
-            supervisorTaskGraph={supervisorTaskGraph}
-            activeTaskId={activeTaskId}
-            recoveringTaskId={recoveringTaskId}
-            planItems={runState.planItems}
-            onOpenDiff={() => {
-              setShowRightPanel(true);
-              setRightPanelTab("diff");
-            }}
-            onOpenFile={(filepath) => {
-              setShowRightPanel(true);
-              setRightPanelTab("code");
-              void openFile(filepath);
-            }}
-          />
-
-          {/* Thinking Text (Protocol 2 — muted italic inline) */}
-          <AnimatePresence>
-            {thinkingText && loading && (
-              <motion.p
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="max-w-2xl pl-9 text-xs italic text-gray-400 dark:text-gray-500"
-              >
-                {thinkingText}
-              </motion.p>
-            )}
-          </AnimatePresence>
-
-          {/* Pending Approval Card */}
-          <AnimatePresence>
-            {pending && (
-              <motion.div
-                initial={{ opacity: 0, scale: 0.96, y: 8 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.96, y: 4 }}
-                transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-                className="max-w-2xl"
-              >
-                <ApprovalCard action={pending} busy={deciding} onDecision={(decision, autoApprove) => void decide(decision, autoApprove)} />
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {/* Question Card (Protocol 3) */}
-          <AnimatePresence>
-            {agentQuestion && (
-              <motion.div
-                initial={{ opacity: 0, scale: 0.96, y: 8 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.96, y: 4 }}
-                transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-                className="max-w-2xl rounded-2xl border border-blue-400/60 bg-blue-50/90 p-5 text-sm shadow-sm backdrop-blur-md dark:border-blue-500/30 dark:bg-blue-950/30"
-              >
-                <div className="flex items-center gap-2 font-semibold text-blue-800 dark:text-blue-300">
-                  <Brain className="h-5 w-5 text-blue-500 dark:text-blue-400" />
-                  <span>Agent needs clarification</span>
-                </div>
-                <p className="mt-2.5 text-sm text-blue-900/90 dark:text-blue-100/90">{agentQuestion.question}</p>
-                {agentQuestion.options.length > 0 && (
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {agentQuestion.options.map((opt: string, i: number) => (
-                      <button
-                        key={i}
-                        onClick={() => setQuestionAnswer(opt)}
-                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition ${questionAnswer === opt ? "border-blue-500 bg-blue-600 text-white" : "border-blue-200 bg-white/80 text-blue-800 hover:bg-blue-50 dark:border-blue-500/30 dark:bg-blue-900/30 dark:text-blue-200"}`}
-                      >
-                        {opt}
-                      </button>
-                    ))}
+                  </div>
+                ) : (
+                  <div className="max-w-[75%] rounded-2xl bg-blue-600 px-4 py-3 text-sm text-white shadow-xs">
+                    <MessageContent
+                      content={item.content}
+                      projectId={projectId}
+                      isStreaming={false}
+                    />
                   </div>
                 )}
-                <textarea
-                  value={questionAnswer}
-                  onChange={(e) => setQuestionAnswer(e.target.value)}
-                  placeholder="Type your answer here…"
-                  rows={2}
-                  className="mt-3 w-full rounded-xl border border-blue-200 bg-white/90 px-3 py-2 text-xs text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-400 dark:border-blue-500/30 dark:bg-blue-900/20 dark:text-gray-100"
-                />
-                <button
-                  disabled={!questionAnswer.trim() || submittingAnswer}
-                  onClick={() => void submitAnswer()}
-                  className="mt-3 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition hover:bg-blue-500 active:scale-95 disabled:opacity-40"
-                >
-                  {submittingAnswer && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                  Submit Answer
-                </button>
               </motion.div>
-            )}
-          </AnimatePresence>
+            );
+
+            const executionTrace = (
+              <div key="execution-trace" className="space-y-3">
+                {/* Activity Stepper */}
+                <ActivityStepper
+                  steps={steps}
+                  usage={usage}
+                  supervisorTaskGraph={supervisorTaskGraph}
+                  activeTaskId={activeTaskId}
+                  recoveringTaskId={recoveringTaskId}
+                  planItems={runState.planItems}
+                  inspectionOnly={runState.run?.intent === "read_only"}
+                  onOpenDiff={() => {
+                    setShowRightPanel(true);
+                    setRightPanelTab("diff");
+                  }}
+                  onOpenFile={(filepath) => {
+                    setShowRightPanel(true);
+                    setRightPanelTab("code");
+                    void openFile(filepath);
+                  }}
+                />
+
+                {subtasks.length > 0 && (
+                  <section className="max-w-2xl rounded-xl border border-cyan-500/20 bg-cyan-950/10 p-3.5" aria-label="Child agent executions">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-cyan-200">Child agents</span>
+                      <span className="font-mono text-[10px] text-cyan-300">
+                        {subtasks.filter((item) => item.status === "succeeded").length}/{subtasks.length} complete
+                      </span>
+                    </div>
+                    <ul className="mt-2 space-y-1.5">
+                      {subtasks.map((item) => (
+                        <li key={item.id} className="flex items-center justify-between gap-3 text-[11px]">
+                          <span className={item.status === "failed" ? "text-red-300" : item.status === "succeeded" ? "text-gray-500 line-through" : "text-cyan-100"}>
+                            {item.title}
+                          </span>
+                          <span className="shrink-0 font-mono text-[10px] text-gray-500">{item.role.replace(/_/g, " ")} · {item.status}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                )}
+
+                {/* Thinking Text (Protocol 2 — muted italic inline) */}
+                <AnimatePresence>
+                  {thinkingText && loading && (
+                    <motion.p
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="max-w-2xl pl-9 text-xs italic text-gray-400 dark:text-gray-500"
+                    >
+                      {thinkingText}
+                    </motion.p>
+                  )}
+                </AnimatePresence>
+
+                {/* Pending Approval Card */}
+                <AnimatePresence>
+                  {pending && (
+                    <motion.div
+                      initial={{ opacity: 0, scale: 0.96, y: 8 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.96, y: 4 }}
+                      transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+                      className="max-w-2xl"
+                    >
+                      <ApprovalCard action={pending} busy={deciding} onDecision={(decision, autoApprove, remember) => void decide(decision, autoApprove, remember)} />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
+                {/* Question Card (Protocol 3) */}
+                <AnimatePresence>
+                  {agentQuestion && (
+                    <motion.div
+                      initial={{ opacity: 0, scale: 0.96, y: 8 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.96, y: 4 }}
+                      transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+                      className="max-w-2xl rounded-2xl border border-blue-400/60 bg-blue-50/90 p-5 text-sm shadow-sm backdrop-blur-md dark:border-blue-500/30 dark:bg-blue-950/30"
+                    >
+                      <div className="flex items-center gap-2 font-semibold text-blue-800 dark:text-blue-300">
+                        <Brain className="h-5 w-5 text-blue-500 dark:text-blue-400" />
+                        <span>Agent needs clarification</span>
+                      </div>
+                      <p className="mt-2.5 text-sm text-blue-900/90 dark:text-blue-100/90">{agentQuestion.question}</p>
+                      {agentQuestion.options.length > 0 && (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {agentQuestion.options.map((opt: string, i: number) => (
+                            <button
+                              key={i}
+                              onClick={() => setQuestionAnswer(opt)}
+                              className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition ${questionAnswer === opt ? "border-blue-500 bg-blue-600 text-white" : "border-blue-200 bg-white/80 text-blue-800 hover:bg-blue-50 dark:border-blue-500/30 dark:bg-blue-900/30 dark:text-blue-200"}`}
+                            >
+                              {opt}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <textarea
+                        value={questionAnswer}
+                        onChange={(e) => setQuestionAnswer(e.target.value)}
+                        placeholder="Type your answer here…"
+                        rows={2}
+                        className="mt-3 w-full rounded-xl border border-blue-200 bg-white/90 px-3 py-2 text-xs text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-400 dark:border-blue-500/30 dark:bg-blue-900/20 dark:text-gray-100"
+                      />
+                      <button
+                        disabled={!questionAnswer.trim() || submittingAnswer}
+                        onClick={() => void submitAnswer()}
+                        className="mt-3 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition hover:bg-blue-500 active:scale-95 disabled:opacity-40"
+                      >
+                        {submittingAnswer && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                        Submit Answer
+                      </button>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            );
+
+            if (lastUserIndex === -1) {
+              return (
+                <>
+                  {executionTrace}
+                  <AnimatePresence initial={false}>
+                    {validMessages.map((item, index) => {
+                      const isCurrentStreaming = loading && index === validMessages.length - 1 && item.role === "agent";
+                      return renderSingleMessage(item, index, isCurrentStreaming, index === 0);
+                    })}
+                  </AnimatePresence>
+                </>
+              );
+            }
+
+            const priorMessages = validMessages.slice(0, lastUserIndex);
+            const currentTurnUser = validMessages[lastUserIndex];
+            const currentTurnAgentMessages = validMessages.slice(lastUserIndex + 1);
+
+            return (
+              <>
+                {/* 1. Prior chat history (if multi-turn) */}
+                <AnimatePresence initial={false}>
+                  {priorMessages.map((item, index) => {
+                    const prevRole = index > 0 ? priorMessages[index - 1].role : null;
+                    const isFirstInGroup = item.role !== prevRole;
+                    return renderSingleMessage(item, index, false, isFirstInGroup);
+                  })}
+                </AnimatePresence>
+
+                {/* 2. User Prompt for Current Turn */}
+                <AnimatePresence initial={false}>
+                  {renderSingleMessage(currentTurnUser, lastUserIndex, false, true)}
+                </AnimatePresence>
+
+                {/* 3. Antigravity Execution / Tool Steps / Stepper (ALWAYS ABOVE summary) */}
+                {executionTrace}
+
+                {/* 4. Generated Summary / Response (ALWAYS BELOW the tool execution trace) */}
+                <AnimatePresence initial={false}>
+                  {currentTurnAgentMessages.map((item, idx) => {
+                    const globalIndex = lastUserIndex + 1 + idx;
+                    const isCurrentStreaming = loading && idx === currentTurnAgentMessages.length - 1;
+                    return renderSingleMessage(item, globalIndex, isCurrentStreaming, idx === 0);
+                  })}
+                </AnimatePresence>
+              </>
+            );
+          })()}
 
           {/* Final Report Card (Protocol 4 — pinned, non-collapsible) */}
           {runStatus === "cancelled" && (
@@ -804,18 +1244,22 @@ export default function ProjectWorkspace() {
 
           <div ref={bottom} />
         </div>
-        <form onSubmit={send} className="border-t border-white/5 bg-zinc-900 p-3">
-          <div className="relative mx-auto max-w-4xl">
+        <form onSubmit={send} onDragOver={(event) => { event.preventDefault(); setDraggingFiles(true); }} onDragLeave={() => setDraggingFiles(false)} onDrop={(event) => { event.preventDefault(); setDraggingFiles(false); void addFiles(event.dataTransfer.files); }} className={`border-t border-white/5 bg-zinc-900 p-3 ${draggingFiles ? "bg-blue-950/40" : ""}`}>
+          <div className="relative mx-auto max-w-4xl rounded-2xl border border-white/10 bg-zinc-800 px-3 pt-2 shadow-2xl shadow-black/20 focus-within:border-blue-500/50">
+            <input ref={attachmentInput} type="file" multiple accept="image/*,.pdf,.txt,.md,.json,.csv,.xml,.py,.js,.ts" className="hidden" onChange={(event) => { if (event.target.files) void addFiles(event.target.files); event.target.value = ""; }} />
+            {attachments.length > 0 && <div className="mb-2 flex flex-wrap gap-1.5">{attachments.map((file, index) => <span key={`${file.name}-${index}`} className="flex max-w-60 items-center gap-1.5 rounded-lg border border-white/10 bg-zinc-950 px-2 py-1 text-[10px] text-gray-300">{file.type.startsWith("image/") ? <img src={file.content} alt="" className="h-6 w-6 rounded object-cover" /> : file.type === "application/pdf" ? <FileText className="h-4 w-4 shrink-0 text-red-300" /> : <ImageIcon className="h-4 w-4 shrink-0 text-gray-500" />}<span className="truncate">{file.name}</span><button type="button" onClick={() => setAttachments((current) => current.filter((_, item) => item !== index))} className="text-gray-500 hover:text-white" aria-label={`Remove ${file.name}`}>×</button></span>)}</div>}
             <textarea
+              ref={inputRef}
               rows={1}
               value={message}
               onChange={(e) => setMessage(e.target.value)}
               onKeyDown={handleKeyDown}
               disabled={!isInteractive || loading || Boolean(pending)}
               placeholder={pending ? "Resolve the pending action first" : runWorking ? "Agent is working…" : "Ask the agent… (⌘↵ to send)"}
-              className="w-full resize-none overflow-hidden rounded-2xl border border-white/10 bg-zinc-800 px-5 py-3 pr-12 text-sm text-white placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500/60"
+              className="w-full resize-none overflow-hidden bg-transparent px-2 py-2 pr-12 text-sm text-white placeholder:text-gray-500 focus:outline-none"
               style={{ fieldSizing: "content", maxHeight: "9rem" } as React.CSSProperties}
             />
+            <div className={`flex items-center gap-1 border-t border-white/5 py-2 ${draggingFiles ? "text-blue-300" : "text-gray-600"}`}><button type="button" onClick={() => attachmentInput.current?.click()} className="rounded-lg px-2 py-1 text-lg text-gray-400 hover:bg-white/10 hover:text-white" aria-label="Attach files" title="Attach files">＋</button><span className="text-[10px]">{draggingFiles ? "Release to attach files" : "Drop files, PDFs, or images here"}</span></div>
             {canStop ? (
               <button
                 type="button"
@@ -876,39 +1320,51 @@ export default function ProjectWorkspace() {
             <div className="flex items-center gap-1 text-xs">
               <button
                 onClick={() => setRightPanelTab("code")}
+                title="Code & Files"
                 className={`flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition ${
                   rightPanelTab === "code" ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"
                 }`}
               >
                 <Code2 className="h-3.5 w-3.5 text-purple-400" />
-                Code & Files
+                {!compactIdePanel && "Code & Files"}
               </button>
               <button
                 onClick={() => setRightPanelTab("diff")}
+                title="Git Diff"
                 className={`flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition ${
                   rightPanelTab === "diff" ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"
                 }`}
               >
                 <GitBranch className="h-3.5 w-3.5 text-blue-400" />
-                Git Diff
+                {!compactIdePanel && "Git Diff"}
+              </button>
+              <button
+                onClick={() => setRightPanelTab("terminal")}
+                title="Terminal"
+                className={`flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition ${rightPanelTab === "terminal" ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"}`}
+              >
+                <Terminal className="h-3.5 w-3.5 text-amber-400" />
+                {!compactIdePanel && "Terminal"}
               </button>
               <button
                 onClick={() => setRightPanelTab("memory")}
+                title="Memories"
                 className={`flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition ${
                   rightPanelTab === "memory" ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"
                 }`}
               >
                 <Brain className="h-3.5 w-3.5 text-amber-400" />
-                Memories
+                {!compactIdePanel && "Memories"}
               </button>
               <button
                 onClick={() => setRightPanelTab("evidence")}
+                title="Artifacts"
                 className={`flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition ${
                   rightPanelTab === "evidence" ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"
                 }`}
               >
                 <Layers className="h-3.5 w-3.5 text-emerald-400" />
-                Artifacts
+                {!compactIdePanel && "Artifacts"}
               </button>
             </div>
             <div className="flex items-center gap-2">
@@ -941,7 +1397,33 @@ export default function ProjectWorkspace() {
                 {/* File Tree */}
                 <div className="border-r border-white/10 bg-zinc-950 p-2 overflow-y-auto">
                   <div className="mb-2 text-[10px] font-semibold uppercase text-gray-500">Workspace Files</div>
-                  <WorkspaceFileTree projectId={projectId} entries={entries} selected={selectedFile} onOpen={(path) => void openFile(path)} onError={setWorkspaceError} />
+                  <form onSubmit={searchWorkspace} className="mb-2 flex gap-1">
+                    <input
+                      value={workspaceSearchQuery}
+                      onChange={(event) => setWorkspaceSearchQuery(event.target.value)}
+                      placeholder="Search files"
+                      aria-label="Search workspace files"
+                      className="min-w-0 flex-1 rounded border border-white/10 bg-zinc-900 px-2 py-1.5 text-[10px] text-white outline-none focus:border-blue-500"
+                    />
+                    <button type="submit" aria-label="Search workspace" className="rounded border border-white/10 px-2 text-xs text-cyan-300 hover:bg-white/10">⌕</button>
+                  </form>
+                  {workspaceSearchResults.length > 0 && (
+                    <ul className="mb-2 space-y-1 rounded border border-cyan-500/20 bg-cyan-950/10 p-1.5">
+                      {workspaceSearchResults.map((result, index) => (
+                        <li key={`${result.path}:${result.line}:${index}`}>
+                          <button
+                            type="button"
+                            className="block w-full truncate text-left font-mono text-[9px] text-cyan-300 hover:text-white"
+                            onClick={() => { setSelectedFile(result.path); void openFile(result.path); }}
+                          >
+                            {result.path}:{result.line}
+                          </button>
+                          <div className="truncate text-[9px] text-gray-500">{result.text}</div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <WorkspaceFileTree key={runState.selectedRunId || "base-workspace"} projectId={projectId} runId={runState.selectedRunId} entries={entries} selected={selectedFile} onOpen={(path) => void openFile(path)} onError={setWorkspaceError} />
                 </div>
                 {/* Code Viewer */}
                 <div className="flex-1 overflow-hidden">
@@ -951,8 +1433,31 @@ export default function ProjectWorkspace() {
             )}
 
             {rightPanelTab === "diff" && (
-              <div className="h-full">
+              <div className="flex h-full flex-col">
+                {workspaceStatus && <div className="border-b border-white/10 bg-zinc-950 px-3 py-2 text-[10px] text-gray-400"><div className="flex items-center justify-between"><span>Branch: <code className="text-blue-300">{workspaceStatus.branch}</code></span><span className={workspaceStatus.clean ? "text-emerald-400" : "text-amber-400"}>{workspaceStatus.clean ? "clean" : `${workspaceStatus.changes.length} change${workspaceStatus.changes.length === 1 ? "" : "s"}`}</span></div>{workspaceStatus.changes.length > 0 && <div className="mt-1 truncate text-gray-500">{workspaceStatus.changes.map((change) => change.path).join(" · ")}</div>}</div>}
+                <div className="min-h-0 flex-1">
                 <CodeDiffViewer path="Workspace Uncommitted / Commit Diff" content={diffContent || "No active diff changes in workspace."} isDiff={true} />
+                </div>
+              </div>
+            )}
+
+            {rightPanelTab === "terminal" && (
+              <div className="flex h-full flex-col bg-zinc-950 p-3">
+                <form onSubmit={runTerminalCommand} className="space-y-2">
+                  <input value={terminalCwd} onChange={(event) => setTerminalCwd(event.target.value)} aria-label="Terminal working directory" placeholder="Working directory (.)" className="w-full rounded border border-white/10 bg-zinc-900 px-2.5 py-2 font-mono text-xs text-white outline-none focus:border-blue-500" />
+                  <div className="flex gap-2">
+                    <input value={terminalCommand} onChange={(event) => setTerminalCommand(event.target.value)} aria-label="Terminal command" placeholder="Run a command (approval required)" className="min-w-0 flex-1 rounded border border-white/10 bg-zinc-900 px-2.5 py-2 font-mono text-xs text-white outline-none focus:border-blue-500" />
+                    <button disabled={terminalSubmitting || !terminalCommand.trim()} className="rounded bg-blue-600 px-3 text-xs text-white disabled:opacity-40">{terminalSubmitting ? "…" : "Run"}</button>
+                  </div>
+                </form>
+                <div className="mt-3 flex-1 space-y-2 overflow-y-auto">
+                  {terminalSessions.length === 0 ? <p className="text-xs text-gray-500">Commands are paused for approval and their output remains attached to the session.</p> : terminalSessions.map((session) => (
+                    <article key={session.id} className="rounded border border-white/10 bg-zinc-900 p-2.5 text-xs">
+                      <div className="flex items-center justify-between gap-2"><code className="truncate text-amber-300">$ {session.command}</code><span className={session.status === "succeeded" ? "text-emerald-400" : session.status === "failed" ? "text-red-400" : "text-gray-400"}>{session.status}</span></div>
+                      {session.output && <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap text-[10px] text-gray-400">{session.output}</pre>}
+                    </article>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -1000,6 +1505,50 @@ export default function ProjectWorkspace() {
                       ))}
                     </ul>
                   )}
+                </div>
+
+                <div className="border-t border-white/10 pt-4">
+                  <div className="mb-2 flex items-center justify-between">
+                    <h3 className="font-semibold text-white">Recurring agent runs</h3>
+                    <span className="text-[10px] text-gray-500">{schedules.length} configured</span>
+                  </div>
+                  <form onSubmit={createSchedule} className="space-y-2 rounded-lg border border-white/10 bg-zinc-800/60 p-2.5">
+                    <input
+                      value={schedulePrompt}
+                      onChange={(event) => setSchedulePrompt(event.target.value)}
+                      placeholder="Prompt to run periodically"
+                      aria-label="Recurring agent prompt"
+                      className="w-full rounded border border-white/10 bg-zinc-950 px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500"
+                    />
+                    <div className="flex gap-2">
+                      <select value={scheduleInterval} onChange={(event) => setScheduleInterval(event.target.value)} aria-label="Recurring run interval" className="min-w-0 flex-1 rounded border border-white/10 bg-zinc-950 px-2 py-1.5 text-xs text-gray-300">
+                        <option value="3600">Every hour</option>
+                        <option value="21600">Every 6 hours</option>
+                        <option value="86400">Every day</option>
+                        <option value="604800">Every week</option>
+                      </select>
+                      <button disabled={scheduleSubmitting || !schedulePrompt.trim()} className="rounded bg-cyan-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-40">{scheduleSubmitting ? "…" : "Add"}</button>
+                    </div>
+                  </form>
+                  {schedules.length > 0 && <ul className="mt-2 space-y-1.5">
+                    {schedules.map((schedule) => (
+                      <li key={schedule.id} className="rounded border border-white/10 bg-zinc-800/40 p-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <span className={schedule.enabled ? "text-gray-300" : "text-gray-600 line-through"}>{schedule.prompt}</span>
+                          <div className="flex shrink-0 gap-2 text-[10px]">
+                            <button type="button" onClick={() => void toggleSchedule(schedule)} className="text-cyan-300 hover:text-white">{schedule.enabled ? "Pause" : "Resume"}</button>
+                            <button type="button" onClick={() => void removeSchedule(schedule)} className="text-red-300 hover:text-red-200">Delete</button>
+                          </div>
+                        </div>
+                        {(() => { const latest = schedule.last_run_id ? runs.find((run) => run.id === schedule.last_run_id) : null; return <div className="mt-2 space-y-1 text-[10px]">
+                          <div className="text-gray-500">Next run: {new Date(schedule.next_run_at).toLocaleString()}</div>
+                          <div className={schedule.last_error ? "rounded bg-amber-950/50 px-2 py-1 text-amber-200" : "text-gray-500"}>
+                            {schedule.last_error ? `Action needed: ${schedule.last_error}` : latest ? `Latest run: ${latest.status} · ${new Date(latest.created_at).toLocaleString()}` : "Latest run: not dispatched yet"}
+                          </div>
+                        </div>; })()}
+                      </li>
+                    ))}
+                  </ul>}
                 </div>
               </div>
             )}

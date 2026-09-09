@@ -6,7 +6,7 @@ import { apiFetch, WorkspaceEntry } from "@/lib/api";
 
 const sorted = (entries: WorkspaceEntry[]) => [...entries].sort((a, b) => Number(b.type === "directory") - Number(a.type === "directory") || a.path.localeCompare(b.path));
 
-export default function WorkspaceFileTree({ projectId, entries, selected, onOpen, onError }: { projectId: number; entries: WorkspaceEntry[]; selected: string; onOpen: (path: string) => void; onError: (message: string) => void }) {
+export default function WorkspaceFileTree({ projectId, runId, entries, selected, onOpen, onError }: { projectId: number; runId?: string | null; entries: WorkspaceEntry[]; selected: string; onOpen: (path: string) => void; onError: (message: string) => void }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [children, setChildren] = useState<Record<string, WorkspaceEntry[]>>({});
   const [loading, setLoading] = useState<Set<string>>(new Set());
@@ -18,7 +18,8 @@ export default function WorkspaceFileTree({ projectId, entries, selected, onOpen
     if (children[entry.path]) return;
     setLoading((current) => new Set(current).add(entry.path));
     try {
-      const rows = await apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree?path=${encodeURIComponent(entry.path)}`);
+      const runQuery = runId ? `&run_id=${encodeURIComponent(runId)}` : "";
+      const rows = await apiFetch<WorkspaceEntry[]>(`/projects/${projectId}/workspace/tree?path=${encodeURIComponent(entry.path)}${runQuery}`);
       setChildren((current) => ({ ...current, [entry.path]: sorted(rows) }));
     } catch (caught) {
       const collapsed = new Set(next); collapsed.delete(entry.path); setExpanded(collapsed);

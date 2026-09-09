@@ -2,7 +2,10 @@ from copy import deepcopy
 
 import models
 from agent import SupervisorPlanner
-from worker import _apply_task_status, requeue_failed_task
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from worker import _apply_task_status, _ensure_subtask, requeue_failed_task
 
 
 def test_nested_task_updates_are_immutable_and_drive_dependency_selection():
@@ -66,3 +69,30 @@ def test_failed_task_is_requeued_with_repair_context(monkeypatch):
     assert task["retry_count"] == 1
     assert task["context_bundle"]["repair_required"] is True
     assert queued == [("run.resume", "run-repair")]
+
+
+def test_each_supervisor_task_gets_one_durable_child_thread():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    models.Base.metadata.create_all(bind=engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        run = models.AgentRun(
+            id="parent-run",
+            project_id=1,
+            requested_by_id=1,
+            prompt="inspect database",
+            thread_id="parent-thread",
+        )
+        db.add(run)
+        db.commit()
+        task = {"task_id": "inspect_schema", "title": "Inspect Odoo schema"}
+
+        first = _ensure_subtask(db, run, task)
+        db.commit()
+        second = _ensure_subtask(db, run, task)
+
+        assert first.id == second.id
+        assert first.thread_id == "parent-thread:subtask:inspect_schema"
+        assert first.role == "discovery_analyst"
+    finally:
+        db.close()

@@ -42,5 +42,5 @@ test("allows first-time setup without an existing session", async ({ page }) => 
   await page.getByLabel("Password (min 12 characters)").fill("correct-horse-battery");
   await page.getByLabel("Confirm Password").fill("correct-horse-battery");
   await page.getByRole("button", { name: "Create Admin Account & Launch" }).click();
-  await expect(page.getByRole("heading", { name: "Projects" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Implementation Projects" })).toBeVisible();
 });
