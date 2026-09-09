@@ -24,10 +24,13 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e backend/
-          pip install pytest pytest-asyncio httpx
+          pip install -e "backend/[test]"
+          pip install pytest pytest-asyncio respx httpx
 
       - name: Run Unit Tests
+        env:
+          ENCRYPTION_KEY: "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
+          WORKSPACE_ROOT: "tests/.workspaces"
         run: |
           cd backend
           pytest tests/ -v
@@ -64,12 +67,13 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e backend/
-          pip install pytest pytest-asyncio psycopg[binary] alembic httpx
+          pip install -e "backend/[test]"
+          pip install pytest pytest-asyncio psycopg[binary] alembic respx httpx
 
       - name: Run Migrations
         env:
           DATABASE_URL: postgresql://primacy:primacy_test_password@localhost:5432/primacy_test
+          ENCRYPTION_KEY: "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
         run: |
           cd backend
           alembic upgrade heads
@@ -77,6 +81,8 @@ jobs:
       - name: Run Integration Tests
         env:
           DATABASE_URL: postgresql://primacy:primacy_test_password@localhost:5432/primacy_test
+          ENCRYPTION_KEY: "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
+          WORKSPACE_ROOT: "tests/.workspaces"
         run: |
           cd backend
           pytest tests/ -v

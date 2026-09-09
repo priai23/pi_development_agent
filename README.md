@@ -1,27 +1,34 @@
-# Odoo ERP Implementation Agent
+# Primacy ERP Implementation Agent
 
-An internal, human-approved Odoo 19 implementation agent. The application combines a FastAPI API, PostgreSQL persistence, a LangGraph agent, and a Next.js 16 frontend.
+An autonomous, human-gated AI implementation and pair-programming assistant for **Odoo 19** and **Pri ERP**. The system combines a FastAPI backend, PostgreSQL persistence with LangGraph state checkpoints, an asynchronous transactional outbox worker, and a Next.js 16 split-pane IDE frontend.
 
 ## Architecture
 
-The system is designed with a strong separation of concerns, ensuring that the AI agent's actions are durable, isolated, and safely gated by human approval.
+The system is designed with a strong separation of concerns, ensuring that all AI agent actions are durable, observable, isolated, and strictly gated by human approval.
 
 ```mermaid
 graph TD
     User([User]) -->|Interacts| UI[Next.js Frontend]
-    UI -->|REST API| API[FastAPI Backend]
+    UI -->|REST API & SSE Stream| API[FastAPI Backend]
     
     subgraph Core System
         API -->|State & Runs| DB[(PostgreSQL)]
-        API -->|Events| Outbox[Outbox Queue]
-        Worker[Background Worker] -.->|Claims Tasks| Outbox
+        API -->|Events| Outbox[Transactional Outbox Queue]
+        Worker[Outbox Worker Pool] -.->|Claims Tasks| Outbox
         Worker -->|Executes| Agent[LangGraph Agent]
         Agent -->|State Checkpoints| DB
+        Agent -->|Telemetry & Metrics| Telemetry[Telemetry Collector]
+    end
+    
+    subgraph Storage & Attachments
+        API -->|Durable 25MB Pipeline| Attachments[Content-Addressed Storage]
+        Attachments -->|Extracted Text / Citations| Agent
     end
     
     subgraph External Boundaries
-        Agent -->|JSON-RPC / XML-RPC| Odoo[Odoo 19 Instances]
-        Agent -->|Read/Write| FS[Project Workspaces]
+        Agent -->|JSON-RPC / XML-RPC / JSON-2| Odoo[Odoo 19 Instances]
+        Agent -->|REST / Instance / Shell| PriERP[Pri ERP Instances]
+        Agent -->|Gated Workspace I/O| FS[Project Workspaces]
     end
 ```
 
@@ -58,6 +65,17 @@ sequenceDiagram
         Worker->>Agent: Write File
     end
 ```
+
+## Core Capabilities
+
+- **Dual ERP Connectors**:
+  - **Odoo 19**: Dynamic schema discovery, XML-RPC (`/xmlrpc/2/object`), and JSON-2 (`/web/dataset/call_kw`) with OWL 3 and `<list>` view support.
+  - **Pri ERP**: Multi-tenant REST adapter (`admin.sh.prierp.com`) supporting instance inspection, remote workspace file operations, secure terminal bridge, and database backup/restore.
+- **Durable 25 MB Attachment Pipeline**: Content-addressed SHA-256 storage, MIME allowlisting, pluggable malware scan hooks, automated text extraction (`pypdf`, plaintext), and evidence citation references.
+- **5-Layer Permission Engine**: Workspace directory gating, risk tier classification, command allowlists, ERP grant validation, and LRU-cached evaluation.
+- **67-Tool Registry**: Formally typed tool catalog with risk classes (1/2/3), ERP engine compatibility tags, idempotency enforcement, and human-in-the-loop approval cards.
+- **Deployment Safety & Auto-Rollback**: Pre-deploy code inspection, view validation, AST checks, automated smoke testing suites, and instant rollback to prior artifact checkpoints.
+- **Observability & Health Monitoring**: Latency, token cost, and run reliability metrics via `/admin/telemetry`, plus active tool registry introspection at `/admin/tools`.
 
 ## Security Model
 
