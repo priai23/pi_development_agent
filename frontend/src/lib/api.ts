@@ -86,6 +86,7 @@ async function responseError(response: Response, fallback: string): Promise<ApiE
 
 export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
+  headers.set("ngrok-skip-browser-warning", "1");
   if (init.body) headers.set("Content-Type", "application/json");
   if (init.method && !["GET", "HEAD"].includes(init.method) && csrfToken) headers.set("X-CSRF-Token", csrfToken);
   let response: Response;
