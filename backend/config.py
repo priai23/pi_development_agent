@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # Pri ERP
     pri_erp_base_url: str = Field(default="https://admin.sh.prierp.com", validation_alias="PRI_ERP_BASE_URL")
     secure_cookies: bool = Field(default=False, validation_alias="SECURE_COOKIES")
+    production_mode: bool = Field(default=False, validation_alias="PRODUCTION_MODE")
     session_hours: int = 8
     action_expiry_minutes: int = 30
     public_base_url: str = Field(default="http://localhost:8001", validation_alias="PUBLIC_BASE_URL")
@@ -45,6 +46,19 @@ class Settings(BaseSettings):
         if not value:
             raise ValueError("ENCRYPTION_KEY is required")
         return value
+
+    @model_validator(mode="after")
+    def enforce_production_transport_security(self):
+        if self.production_mode:
+            if not self.secure_cookies:
+                raise ValueError("SECURE_COOKIES=true is required in production mode")
+            if not self.frontend_origin.startswith("https://"):
+                raise ValueError("FRONTEND_ORIGIN must use HTTPS in production mode")
+            if not self.public_base_url.startswith("https://"):
+                raise ValueError("PUBLIC_BASE_URL must use HTTPS in production mode")
+            if "*" in self.erp_allowed_hosts:
+                raise ValueError("ERP_ALLOWED_HOSTS cannot contain '*' in production mode")
+        return self
 
     @property
     def allowed_hosts(self) -> set[str]:

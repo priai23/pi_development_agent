@@ -413,6 +413,7 @@ class SessionOut(ORMModel):
     expires_at: datetime
     created_at: datetime
     last_seen_at: datetime
+    is_current: bool = False
 
 
 class RequirementCreate(BaseModel):

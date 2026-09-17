@@ -12,9 +12,11 @@ import socket
 import shlex
 import ssl
 import subprocess
-import xmlrpc.client
+import time
+import xmlrpc.client  # nosec B411 - defusedxml patch is applied by agent before use
 import httpx
 from contextlib import asynccontextmanager
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -48,6 +50,9 @@ from attachment import (
 )
 
 logger = logging.getLogger(__name__)
+_login_attempts: dict[str, deque[float]] = defaultdict(deque)
+_LOGIN_WINDOW_SECONDS = 60.0
+_LOGIN_MAX_ATTEMPTS = 20
 
 
 def get_worker_status(db: Session) -> tuple[str, str | None, float | None, int]:
@@ -153,6 +158,30 @@ async def csrf_protection(request: Request, call_next):
                 if not session or not csrf_token or session.csrf_hash != token_hash(csrf_token):
                     return Response(content='{"detail":"Invalid CSRF token"}', status_code=403, media_type="application/json")
     return await call_next(request)
+
+
+@app.middleware("http")
+async def security_headers_and_login_limit(request: Request, call_next):
+    if request.url.path == "/auth/login" and request.method == "POST":
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        attempts = _login_attempts[client_ip]
+        while attempts and now - attempts[0] >= _LOGIN_WINDOW_SECONDS:
+            attempts.popleft()
+        if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
+            response = Response(content='{"detail":"Too many login attempts"}', status_code=429, media_type="application/json")
+            response.headers["Retry-After"] = str(int(_LOGIN_WINDOW_SECONDS))
+            return response
+        attempts.append(now)
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if settings.production_mode:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 
 def validate_erp_url(value: str, db: Session | None = None) -> str:
@@ -910,19 +939,32 @@ def me(request: Request, user: models.User = Depends(current_user)):
 
 
 @app.post("/auth/change-password", status_code=204)
-def change_password(payload: schemas.PasswordChange, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+def change_password(payload: schemas.PasswordChange, request: Request, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
     if not verify_password(user.password_hash, payload.current_password):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     user.password_hash = hash_password(payload.new_password)
     user.must_change_password = False
-    db.query(models.UserSession).filter(models.UserSession.user_id == user.id).delete()
+    current_cookie = request.cookies.get(SESSION_COOKIE)
+    current_hash = token_hash(current_cookie) if current_cookie else None
+    query = db.query(models.UserSession).filter(models.UserSession.user_id == user.id)
+    if current_hash:
+        query = query.filter(models.UserSession.token_hash != current_hash)
+    query.delete(synchronize_session=False)
     audit(db, "auth.password_changed", user.id, None, {})
     db.commit()
 
 
 @app.get("/auth/sessions", response_model=list[schemas.SessionOut])
-def list_sessions(user: models.User = Depends(current_user), db: Session = Depends(get_db)):
-    return db.query(models.UserSession).filter(models.UserSession.user_id == user.id).order_by(models.UserSession.created_at.desc()).all()
+def list_sessions(request: Request, user: models.User = Depends(current_user), db: Session = Depends(get_db)):
+    current_cookie = request.cookies.get(SESSION_COOKIE)
+    current_hash = token_hash(current_cookie) if current_cookie else None
+    sessions = db.query(models.UserSession).filter(models.UserSession.user_id == user.id).order_by(models.UserSession.created_at.desc()).all()
+    results = []
+    for item in sessions:
+        record = schemas.SessionOut.model_validate(item)
+        record.is_current = bool(current_hash and item.token_hash == current_hash)
+        results.append(record)
+    return results
 
 
 @app.delete("/auth/sessions/{session_id}", status_code=204)
@@ -1353,7 +1395,7 @@ async def detect_instance(payload: schemas.DetectRequest, _: models.User = Depen
         found: list[str] = []
         # A. HTML selector extraction (/web/database/selector and /odoo)
         try:
-            async with httpx.AsyncClient(timeout=4.0, verify=False, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as client:
                 res = await client.get(f"{url}/web/database/selector")
                 if res.status_code == 200:
                     dbs = re.findall(r'(?:href|data-db)=["\'][^"\']*[?&]db=([a-zA-Z0-9_\-\.]+)', res.text)
@@ -2240,7 +2282,7 @@ def is_expired(expires_at: datetime | None) -> bool:
         return True
     now = datetime.now(timezone.utc)
     if expires_at.tzinfo is None:
-        return expires_at <= datetime.utcnow()
+        return expires_at <= now.replace(tzinfo=None)
     return expires_at <= now
 
 

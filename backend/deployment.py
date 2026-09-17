@@ -8,6 +8,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from sqlalchemy.orm import object_session
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -179,6 +180,9 @@ def run_smoke_tests(deployment: models.Deployment, instance: models.Instance) ->
 
 def execute_rollback(deployment: models.Deployment, db) -> bool:
     """Attempt automatic rollback to prior_artifact_id if available."""
+    if object_session(deployment) is not db:
+        deployment = db.merge(deployment)
+
     if not deployment.prior_artifact_id:
         deployment.recovery_state = "unrecoverable"
         db.commit()

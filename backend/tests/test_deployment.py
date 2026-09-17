@@ -146,3 +146,52 @@ def test_execute_rollback_with_prior_artifact():
     finally:
         db.close()
 
+
+def test_execute_rollback_restores_prior_artifact():
+    engine = create_engine("sqlite:///:memory:")
+    db = sessionmaker(bind=engine)()
+    models.Base.metadata.create_all(engine)
+    try:
+        user = models.User(email="rollback@example.com", password_hash="hash", role="admin")
+        org = models.Organization(name="Rollback Org")
+        db.add_all([user, org]); db.flush()
+        project = models.Project(name="Rollback ERP", organization_id=org.id, created_by_id=user.id, workspace_slug="rollback")
+        db.add(project); db.flush()
+        prior = models.Artifact(
+            project_id=project.id, artifact_type="odoo_module", name="sample", version="19.0.1.0.0",
+            commit_hash="1" * 40, digest="1" * 64, path="sample", status="validated", created_by_id=user.id,
+        )
+        current = models.Artifact(
+            project_id=project.id, artifact_type="odoo_module", name="sample", version="19.0.1.0.1",
+            commit_hash="2" * 40, digest="2" * 64, path="sample", status="validated", created_by_id=user.id,
+        )
+        db.add_all([prior, current]); db.flush()
+        instance = models.Instance(
+            project_id=project.id, erp_type="pri_erp", url="https://staging.example", environment="staging",
+            deployment_config_encrypted="encrypted", hosting_type="bridge",
+        )
+        db.add(instance); db.flush()
+        validation = models.ValidationRun(project_id=project.id, artifact_id=current.id, status="passed", report={})
+        db.add(validation); db.flush()
+        deployment_record = models.Deployment(
+            project_id=project.id, instance_id=instance.id, artifact_id=current.id, environment="staging",
+            validation_id=validation.id, requested_by_id=user.id, prior_artifact_id=prior.id, status="failed", logs="",
+        )
+        db.add(deployment_record); db.commit()
+
+        deployment_id = deployment_record.id
+        db.expunge(deployment_record)
+        detached_session = sessionmaker(bind=engine)()
+        detached_record = detached_session.get(models.Deployment, deployment_id)
+        detached_session.close()
+        with patch("deployment.decrypt_secret", return_value='{"bridge_url":"https://bridge.example","bridge_token":"token","signing_private_key":"' + base64.b64encode(Ed25519PrivateKey.generate().private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())).decode() + '"}'), \
+             patch("deployment.execute_bridge") as bridge:
+            assert deployment.execute_rollback(detached_record, db) is True
+
+        persisted_record = db.get(models.Deployment, deployment_id)
+        assert persisted_record.recovery_state == "recovered"
+        assert persisted_record.status == "rolled_back"
+        bridge.assert_called_once()
+        assert bridge.call_args.args[2].id == prior.id
+    finally:
+        db.close()

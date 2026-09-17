@@ -125,6 +125,67 @@ def test_action_rejection_transitions_run_status_to_queued(sync_db, setup_data):
     assert action.status == "rejected"
 
 
+def test_duplicate_action_decision_is_rejected(sync_db, setup_data):
+    user, project = setup_data
+    run = models.AgentRun(
+        id="run_test_duplicate_decision",
+        project_id=project.id,
+        requested_by_id=user.id,
+        prompt="Build test module",
+        thread_id="thread_test_duplicate_decision",
+        status="awaiting_approval",
+    )
+    action = models.PendingAction(
+        id="act_test_duplicate_decision",
+        project_id=project.id,
+        run_id=run.id,
+        thread_id=run.thread_id,
+        tool_name="write_file",
+        tool_call_id="call_duplicate_decision",
+        risk_class="B",
+        arguments={"path": "test.py", "content": "print('hello')"},
+        preview={"summary": "write test.py"},
+        status="pending",
+        requested_by_id=user.id,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    sync_db.add_all([run, action]); sync_db.commit()
+
+    main.decide_run_action(action.id, schemas.ActionDecision(decision="reject"), user=user, db=sync_db)
+    with pytest.raises(main.HTTPException, match="no longer pending"):
+        main.decide_run_action(action.id, schemas.ActionDecision(decision="approve"), user=user, db=sync_db)
+
+
+def test_expired_action_decision_is_rejected(sync_db, setup_data):
+    user, project = setup_data
+    run = models.AgentRun(
+        id="run_test_expired_decision",
+        project_id=project.id,
+        requested_by_id=user.id,
+        prompt="Build test module",
+        thread_id="thread_test_expired_decision",
+        status="awaiting_approval",
+    )
+    action = models.PendingAction(
+        id="act_test_expired_decision",
+        project_id=project.id,
+        run_id=run.id,
+        thread_id=run.thread_id,
+        tool_name="write_file",
+        tool_call_id="call_expired_decision",
+        risk_class="B",
+        arguments={"path": "test.py", "content": "print('hello')"},
+        preview={"summary": "write test.py"},
+        status="pending",
+        requested_by_id=user.id,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    sync_db.add_all([run, action]); sync_db.commit()
+
+    with pytest.raises(main.HTTPException, match="no longer pending"):
+        main.decide_run_action(action.id, schemas.ActionDecision(decision="approve"), user=user, db=sync_db)
+
+
 def test_schedule_crud_is_project_scoped(sync_db, setup_data):
     user, project = setup_data
     schedule = main.create_schedule(

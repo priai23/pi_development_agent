@@ -6,7 +6,7 @@
     <string>com.prierp.worker</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Volumes/Crucial X9/pi_development_agent/backend/venv/bin/python</string>
+        <string>/Volumes/Crucial X9/pi_development_agent/backend/.venv/bin/python</string>
         <string>/Volumes/Crucial X9/pi_development_agent/backend/worker.py</string>
     </array>
     <key>WorkingDirectory</key>

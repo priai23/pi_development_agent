@@ -50,13 +50,23 @@ def _terminate_proc(proc: subprocess.Popen | None, timeout: float = 5.0) -> None
         pass
 
 
-def run_supervisor(host: str = "0.0.0.0", port: int = 8001, reload: bool = False, loop_delay: float = 0.5) -> None:
-    """Supervised single-command entry point running API + exactly one worker."""
+def _runtime_python(backend_dir: str) -> str:
+    """Use the project environment when manage.py was invoked by system Python."""
+    project_python = Path(backend_dir) / ".venv" / "bin" / "python"
+    if project_python.is_file() and Path(sys.executable).resolve() != project_python.resolve():
+        return str(project_python)
+    return sys.executable
+
+
+def run_supervisor(host: str | None = None, port: int = 8001, reload: bool = False, loop_delay: float = 0.5) -> None:
+    """Run API and worker; bind to loopback unless API_BIND_HOST is explicit."""
+    host = host or os.environ.get("API_BIND_HOST", "127.0.0.1")
     backend_dir = str(Path(__file__).resolve().parent)
+    runtime_python = _runtime_python(backend_dir)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    api_cmd = [sys.executable, "-m", "uvicorn", "main:app", "--host", host, "--port", str(port)]
+    api_cmd = [runtime_python, "-m", "uvicorn", "main:app", "--host", host, "--port", str(port)]
     if reload:
         api_cmd.extend([
             "--reload",
@@ -67,7 +77,7 @@ def run_supervisor(host: str = "0.0.0.0", port: int = 8001, reload: bool = False
             "--reload-exclude", "*workspaces*",
         ])
 
-    worker_cmd = [sys.executable, "worker.py"]
+    worker_cmd = [runtime_python, "worker.py"]
 
     api_proc: subprocess.Popen | None = None
     worker_proc: subprocess.Popen | None = None
@@ -124,7 +134,7 @@ def main() -> None:
     subparsers.add_parser("worker", help="Run the background worker process")
 
     serve_parser = subparsers.add_parser("serve", help="Run supervised API + worker processes")
-    serve_parser.add_argument("--host", default="0.0.0.0", help="API host (default: 0.0.0.0)")
+    serve_parser.add_argument("--host", default=None, help="API host (default: API_BIND_HOST or 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=8001, help="API port (default: 8001)")
     serve_parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development (Uvicorn only)")
 

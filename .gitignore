@@ -23,6 +23,8 @@ env/
 *.swp
 *.swo
 .DS_Store
+backend/.coverage
+backend/coverage.xml
 
 # Frontend is handled by frontend/.gitignore but just in case
 node_modules/

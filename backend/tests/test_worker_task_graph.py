@@ -1,11 +1,17 @@
+from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 import models
 from agent import SupervisorPlanner
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from worker import _apply_task_status, _ensure_subtask, requeue_failed_task
+import worker
+import agent
+from worker import _apply_task_status, _ensure_subtask, is_in_flight_budget_error, requeue_failed_task
 
 
 def test_nested_task_updates_are_immutable_and_drive_dependency_selection():
@@ -29,6 +35,41 @@ def test_nested_task_updates_are_immutable_and_drive_dependency_selection():
     assert updated[0]["status"] == "done"
     assert run.task_graph == updated
     assert SupervisorPlanner.get_next_task(updated)["task_id"] == "two"
+
+
+def test_in_flight_budget_errors_are_detected_without_matching_other_402s():
+    assert is_in_flight_budget_error(Exception("Error code: 402 - in_flight_budget_exhausted")) is True
+    assert is_in_flight_budget_error(Exception("code': 402 available credits")) is True
+    assert is_in_flight_budget_error(Exception("payment required for another reason")) is False
+
+
+def test_agent_bounds_provider_stream_stalls(monkeypatch):
+    calls = []
+
+    class FakeChat:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def with_fallbacks(self, fallbacks):
+            return self
+
+        def bind_tools(self, tools):
+            return self
+
+    monkeypatch.setattr(agent, "ChatOpenAI", FakeChat)
+    monkeypatch.setattr(agent, "Workspace", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(agent, "create_react_agent", lambda *args, **kwargs: MagicMock())
+    agent.ERPImplementationAgent(
+        client=MagicMock(),
+        workspace_slug="stream-stall-test",
+        checkpointer=None,
+        llm_model="primary",
+        fallback_model="fallback",
+        read_only=True,
+    )
+
+    assert len(calls) == 2
+    assert all(call["stream_chunk_timeout"] == 30 for call in calls)
 
 
 def test_requirement_graph_generates_tests_before_validation():
@@ -94,5 +135,63 @@ def test_each_supervisor_task_gets_one_durable_child_thread():
         assert first.id == second.id
         assert first.thread_id == "parent-thread:subtask:inspect_schema"
         assert first.role == "discovery_analyst"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_action_terminates_without_resuming_agent(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    models.Base.metadata.create_all(bind=engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        run = models.AgentRun(
+            id="run-rejected-action",
+            project_id=1,
+            requested_by_id=1,
+            prompt="build a module",
+            thread_id="thread-rejected-action",
+            intent="read",
+            status="queued",
+        )
+        action = models.PendingAction(
+            id="action-rejected-action",
+            project_id=1,
+            run_id=run.id,
+            requested_by_id=1,
+            thread_id=run.thread_id,
+            tool_name="write_file",
+            tool_call_id="call-rejected-action",
+            risk_class="2",
+            arguments={"path": "module.py", "content": "# denied"},
+            preview={"summary": "write module.py"},
+            status="rejected",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+        db.add_all([run, action]); db.commit()
+
+        agent = MagicMock(read_only=True)
+        agent.stream = MagicMock(side_effect=AssertionError("rejected actions must not resume the agent"))
+        agent.usage = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+
+        @contextmanager
+        def session_context():
+            yield db
+
+        monkeypatch.setattr(worker, "SessionLocal", session_context)
+        monkeypatch.setattr(worker, "build_agent", AsyncMock(return_value=agent))
+
+        await worker.process_run(
+            run.id,
+            checkpointer=None,
+            action_id=action.id,
+            decision="reject",
+        )
+
+        db.refresh(run); db.refresh(action)
+        assert run.status == "failed"
+        assert run.error_category == "ActionRejected"
+        assert action.status == "rejected"
+        agent.stream.assert_not_called()
     finally:
         db.close()

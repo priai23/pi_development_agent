@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import ast
 import re
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 from dataclasses import dataclass
 from typing import Any
 

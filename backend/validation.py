@@ -7,7 +7,7 @@ import io
 import importlib.util
 import platform
 import zipfile
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 from pathlib import Path
 from sqlalchemy.engine import make_url
 
@@ -343,4 +343,3 @@ def validate_business_scenario(scenario_name: str, context_data: dict) -> dict:
         "scenario": scenario_name,
         "checks": checks,
     }
-

@@ -14,7 +14,7 @@ import io
 import logging
 import tokenize
 import re
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -650,4 +650,3 @@ def change_impact(db, snapshot_id: str, changed_files: list[str]) -> dict:
         "impacted_symbols": impacted_symbols[:50],
         "impacted_models": sorted(impacted_models),
     }
-

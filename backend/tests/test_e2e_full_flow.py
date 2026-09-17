@@ -165,4 +165,7 @@ def test_full_pipeline_e2e(test_env):
     snap = telemetry.get_system_snapshot(db)
     assert snap["status"] == "healthy"
     assert snap["runs"]["active"] == 1
+    assert snap["runs"]["failed_24h"] == 0
+    assert snap["queue"]["retries_total"] == 0
+    assert snap["deployments"]["rollbacks_total"] == 0
     assert "write_file" in snap["tools"]

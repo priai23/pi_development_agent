@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func
@@ -64,10 +64,18 @@ class TelemetryCollector:
         return result
 
     def get_system_snapshot(self, db) -> dict[str, Any]:
+        since_24h = datetime.now(timezone.utc) - timedelta(hours=24)
         active_runs = db.query(models.AgentRun).filter(models.AgentRun.status == "running").count()
         queued_runs = db.query(models.AgentRun).filter(models.AgentRun.status == "queued").count()
         awaiting = db.query(models.PendingAction).filter(models.PendingAction.status == "pending_approval").count()
         total_runs = db.query(models.AgentRun).count()
+        failed_runs_24h = db.query(models.AgentRun).filter(
+            models.AgentRun.status == "failed", models.AgentRun.created_at >= since_24h,
+        ).count()
+        queue_depth = db.query(models.OutboxEvent).filter(models.OutboxEvent.completed_at.is_(None)).count()
+        retries_total = db.query(models.ToolEvent).filter(models.ToolEvent.event_type == "task.retrying").count()
+        rollbacks_total = db.query(models.Deployment).filter(models.Deployment.recovery_state.isnot(None)).count()
+        rollbacks_recovered = db.query(models.Deployment).filter(models.Deployment.recovery_state == "recovered").count()
 
         token_sum = db.query(
             func.sum(models.AgentRun.input_tokens),
@@ -89,6 +97,12 @@ class TelemetryCollector:
                 "queued": queued_runs,
                 "awaiting_approval": awaiting,
                 "total": total_runs,
+                "failed_24h": failed_runs_24h,
+            },
+            "queue": {"outbox_depth": queue_depth, "retries_total": retries_total},
+            "deployments": {
+                "rollbacks_total": rollbacks_total,
+                "rollbacks_recovered": rollbacks_recovered,
             },
             "usage": {
                 "input_tokens": total_in,

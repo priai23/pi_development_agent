@@ -1,7 +1,9 @@
 import asyncio
 import json
 import socket
-import xmlrpc.client
+from defusedxml.xmlrpc import monkey_patch as patch_xmlrpc
+patch_xmlrpc()
+import xmlrpc.client  # nosec B411 - defusedxml patch is applied above
 import httpx
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -462,6 +464,7 @@ class ERPImplementationAgent:
         fallback_model: str = "anthropic/claude-3.5-sonnet",
         autonomous_workspace_writes: bool = False,
         read_only: bool = False,
+        stream_chunk_timeout: float | None = 30,
     ):
         self.client = client
         self.workspace = Workspace(workspace_slug, create=not read_only)
@@ -482,6 +485,10 @@ class ERPImplementationAgent:
             "streaming": True,
             "parallel_tool_calls": False,
             "timeout": request_timeout,
+            # A provider can keep the socket open without yielding a token. Keep
+            # that stall bounded so fallbacks and durable run failure handling
+            # get a chance to run instead of waiting for the full request timeout.
+            "stream_chunk_timeout": stream_chunk_timeout,
             "max_tokens": max_output_tokens,
         }
         if api_key:

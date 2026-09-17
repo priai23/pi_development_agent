@@ -10,6 +10,7 @@ dependencies = [
   "alembic>=1.19,<2",
   "argon2-cffi>=25,<26",
   "cryptography>=50,<51",
+  "defusedxml>=0.7,<1",
   "email-validator>=2.3,<3",
   "fastapi>=0.141,<1",
   "graphifyy>=0.9,<1",
@@ -19,7 +20,7 @@ dependencies = [
   "langgraph-checkpoint-postgres>=3.1,<4",
   "psycopg[binary,pool]>=3.3,<4",
   "pydantic-settings>=2.15,<3",
-  "pypdf>=5.0,<6",
+  "pypdf>=6.16.1,<7",
   "python-magic>=0.4,<1",
   "python-multipart>=0.0.9,<1",
   "pyyaml>=6.0,<7",
@@ -29,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ocr = ["pytesseract>=0.3,<1"]
-test = ["pytest>=9,<10", "pytest-asyncio>=0.23", "respx>=0.22,<1"]
+test = ["pytest>=9,<10", "pytest-asyncio>=0.23", "pytest-cov>=7,<8", "respx>=0.22,<1"]
 
 [tool.setuptools]
 py-modules = ["agent", "attachment", "auth", "config", "database", "deployment", "erp_adapter", "main", "manage", "model_conformance", "models", "permissions", "pri_erp_adapter", "schemas", "security", "source_indexer", "specification", "telemetry", "tool_registry", "validation", "worker", "workspace"]

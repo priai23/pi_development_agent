@@ -60,7 +60,8 @@ class TestManifestParser:
 
 class TestPythonParser:
     @pytest.fixture(scope="class")
-    def records(self):
+    @classmethod
+    def records(cls):
         return parse_python_file(
             ADDON_ROOT / "models" / "leave_request.py",
             module="primacy_test_fixture",
@@ -135,7 +136,8 @@ class TestPythonParser:
 
 class TestXmlParser:
     @pytest.fixture(scope="class")
-    def records(self):
+    @classmethod
+    def records(cls):
         return parse_xml_file(
             ADDON_ROOT / "views" / "leave_request_views.xml",
             module="primacy_test_fixture",
@@ -170,7 +172,8 @@ class TestXmlParser:
 
 class TestAccessCsvParser:
     @pytest.fixture(scope="class")
-    def records(self):
+    @classmethod
+    def records(cls):
         return parse_access_csv(
             ADDON_ROOT / "security" / "ir.model.access.csv",
             module="primacy_test_fixture",
@@ -204,7 +207,8 @@ class TestAccessCsvParser:
 
 class TestAddonIndexer:
     @pytest.fixture(scope="class")
-    def all_records(self):
+    @classmethod
+    def all_records(cls):
         return index_addon(ADDON_ROOT, SNAPSHOT_ID)
 
     def test_total_symbol_count_reasonable(self, all_records):

@@ -4,6 +4,7 @@ import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } fr
 import { AlertTriangle, Bot, Brain, ChevronDown, ChevronUp, Code2, Database, FileText, GitBranch, HelpCircle, History, Image as ImageIcon, Layers, Lightbulb, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, Rocket, RotateCcw, Search, Send, Server, Shield, SlidersHorizontal, Sparkles, Square, Terminal } from "lucide-react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
+import Image from "next/image";
 import { motion, AnimatePresence } from "framer-motion";
 import MessageContent from "@/components/MessageContent";
 import AgentStatus from "@/components/AgentStatus";
@@ -651,10 +652,11 @@ export default function ProjectWorkspace() {
       </div>
 
       <form onSubmit={connect} className="mt-6 space-y-4 rounded-2xl border p-6 dark:border-white/10">
-        <label className="block text-sm font-medium">
+        <label htmlFor="erp-server-url" className="block text-sm font-medium">
           Server URL <span className="text-xs text-gray-500 font-normal">(Hosted Odoo or Local ERP)</span>
           <div className="relative mt-1">
             <input
+              id="erp-server-url"
               type="url"
               required
               value={url}
@@ -666,19 +668,19 @@ export default function ProjectWorkspace() {
             {detectingDatabases && <Loader2 className="absolute right-3 top-3.5 h-4 w-4 animate-spin text-blue-600" />}
           </div>
         </label>
-        <label className="block text-sm font-medium">Database
+        <label htmlFor="erp-database" className="block text-sm font-medium">Database
           {detectedDatabases.length > 1 ? (
-            <select required value={dbName} onChange={(event) => setDbName(event.target.value)} className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm">
+            <select id="erp-database" required value={dbName} onChange={(event) => setDbName(event.target.value)} className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm">
               <option value="">Select a database…</option>
               {detectedDatabases.map((database) => <option key={database} value={database}>{database}</option>)}
             </select>
           ) : (
-            <input required value={dbName} onChange={(event) => setDbName(event.target.value)} readOnly={detectedDatabases.length === 1} placeholder={detectingDatabases ? "Discovering databases…" : "Database name (e.g. production)"} className="mt-1 w-full rounded-xl border px-4 py-3 read-only:bg-gray-50 dark:border-white/10 dark:bg-black dark:read-only:bg-white/5 text-sm" />
+            <input id="erp-database" required value={dbName} onChange={(event) => setDbName(event.target.value)} readOnly={detectedDatabases.length === 1} placeholder={detectingDatabases ? "Discovering databases…" : "Database name (e.g. production)"} className="mt-1 w-full rounded-xl border px-4 py-3 read-only:bg-gray-50 dark:border-white/10 dark:bg-black dark:read-only:bg-white/5 text-sm" />
           )}
           {discoveryMessage && <span className="mt-1 block text-xs text-gray-500">{discoveryMessage}</span>}
         </label>
-        <label className="block text-sm font-medium">Username<input required value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="admin@example.com" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label>
-        <label className="block text-sm font-medium">Password<input type="password" required value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Password" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label>
+        <label htmlFor="erp-username" className="block text-sm font-medium">Username<input id="erp-username" required value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="admin@example.com" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label>
+        <label htmlFor="erp-password" className="block text-sm font-medium">Password<input id="erp-password" type="password" required value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Password" className="mt-1 w-full rounded-xl border px-4 py-3 dark:border-white/10 dark:bg-black text-sm" /></label>
         {error && <p className="text-sm text-red-600">{error}</p>}
         <button disabled={loading || detectingDatabases} className="w-full rounded-xl bg-blue-600 py-3 font-medium text-white disabled:opacity-50 transition active:scale-95">{loading ? "Verifying…" : detectingDatabases ? "Discovering databases…" : "Verify and connect"}</button>
       </form>
@@ -1247,7 +1249,7 @@ export default function ProjectWorkspace() {
         <form onSubmit={send} onDragOver={(event) => { event.preventDefault(); setDraggingFiles(true); }} onDragLeave={() => setDraggingFiles(false)} onDrop={(event) => { event.preventDefault(); setDraggingFiles(false); void addFiles(event.dataTransfer.files); }} className={`border-t border-white/5 bg-zinc-900 p-3 ${draggingFiles ? "bg-blue-950/40" : ""}`}>
           <div className="relative mx-auto max-w-4xl rounded-2xl border border-white/10 bg-zinc-800 px-3 pt-2 shadow-2xl shadow-black/20 focus-within:border-blue-500/50">
             <input ref={attachmentInput} type="file" multiple accept="image/*,.pdf,.txt,.md,.json,.csv,.xml,.py,.js,.ts" className="hidden" onChange={(event) => { if (event.target.files) void addFiles(event.target.files); event.target.value = ""; }} />
-            {attachments.length > 0 && <div className="mb-2 flex flex-wrap gap-1.5">{attachments.map((file, index) => <span key={`${file.name}-${index}`} className="flex max-w-60 items-center gap-1.5 rounded-lg border border-white/10 bg-zinc-950 px-2 py-1 text-[10px] text-gray-300">{file.type.startsWith("image/") ? <img src={file.content} alt="" className="h-6 w-6 rounded object-cover" /> : file.type === "application/pdf" ? <FileText className="h-4 w-4 shrink-0 text-red-300" /> : <ImageIcon className="h-4 w-4 shrink-0 text-gray-500" />}<span className="truncate">{file.name}</span><button type="button" onClick={() => setAttachments((current) => current.filter((_, item) => item !== index))} className="text-gray-500 hover:text-white" aria-label={`Remove ${file.name}`}>×</button></span>)}</div>}
+            {attachments.length > 0 && <div className="mb-2 flex flex-wrap gap-1.5">{attachments.map((file, index) => <span key={`${file.name}-${index}`} className="flex max-w-60 items-center gap-1.5 rounded-lg border border-white/10 bg-zinc-950 px-2 py-1 text-[10px] text-gray-300">{file.type.startsWith("image/") ? <Image src={file.content} alt="" width={24} height={24} unoptimized className="h-6 w-6 rounded object-cover" /> : file.type === "application/pdf" ? <FileText className="h-4 w-4 shrink-0 text-red-300" /> : <ImageIcon className="h-4 w-4 shrink-0 text-gray-500" />}<span className="truncate">{file.name}</span><button type="button" onClick={() => setAttachments((current) => current.filter((_, item) => item !== index))} className="text-gray-500 hover:text-white" aria-label={`Remove ${file.name}`}>×</button></span>)}</div>}
             <textarea
               ref={inputRef}
               rows={1}

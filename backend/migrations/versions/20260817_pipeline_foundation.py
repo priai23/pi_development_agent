@@ -178,6 +178,19 @@ def upgrade() -> None:
 # ---------------------------------------------------------------------------
 
 def downgrade() -> None:
+    # Remove cross-migration foreign keys before dropping their referenced tables.
+    inspector = sa.inspect(op.get_bind())
+    if _table_exists("agent_runs"):
+        for local_columns, referred_table in (
+            (["specification_id"], "run_specifications"),
+            (["source_snapshot_id"], "source_snapshots"),
+        ):
+            for foreign_key in inspector.get_foreign_keys("agent_runs"):
+                if (foreign_key.get("constrained_columns") == local_columns
+                        and foreign_key.get("referred_table") == referred_table
+                        and foreign_key.get("name")):
+                    op.drop_constraint(foreign_key["name"], "agent_runs", type_="foreignkey")
+
     # Drop new tables (reverse order of FK dependencies)
     for tbl in ("tool_executions", "acceptance_checks", "run_specifications", "source_symbols", "source_snapshots"):
         if _table_exists(tbl):

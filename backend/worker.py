@@ -44,6 +44,15 @@ class ProjectBusy(RuntimeError):
     pass
 
 
+def is_in_flight_budget_error(exc: BaseException) -> bool:
+    """Identify provider errors caused by the account's concurrent-request cap."""
+    message = str(exc).casefold()
+    return "in_flight_budget_exhausted" in message or (
+        ("error code: 402" in message or "code': 402" in message or 'code": 402' in message)
+        and "available credits" in message
+    )
+
+
 def dispatch_due_schedules() -> int:
     """Turn due schedules into normal durable runs.
 
@@ -849,37 +858,44 @@ async def process_run(
             action = db.get(models.PendingAction, action_id)
             if not action or action.run_id != run.id:
                 raise ValueError("Approval no longer matches this run")
-            if decision != "approve" and action.tool_name == "install_module_dependency":
+            if decision != "approve":
                 task_id = run.active_task_id
+                cancelled = cancel_after
+                rejection_message = (
+                    "ActionRejected: the requested action was rejected by the approver."
+                    if action.tool_name != "install_module_dependency"
+                    else "DependencyRejected: the required Odoo module installation was rejected."
+                )
                 report = {
                     "task_id": task_id,
-                    "outcome": "FAILED",
+                    "outcome": "CANCELLED" if cancelled else "FAILED",
                     "done": [],
-                    "verification": "Dependency installation was not executed.",
-                    "errors": "DependencyRejected: the required Odoo module installation was rejected.",
+                    "verification": "Rejected action was not executed.",
+                    "errors": rejection_message,
                 }
                 emit(db, run.id, "task.report", report)
                 if task_id:
-                    graph = _apply_task_status(db, run, task_id, "failed", result=report)
-                    _emit_task_transition(db, run, "task.failed", task_id, {"task_graph": graph, "error_category": "DependencyRejected"})
+                    task_status = "cancelled" if cancelled else "failed"
+                    graph = _apply_task_status(db, run, task_id, task_status, result=report)
+                    _emit_task_transition(db, run, f"task.{task_status}", task_id, {"task_graph": graph, "error_category": "ActionRejected"})
                 if subtask_id:
                     child = db.get(models.AgentSubtask, subtask_id)
                     if child:
-                        _set_subtask_status(child, "failed", result=report, error=report["errors"])
+                        _set_subtask_status(child, "cancelled" if cancelled else "failed", result=report, error=report["errors"])
                 run.active_task_id = None
-                run.status = "failed"
-                run.error_category = "DependencyRejected"
+                run.status = "cancelled" if cancelled else "failed"
+                run.error_category = None if cancelled else ("DependencyRejected" if action.tool_name == "install_module_dependency" else "ActionRejected")
                 run.error_message = report["errors"]
                 run.finished_at = datetime.now(timezone.utc)
                 action.status = "rejected"
                 emit(db, run.id, "final_report", {"scope": "run", **report})
-                emit(db, run.id, "run.failed", {
-                    "category": "DependencyRejected",
+                emit(db, run.id, "run.cancelled" if cancelled else "run.failed", {
+                    "category": "ActionRejected" if not cancelled else "CancellationRequested",
                     "message": run.error_message,
                     "retryable": False,
                     "support_id": run.support_id,
                     "task_id": task_id,
-                    "tool": "install_module_dependency",
+                    "tool": action.tool_name,
                 })
                 db.commit()
                 return
@@ -1299,7 +1315,12 @@ async def handle_event(event, checkpointer):
                 return
             run = db.get(models.AgentRun, run_id)
             if run:
-                error_category = "TaskExecutionLimitExceeded" if str(exc).startswith("TaskExecutionLimitExceeded") else type(exc).__name__
+                budget_exhausted = is_in_flight_budget_error(exc)
+                error_category = (
+                    "AgentBudgetExceeded"
+                    if budget_exhausted
+                    else ("TaskExecutionLimitExceeded" if str(exc).startswith("TaskExecutionLimitExceeded") else type(exc).__name__)
+                )
                 failed_task_id = run.active_task_id
                 if failed_task_id:
                     child = db.query(models.AgentSubtask).filter(
@@ -1316,9 +1337,13 @@ async def handle_event(event, checkpointer):
                     run.active_task_id = None
                 run.status = "failed"
                 run.error_category = error_category
-                run.error_message = str(exc)[:500]
+                run.error_message = (
+                    "The AI provider rejected this request because the in-flight request budget is exhausted. "
+                    "Wait for active requests to settle or increase the provider credit limit."
+                    if budget_exhausted else str(exc)[:500]
+                )
                 run.error_detail = traceback.format_exc()[-20_000:]
-                run.retryable = isinstance(exc, (TimeoutError, ConnectionError, RuntimeError))
+                run.retryable = not budget_exhausted and isinstance(exc, (TimeoutError, ConnectionError, RuntimeError))
                 run.finished_at = datetime.now(timezone.utc)
                 emit(db, run.id, "run.failed", {
                     "category": error_category,

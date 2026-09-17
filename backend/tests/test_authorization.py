@@ -93,3 +93,43 @@ def test_duplicate_project_name_rejected(db):
     assert exc.value.status_code == 409
     assert "already exists" in exc.value.detail
 
+
+def test_list_sessions_tags_current_session(db):
+    from starlette.requests import Request
+    from security import token_hash
+    from auth import SESSION_COOKIE
+
+    user = models.User(email="sess@example.com", password_hash="hash", role="member")
+    db.add(user); db.flush()
+    s1 = models.UserSession(id="s1", user_id=user.id, token_hash=token_hash("token-1"), csrf_hash=token_hash("csrf-1"), expires_at=models.utcnow(), last_seen_at=models.utcnow())
+    s2 = models.UserSession(id="s2", user_id=user.id, token_hash=token_hash("token-2"), csrf_hash=token_hash("csrf-2"), expires_at=models.utcnow(), last_seen_at=models.utcnow())
+    db.add_all([s1, s2]); db.commit()
+
+    req = Request(scope={"type": "http", "headers": [(b"cookie", f"{SESSION_COOKIE}=token-1".encode())]})
+    sessions = main.list_sessions(req, user=user, db=db)
+    assert len(sessions) == 2
+    sess1 = next(s for s in sessions if s.id == "s1")
+    sess2 = next(s for s in sessions if s.id == "s2")
+    assert sess1.is_current is True
+    assert sess2.is_current is False
+
+
+def test_change_password_preserves_current_session_and_revokes_others(db):
+    from starlette.requests import Request
+    from security import hash_password, token_hash
+    from auth import SESSION_COOKIE
+
+    user = models.User(email="pw@example.com", password_hash=hash_password("OldPassword123!"), role="member")
+    db.add(user); db.flush()
+    s_curr = models.UserSession(id="curr", user_id=user.id, token_hash=token_hash("token-curr"), csrf_hash=token_hash("csrf-c"), expires_at=models.utcnow(), last_seen_at=models.utcnow())
+    s_other = models.UserSession(id="other", user_id=user.id, token_hash=token_hash("token-other"), csrf_hash=token_hash("csrf-o"), expires_at=models.utcnow(), last_seen_at=models.utcnow())
+    db.add_all([s_curr, s_other]); db.commit()
+
+    req = Request(scope={"type": "http", "headers": [(b"cookie", f"{SESSION_COOKIE}=token-curr".encode())]})
+    payload = schemas.PasswordChange(current_password="OldPassword123!", new_password="NewPassword123!")
+    main.change_password(payload, req, user=user, db=db)
+
+    remaining = db.query(models.UserSession).filter(models.UserSession.user_id == user.id).all()
+    assert len(remaining) == 1
+    assert remaining[0].id == "curr"
+

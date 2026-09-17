@@ -82,3 +82,28 @@ test("displays diagnostic failure card with retry button on worker unavailable r
   expect(retried).toBe(true);
   await expect(page.getByRole("button", { name: "Retry Run" })).toHaveCount(0);
 });
+
+test("exposes accessible labels for the ERP connection form", async ({ page }) => {
+  await baseRoutes(page, () => undefined);
+  await page.goto("/projects/1");
+
+  const formAccessibility = await page.evaluate(() => {
+    const controls = [...document.querySelectorAll("input, textarea, select")];
+    const labelled = (control: Element) => {
+      const id = control.id;
+      return Boolean(
+        control.getAttribute("aria-label") ||
+        control.getAttribute("aria-labelledby") ||
+        (id && document.querySelector(`label[for="${id}"]`)),
+      );
+    };
+    return {
+      unlabeledControls: controls.filter((control) => !labelled(control)).length,
+      unnamedButtons: [...document.querySelectorAll("button")].filter(
+        (button) => !(button.innerText || button.getAttribute("aria-label") || button.getAttribute("title")),
+      ).length,
+    };
+  });
+
+  expect(formAccessibility).toEqual({ unlabeledControls: 0, unnamedButtons: 0 });
+});

@@ -24,9 +24,14 @@ export default function Sidebar({ open = false, onClose }: { open?: boolean; onC
     return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); };
   }, [resizing]);
   const logout = async () => {
-    await apiFetch<void>("/auth/logout", { method: "POST" });
-    setCsrfToken("");
-    router.replace("/login");
+    try {
+      await apiFetch<void>("/auth/logout", { method: "POST" });
+    } catch {
+      // Ignore network / auth errors during logout
+    } finally {
+      setCsrfToken("");
+      router.replace("/login");
+    }
   };
   return (
     <aside style={{ width: `${width}px` }} className={`glass-panel fixed inset-y-0 left-0 z-50 flex h-screen shrink-0 flex-col border-r border-black/5 p-4 transition-transform dark:border-white/10 lg:sticky lg:translate-x-0 lg:transition-[width,transform] ${open ? "translate-x-0" : "-translate-x-full"}`} aria-label="Main navigation">

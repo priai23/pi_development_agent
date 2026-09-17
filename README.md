@@ -97,6 +97,24 @@ The model never receives raw ORM methods, domains, SQL, shell commands, filesyst
 - PostgreSQL
 - An Odoo 19 instance whose hostname is explicitly allowed
 
+## Reproducible local test setup
+
+With Docker running, one command provisions disposable PostgreSQL, installs the
+backend test dependencies, applies migrations, and verifies connectivity:
+
+```bash
+./scripts/setup-local.sh
+```
+
+Run the database-only health check at any time with `./scripts/healthcheck.sh`.
+The setup uses PostgreSQL 16 and the test database `erp_agent`; do not point it
+at production credentials or a production database.
+
+Production SLOs, alert thresholds, diagnosis steps, and recovery procedures are
+defined in [docs/RELIABILITY_OPERATIONS.md](docs/RELIABILITY_OPERATIONS.md).
+Use [docs/RELIABILITY_SCORECARD.md](docs/RELIABILITY_SCORECARD.md) to record
+release evidence and keep unverified claims visible.
+
 ## Backend Setup
 
 ```bash
